@@ -45,17 +45,48 @@ Windows 应用播放 → 扬声器 (Virtual Cable NN)  [usbaudio/usbaudio2]
 | 日志落盘 + 设置页可选中复制 | ✅ |
 | 无命令行窗口启动（`windows_subsystem="windows"`） | ✅ |
 
-### ⚠️ 未完成 / 正在修
+### ⚠️ 未完成 / 待办
 
-**UAC2 不通（核心待办）**：设备能枚举（`usbaudio2.sys`，Problem 0），但 Windows 拿不到
-「设备格式」：`GetMixFormat` → `0x88890008 (AUDCLNT_E_UNSUPPORTED_FORMAT)`；KS 独占下
-48k/16 PCM 仍被接受，驱动却不停 `SET_CUR(采样率)` + `SET_INTERFACE(alt1→alt0)` 死循环、
-从不发起 iso 传输。已排除：包长余量、bInterval(1/3/4)、单/双 clock、clock 类型与 bmControls、
-有无 Feature Unit、端点同步类型、AC 中断端点（有/回包/NAK/无）、bCategory、终端拷贝控制位。
-**下一步**：把 UAC2 枚举期**所有类请求的 wLength 与我们的应答长度逐条对比**（UAC1 就死在这里），
-再用 usbzh UAC2 系列文章逐条核对。
+#### 待办 1：UAC2 仍未打通（用户指定：UAC1 先能用，UAC2 之后再做）
+
+设备能枚举（`usbaudio2.sys`，Problem 0），但 Windows 拿不到「设备格式」：
+`GetMixFormat` → `0x88890008 (AUDCLNT_E_UNSUPPORTED_FORMAT)`；KS 独占下 48k/16 PCM 仍被接受，
+驱动却不停 `SET_CUR(采样率)` + `SET_INTERFACE(alt1→alt0)` 死循环、从不发起 iso 传输。
+
+已排除：包长余量、bInterval(1/3/4)、单/双 clock、clock 类型与 bmControls、有无 Feature Unit、
+端点同步类型、AC 中断端点（有/回包/NAK/无）、bCategory、终端拷贝控制位、iso 包 offset 是否连续（实测连续）。
+
+**下一步（按优先级）**：
+
+1. 用 `RUST_LOG=…=trace` 抓 UAC2 **枚举期全部 EP0 请求**，把每条类请求的 `wLength`
+   与我们的应答长度逐条对比（UAC1 就是死在这个不匹配上：`GET_MIN/MAX/RES` 各 2 字节 vs 我们回 8 字节）。
+2. 按 Linux `f_uac2.c` 核对 **`wMaxPacketSize` 的"+1 帧给 Win10"**：`get_max_bw_for_bint()` 里
+   这个余量**只加在 capture（USB IN）方向**，playback 方向不加。我们现在两个方向都加，
+   在 UAC2 下可能让 pin 的格式判定失败。
+3. 用 usbzh 的 UAC2 描述符/请求系列文章逐条核对 AC 头 / Clock Source / AS General / Format Type I。
+4. 备选：对照一个真实能在 usbaudio2 下工作的 UAC2 设备逐字节 diff。
+
+#### 待办 2：虚拟麦克风（capture 方向）应用侧几乎收不到声音
+
+- **设备侧完全正常**：`ISO IN` 统计 100 URB/s、187 KB/s、峰值 0.25、**零样本仅 0.1%**。
+- **应用侧却是 -57 dB 的近似静音**（`GetMixFormat` 正常、端点音量 1.0、未静音、无精确零缺口）；
+  偶尔某次能录到完美的 1kHz（倍率 1.0000）。
+- 已修的**真问题**（真机验证）：loopback 拷贝只在"主机真的在读麦克风（录音接口 alt1）"时才做，
+  否则 `cap_ring` 会被灌满、之后每次 push 都丢掉**还没被读走**的音频（实测丢接近 100%）。
+- 怀疑方向：驱动/音频引擎把我们的采集流当静音（`AUDCLNT_BUFFERFLAGS_SILENT`）；下一步统计该 flag
+  占比，并用另一种宿主（如独占采集 / KS）交叉验证。
 
 ## 关键结论（仍然有效的坑）
+
+### 虚拟线缆数据通路（照抄参考实现 Virtual-Cables 的 UAC1）
+
+- **参考实现只有一个 ring**：播放端 `WritePlayback` 写、采集端 `ReadCapture` 从**同一个** ring 读
+  —— loopback 是天然 FIFO 直通。我们为让混音器也能读播放端用了两份 ring，
+  多出来的拷贝必须**只在有读者时才做**（见待办 2）。
+- **顺序**：iso OUT **立刻**把数据写进 ring，只把"回复"推迟到节拍点；iso IN 是**节拍到点才读 ring**。
+  我们原来写成"节拍到点后才写数据"，ring 里永远比主机晚一个节拍，采集方向因此读到空/过期数据。
+- 节拍必须是**绝对排程 + 小提前量**（`IsoTimeline::reserve`）：主机"收到完成才提交下一批"，
+  节拍=流速率；落后过多要**重新起拍**而不是让主机一次性追平（后者让播放变快并一次丢掉数秒音频）。
 
 ### UAC1 vs UAC2 的类请求差异（UAC1 曾因此起不来）
 

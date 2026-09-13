@@ -169,7 +169,43 @@ fn main() {
         taps.push(t);
     }
     println!("\n录 {SECS}s —— 请现在开始播放（保持连续）…\n");
+    // 自测模式：白噪声（VC_NOISE=1）或"序列"信号（VC_RAMP=1，每帧 +1 LSB 的低幅锯齿，
+    // 用来精确检出丢样/重样：接收端出现 +2 LSB 就是丢了 1 个样本，+0 就是重复）
+    let noise = std::env::var("VC_NOISE").map(|v| v == "1").unwrap_or(false);
+    let ramp = std::env::var("VC_RAMP").map(|v| v == "1").unwrap_or(false);
+    let mut _play = None;
+    if noise || ramp {
+        let ch = vc_out.channels.max(1) as usize;
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut n: u64 = 0;
+        _play = audiomix_backend_windows::wasapi::render::start_render(
+            &vc_out.id,
+            Box::new(move |out| {
+                for frame in out.chunks_mut(ch) {
+                    let v = if ramp {
+                        // 每帧 +16 LSB 的锯齿：步长必须远大于 Windows 16bit 转换时的抖动(±1 LSB)，
+                        // 否则测出来的全是假阳性。512 帧一个周期 → 93.75Hz，幅度 ±0.125。
+                        const SPAN: u64 = 512;
+                        const STEP: i32 = 16;
+                        (((n % SPAN) as i32 * STEP - 4096) as f32) / 32768.0
+                    } else {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        ((seed >> 11) as f64 / (1u64 << 53) as f64) as f32 * 0.4 - 0.2
+                    };
+                    n += 1;
+                    for y in frame.iter_mut() {
+                        *y = v;
+                    }
+                }
+            }),
+        )
+        .ok();
+        println!("（自测：正在放{}）", if ramp { "序列信号（每帧+1 LSB）" } else { "白噪声" });
+    }
     std::thread::sleep(Duration::from_secs_f32(SECS));
+    drop(_play);
 
     println!("写文件：");
     for t in &taps {

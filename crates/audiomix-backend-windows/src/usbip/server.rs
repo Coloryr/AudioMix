@@ -277,6 +277,17 @@ struct OutStatsInner {
     max_gap_ms: u128,
     /// 与上一批**完全相同**的批次数（内容重复 = 听感上的"卡"，电平/速率都看不出来）
     repeat_urbs: u64,
+    /// 包描述符 offset 不连续的批次数。
+    /// 我们一直把整块 payload 当连续 PCM 读写；若主机给的 offset 有间隙/错位，
+    /// 送进去（和读回来）的音频就会被打碎 —— 实测正是麦克风端丢/重样百万级。
+    noncontig_urbs: u64,
+    /// 序列自检（每帧 +1 LSB 的测试信号）：相邻样本差值异常的次数
+    seq_bad: u64,
+    seq_total: u64,
+    seq_prev: [i16; 2],
+    seq_has_prev: bool,
+    /// 首个包的 offset（不为 0 说明 payload 开头有偏移，我们一直读错了位置）
+    first_offset: u32,
     /// 样本级"保持"（同一通道连续 ≥4 个完全相同的样本）。
     /// 音乐里这种情况几乎不可能自然出现，出现就是驱动/引擎在欠载时**保持上一帧**
     /// ——听感是持续发毛发涩（"一直不流畅"），而整批比对、电平、速率全都看不出来。
@@ -302,12 +313,22 @@ struct InStatsInner {
     urbs: u64,
     bytes: u64,
     max_gap_ms: u128,
+    /// 本区间内我们交给主机的 PCM 峰值（0 = 我们发出去的就是静音）
+    peak: f32,
+    /// 序列自检：相邻样本差值不等于期望步长的次数
+    seq_bad: u64,
+    seq_total: u64,
+    /// 零样本数（占比高说明我们发出的就是"很多静音"）
+    zero_samples: u64,
+    samples_total: u64,
+    prev: [i16; 2],
+    has_prev: bool,
     last: Option<Instant>,
     since: Option<Instant>,
 }
 
 impl InStats {
-    fn note(&self, bus: &str, payload_len: usize, now: Instant) {
+    fn note(&self, bus: &str, payload: &[u8], now: Instant) {
         let mut s = self.inner.lock();
         let since = *s.since.get_or_insert(now);
         if let Some(last) = s.last {
@@ -318,17 +339,49 @@ impl InStats {
         }
         s.last = Some(now);
         s.urbs += 1;
-        s.bytes += payload_len as u64;
+        s.bytes += payload.len() as u64;
+        // 序列与峰值自检（按通道分别看）
+        for (i, pair) in payload.chunks_exact(2).enumerate() {
+            let v = i16::from_le_bytes([pair[0], pair[1]]);
+            let c = i & 1;
+            let f = v as f32 / 32768.0;
+            if f.abs() > s.peak {
+                s.peak = f.abs();
+            }
+            s.samples_total += 1;
+            if v == 0 {
+                s.zero_samples += 1;
+            }
+            if s.has_prev {
+                let d = v as i32 - s.prev[c] as i32;
+                // 测试信号每帧 +1（-1 是回绕）；只统计"明显异常"的
+                if d != 1 && d != -6553 && d != -6554 && v != 0 && s.prev[c] != 0 {
+                    s.seq_bad += 1;
+                }
+                s.seq_total += 1;
+            }
+            s.prev[c] = v;
+            s.has_prev = true;
+        }
         let elapsed = now.saturating_duration_since(since);
         if elapsed >= Duration::from_secs(2) {
             let secs = elapsed.as_secs_f64();
             tracing::debug!(
-                "{bus} ISO IN（麦克风）：{:.0} URB/s、{:.1} KB/s、最大到达间隔 {}ms",
+                "{bus} ISO IN（麦克风）：{:.0} URB/s、{:.1} KB/s、峰值 {:.4}、零样本 {:.1}%、最大到达间隔 {}ms",
                 s.urbs as f64 / secs,
                 s.bytes as f64 / 1024.0 / secs,
+                s.peak,
+                100.0 * s.zero_samples as f64 / (s.samples_total.max(1)) as f64,
                 s.max_gap_ms
             );
-            *s = InStatsInner { since: Some(now), ..Default::default() };
+            let prev = s.prev;
+            let has_prev = s.has_prev;
+            *s = InStatsInner {
+                since: Some(now),
+                prev,
+                has_prev,
+                ..Default::default()
+            };
         }
     }
 }
@@ -344,9 +397,41 @@ fn payload_hash(payload: &[u8]) -> u64 {
 }
 
 impl OutStats {
-    fn note(&self, bus: &str, payload: &[u8], now: Instant) {
+    fn note(&self, bus: &str, payload: &[u8], packets: &[IsoPacket], now: Instant) {
         let mut s = self.inner.lock();
         let since = *s.since.get_or_insert(now);
+        // 包 offset 是否连续（不连续 ⇒ 不能把整块 payload 当连续 PCM）
+        if !packets.is_empty() {
+            let mut expect = packets[0].offset;
+            let mut contig = true;
+            for p in packets {
+                if p.offset != expect {
+                    contig = false;
+                    break;
+                }
+                expect = p.offset + p.length;
+            }
+            if !contig {
+                s.noncontig_urbs += 1;
+            }
+            if s.urbs == 0 {
+                s.first_offset = packets[0].offset;
+            }
+        }
+        // 序列自检：测试信号每帧 +1 LSB，相邻样本差值异常即说明数据被打碎
+        for (i, pair) in payload.chunks_exact(2).enumerate() {
+            let v = i16::from_le_bytes([pair[0], pair[1]]);
+            let c = i & 1;
+            if s.seq_has_prev {
+                let d = v as i32 - s.seq_prev[c] as i32;
+                if d != 1 && d != -6553 && d != -6554 && v != 0 && s.seq_prev[c] != 0 {
+                    s.seq_bad += 1;
+                }
+                s.seq_total += 1;
+            }
+            s.seq_prev[c] = v;
+            s.seq_has_prev = true;
+        }
         if let Some(last) = s.last {
             let gap = now.saturating_duration_since(last).as_millis();
             if gap > s.max_gap_ms {
@@ -410,13 +495,18 @@ impl OutStats {
             let secs = elapsed.as_secs_f64();
             let hold_ms = s.hold_samples as f64 / 48.0; // 48 样本/ms（48k 立体声）
             tracing::debug!(
-                "{bus} ISO OUT：{:.0} URB/s、{:.1} KB/s、全零 {:.1}%、重复批 {:.1}%、保持 {:.1}ms/s（{:.2}%）、最大到达间隔 {}ms",
+                "{bus} ISO OUT：{:.0} URB/s、{:.1} KB/s、全零 {:.1}%、重复批 {:.1}%、保持 {:.1}ms/s（{:.2}%）、包 offset 不连续 {:.1}%（首包 offset={}）、**序列异常 {:.1}%**（{}/{}）、最大到达间隔 {}ms",
                 s.urbs as f64 / secs,
                 s.bytes as f64 / 1024.0 / secs,
                 100.0 * s.zero_bytes as f64 / (s.bytes.max(1)) as f64,
                 100.0 * s.repeat_urbs as f64 / s.urbs.max(1) as f64,
                 hold_ms / secs,
                 100.0 * s.hold_samples as f64 / (s.total_samples.max(1)) as f64,
+                100.0 * s.noncontig_urbs as f64 / s.urbs.max(1) as f64,
+                s.first_offset,
+                100.0 * s.seq_bad as f64 / (s.seq_total.max(1)) as f64,
+                s.seq_bad,
+                s.seq_total,
                 s.max_gap_ms
             );
             let last_hash = s.last_hash;
@@ -475,18 +565,28 @@ async fn handle_urbs(
                 };
                 // EP0 与非 iso 请求串行处理（保证枚举顺序）
                 if basic.endpoint == 0 || !submit.req.is_isochronous() {
-                    if process_submit(&state, &cable, submit).await.is_err() {
+                    if process_submit(&state, &cable, submit, None).await.is_err() {
                         tracing::warn!("{} SUBMIT 处理失败，断开", cable.bus_id);
                         break;
                     }
                     continue;
                 }
-                // iso：预留完成时刻后派发独立任务。
+                // iso OUT：**立刻**把数据写进环形缓冲，只把"回复"推迟到节拍点。
                 //
-                // **节拍对两个方向都是必须的**：主机是「收到完成才提交下一批」，
-                // 所以完成节拍直接决定流的速率 —— 实测把 OUT 改成立刻完成，
-                // 播放速度立刻变快（主机按 CPU 速度灌数据），而且缓冲溢出更卡。
-                // 节拍本身用绝对排程 + 5ms 提前量（见 IsoTimeline::reserve）。
+                // 这是参考实现（Virtual-Cables）的关键顺序：先 WritePlayback，再 waitIsoCompletion，
+                // 最后才 writeSubmit。我们原来是"等节拍到点后才写数据"，于是 ring 里的音频
+                // 永远比主机晚一个节拍；而录音方向是"节拍到点才读 ring"，结果读麦克风时
+                // ring 经常是空的/过期的 —— 表现为虚拟麦克风几乎是静音。
+                let prewritten = if basic.endpoint == 1 && basic.direction == DIRECTION_OUT {
+                    Some(if cable.playback_active() {
+                        cable.write_playback(&submit.out)
+                    } else {
+                        0
+                    })
+                } else {
+                    None
+                };
+                // iso：预留完成时刻后派发独立任务（节拍到点才回复）
                 let complete_at =
                     state.timeline.reserve(basic.endpoint, submit.req.number_of_packets, Instant::now());
                 let task_state = state.clone();
@@ -494,7 +594,7 @@ async fn handle_urbs(
                 let seq = basic.sequence;
                 let handle = tokio::spawn(async move {
                     tokio::time::sleep_until(tokio::time::Instant::from_std(complete_at)).await;
-                    let _ = process_submit(&task_state, &task_cable, submit).await;
+                    let _ = process_submit(&task_state, &task_cable, submit, prewritten).await;
                     task_state.pending.inner.lock().remove(&seq);
                 });
                 state.pending.insert(seq, handle.abort_handle());
@@ -549,7 +649,12 @@ async fn read_submit(
 }
 
 /// 处理一个 SUBMIT 并写应答
-async fn process_submit(state: &ConnState, cable: &Cable, submit: ParsedSubmit) -> std::io::Result<()> {
+async fn process_submit(
+    state: &ConnState,
+    cable: &Arc<Cable>,
+    submit: ParsedSubmit,
+    prewritten: Option<usize>,
+) -> std::io::Result<()> {
     let req = &submit.req;
     let basic = &req.basic;
 
@@ -583,13 +688,16 @@ async fn process_submit(state: &ConnState, cable: &Cable, submit: ParsedSubmit) 
             if req.is_isochronous() {
                 state
                     .out_stats
-                    .note(&cable.bus_id, &submit.out, Instant::now());
+                    .note(&cable.bus_id, &submit.out, &submit.packets, Instant::now());
             }
-            let actual = if cable.playback_active() {
-                cable.write_playback(&submit.out)
-            } else {
-                0 // SET_INTERFACE 前后的无害竞态：接受并丢弃
-            };
+            // 数据在派发前就已经写进 ring（只把回复推迟到节拍点，见 handle_urbs）
+            let actual = prewritten.unwrap_or_else(|| {
+                if cable.playback_active() {
+                    cable.write_playback(&submit.out)
+                } else {
+                    0 // SET_INTERFACE 前后的无害竞态：接受并丢弃
+                }
+            });
             let (packets, error_count) = if req.is_isochronous() {
                 (mark_iso_packets(&submit.packets, actual), 0)
             } else {
@@ -604,7 +712,7 @@ async fn process_submit(state: &ConnState, cable: &Cable, submit: ParsedSubmit) 
             let mut data = vec![0u8; payload];
             let got = cable.read_capture(&mut data);
             if req.is_isochronous() {
-                state.in_stats.note(&cable.bus_id, got, Instant::now());
+                state.in_stats.note(&cable.bus_id, &data[..got.min(data.len())], Instant::now());
             }
             let (packets, error_count) = if req.is_isochronous() {
                 (mark_iso_packets(&submit.packets, payload), 0)

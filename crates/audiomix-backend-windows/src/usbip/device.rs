@@ -64,9 +64,6 @@ const CS_VOLUME: u8 = 0x02;
 /// 音量范围（1/256 dB）：-60dB .. 0dB，步进 1dB
 const VOLUME_MIN_DB_256: i16 = -60 * 256;
 const VOLUME_RES_DB_256: i16 = 256;
-/// 录音端（虚拟麦克风）环形缓冲的目标积压长度（毫秒）。
-/// 只保留最新一小段：够吸收抖动，又不会出现"环满 → push 丢掉还没被读走的音频"。
-const CAPTURE_TARGET_MS: usize = 50;
 
 // bmRequestType 位域
 const RT_DIR_IN: u8 = 0x80;
@@ -209,28 +206,27 @@ impl Cable {
         let mut samples = Vec::with_capacity(pcm.len() / fmt.subslot() as usize);
         pcm_to_f32(pcm, fmt.bits, &mut samples);
         self.play_ring.push(&samples);
-        if self.cfg.mode == CableMode::Loopback {
-            // 录音端只保留最新一小段：没人录音时这里会被灌满，之后每次 push 都会丢掉
-            // "还没被读走"的音频（实测丢接近 100%，麦克风端持续卡顿）。
-            self.cap_ring.trim(self.capture_target_samples());
+        // loopback：播放端收到的音频原样出现在麦克风端。
+        //
+        // 关键：**只有主机真的在读麦克风（录音接口 alt1）时才拷贝**。
+        // 参考实现（Virtual-Cables）只有一个 ring，播放写、采集读；我们额外多一个
+        // cap_ring 是为了让混音器也能读播放端，但"没人读的时候照样往里灌"会让它被灌满，
+        // 之后每次 push 都丢掉**还没被读走**的音频 —— 实测麦克风端因此被打碎
+        // （序列测试：丢样 66 万、重样 20 万）。
+        if self.cfg.mode == CableMode::Loopback && self.capture_active() {
             self.cap_ring.push(&samples);
         }
         pcm.len()
-    }
-
-    /// 录音端环形缓冲的目标占用（样本数）= 目标毫秒 × 采样率 × 通道
-    fn capture_target_samples(&self) -> usize {
-        let fmt = self.format();
-        let per_ms = (fmt.sample_rate as usize / 1000).max(1) * fmt.channels as usize;
-        per_ms * CAPTURE_TARGET_MS
     }
 
     /// 混音引擎写入录音端（线路输出 → 系统录音）。
     /// `reverse` 模式下同时把同一份数据回灌到 play_ring（输出 → 拷贝到 → 输入），
     /// 这样混音图的「线路输入」源就能读到它。
     pub fn write_capture(&self, samples: &[f32]) {
-        // 同样先裁掉积压：录音端只要"现在"的音频
-        self.cap_ring.trim(self.capture_target_samples());
+        // 同样只在主机真的在读麦克风时才写（没人读就没必要积累）
+        if !self.capture_active() {
+            return;
+        }
         self.cap_ring.push(samples);
         if self.cfg.mode == CableMode::Reverse {
             self.play_ring.push(samples);
