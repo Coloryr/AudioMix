@@ -26,7 +26,7 @@ const TICK: Duration = Duration::from_millis(10);
 /// 引擎是**拉取式**的：sink 线程按自己的节奏取数，取不到时重采样器会「保持上一帧」
 /// （见 core::resample::PullResampler），听感就是声音被拉慢 + 一卡一卡。
 /// 留一点余量就能让引擎永远取得到数据，抖动由余量吸收。
-const CUSHION_MS: u64 = 50;
+const CUSHION_MS: u64 = 20;
 /// 单次最多补多少毫秒（时钟跳变/线程被抢占后别一次灌太多）
 const MAX_CATCHUP_MS: u64 = 100;
 

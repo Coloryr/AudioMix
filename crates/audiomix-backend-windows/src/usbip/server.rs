@@ -277,16 +277,9 @@ struct OutStatsInner {
     max_gap_ms: u128,
     /// 与上一批**完全相同**的批次数（内容重复 = 听感上的"卡"，电平/速率都看不出来）
     repeat_urbs: u64,
-    /// 包描述符 offset 不连续的批次数。
-    /// 我们一直把整块 payload 当连续 PCM 读写；若主机给的 offset 有间隙/错位，
-    /// 送进去（和读回来）的音频就会被打碎 —— 实测正是麦克风端丢/重样百万级。
+    /// 包描述符 offset 不连续的批次数（正常应为 0；不连续就不能把整块 payload 当连续 PCM）
     noncontig_urbs: u64,
-    /// 序列自检（每帧 +1 LSB 的测试信号）：相邻样本差值异常的次数
-    seq_bad: u64,
-    seq_total: u64,
-    seq_prev: [i16; 2],
-    seq_has_prev: bool,
-    /// 首个包的 offset（不为 0 说明 payload 开头有偏移，我们一直读错了位置）
+    /// 首个包的 offset
     first_offset: u32,
     /// 样本级"保持"（同一通道连续 ≥4 个完全相同的样本）。
     /// 音乐里这种情况几乎不可能自然出现，出现就是驱动/引擎在欠载时**保持上一帧**
@@ -315,14 +308,9 @@ struct InStatsInner {
     max_gap_ms: u128,
     /// 本区间内我们交给主机的 PCM 峰值（0 = 我们发出去的就是静音）
     peak: f32,
-    /// 序列自检：相邻样本差值不等于期望步长的次数
-    seq_bad: u64,
-    seq_total: u64,
     /// 零样本数（占比高说明我们发出的就是"很多静音"）
     zero_samples: u64,
     samples_total: u64,
-    prev: [i16; 2],
-    has_prev: bool,
     last: Option<Instant>,
     since: Option<Instant>,
 }
@@ -340,10 +328,9 @@ impl InStats {
         s.last = Some(now);
         s.urbs += 1;
         s.bytes += payload.len() as u64;
-        // 序列与峰值自检（按通道分别看）
-        for (i, pair) in payload.chunks_exact(2).enumerate() {
+        // 峰值与零样本占比（诊断"我们发出去的是不是静音"）
+        for pair in payload.chunks_exact(2) {
             let v = i16::from_le_bytes([pair[0], pair[1]]);
-            let c = i & 1;
             let f = v as f32 / 32768.0;
             if f.abs() > s.peak {
                 s.peak = f.abs();
@@ -352,16 +339,6 @@ impl InStats {
             if v == 0 {
                 s.zero_samples += 1;
             }
-            if s.has_prev {
-                let d = v as i32 - s.prev[c] as i32;
-                // 测试信号每帧 +1（-1 是回绕）；只统计"明显异常"的
-                if d != 1 && d != -6553 && d != -6554 && v != 0 && s.prev[c] != 0 {
-                    s.seq_bad += 1;
-                }
-                s.seq_total += 1;
-            }
-            s.prev[c] = v;
-            s.has_prev = true;
         }
         let elapsed = now.saturating_duration_since(since);
         if elapsed >= Duration::from_secs(2) {
@@ -374,14 +351,7 @@ impl InStats {
                 100.0 * s.zero_samples as f64 / (s.samples_total.max(1)) as f64,
                 s.max_gap_ms
             );
-            let prev = s.prev;
-            let has_prev = s.has_prev;
-            *s = InStatsInner {
-                since: Some(now),
-                prev,
-                has_prev,
-                ..Default::default()
-            };
+            *s = InStatsInner { since: Some(now), ..Default::default() };
         }
     }
 }
@@ -418,20 +388,7 @@ impl OutStats {
                 s.first_offset = packets[0].offset;
             }
         }
-        // 序列自检：测试信号每帧 +1 LSB，相邻样本差值异常即说明数据被打碎
-        for (i, pair) in payload.chunks_exact(2).enumerate() {
-            let v = i16::from_le_bytes([pair[0], pair[1]]);
-            let c = i & 1;
-            if s.seq_has_prev {
-                let d = v as i32 - s.seq_prev[c] as i32;
-                if d != 1 && d != -6553 && d != -6554 && v != 0 && s.seq_prev[c] != 0 {
-                    s.seq_bad += 1;
-                }
-                s.seq_total += 1;
-            }
-            s.seq_prev[c] = v;
-            s.seq_has_prev = true;
-        }
+        // 序列自检：测试信号每帧恒定步长，相邻样本差值异常即说明数据被打碎
         if let Some(last) = s.last {
             let gap = now.saturating_duration_since(last).as_millis();
             if gap > s.max_gap_ms {
@@ -495,18 +452,13 @@ impl OutStats {
             let secs = elapsed.as_secs_f64();
             let hold_ms = s.hold_samples as f64 / 48.0; // 48 样本/ms（48k 立体声）
             tracing::debug!(
-                "{bus} ISO OUT：{:.0} URB/s、{:.1} KB/s、全零 {:.1}%、重复批 {:.1}%、保持 {:.1}ms/s（{:.2}%）、包 offset 不连续 {:.1}%（首包 offset={}）、**序列异常 {:.1}%**（{}/{}）、最大到达间隔 {}ms",
+                "{bus} ISO OUT：{:.0} URB/s、{:.1} KB/s、全零 {:.1}%、重复批 {:.1}%、保持 {:.1}ms/s、包 offset 不连续 {:.1}%、最大到达间隔 {}ms",
                 s.urbs as f64 / secs,
                 s.bytes as f64 / 1024.0 / secs,
                 100.0 * s.zero_bytes as f64 / (s.bytes.max(1)) as f64,
                 100.0 * s.repeat_urbs as f64 / s.urbs.max(1) as f64,
                 hold_ms / secs,
-                100.0 * s.hold_samples as f64 / (s.total_samples.max(1)) as f64,
                 100.0 * s.noncontig_urbs as f64 / s.urbs.max(1) as f64,
-                s.first_offset,
-                100.0 * s.seq_bad as f64 / (s.seq_total.max(1)) as f64,
-                s.seq_bad,
-                s.seq_total,
                 s.max_gap_ms
             );
             let last_hash = s.last_hash;

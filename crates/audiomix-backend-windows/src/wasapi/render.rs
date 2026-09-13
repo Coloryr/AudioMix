@@ -18,7 +18,9 @@ use audiomix_core::error::{Error, Result};
 use super::device::{com_init, mix_format_of_by_id};
 use super::capture::check_float_format;
 
-const BUFFER_DURATION_HNS: i64 = 2_000_000; // 200ms
+/// 共享模式缓冲时长。原来 200ms；实测这一项直接叠加到端到端延迟上，
+/// 50ms 足够（事件回调 + MMCSS 下不会欠载），同时把延迟砍掉约 150ms。
+const BUFFER_DURATION_HNS: i64 = 500_000;
 
 pub fn start_render(device_id: &str, on_fill: RenderCallback) -> Result<StartedStream> {
     let info = mix_format_of_by_id(device_id)?;

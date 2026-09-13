@@ -18,7 +18,8 @@ use audiomix_core::error::{Error, Result};
 
 use super::device::{com_init, mix_format_of_by_id};
 
-const BUFFER_DURATION_HNS: i64 = 2_000_000; // 200ms
+/// 共享模式缓冲时长（与 render.rs 一致：50ms，直接决定端到端延迟）
+const BUFFER_DURATION_HNS: i64 = 500_000;
 const IEEE_FLOAT_SUBFORMAT: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 // mmreg.h 格式标签
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
