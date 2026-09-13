@@ -1,0 +1,32 @@
+[package]
+name = "audiomix-backend-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+audiomix-core.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+winreg.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_Security",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+# `#[interface]` 宏生成的代码引用 `::windows_core`，需要显式依赖（与 windows 0.62 对齐）
+windows-core = "0.62"

@@ -1,0 +1,24 @@
+[package]
+name = "audiomix-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "audiomix-app"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+audiomix-core.workspace = true
+audiomix-backend-windows.workspace = true
+audiomix-control-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+winreg.workspace = true
+
+[dependencies.tauri]
+version = "2"
+features = ["tray-icon", "devtools"]

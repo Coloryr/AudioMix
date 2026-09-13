@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/audiomix-core",
+    "crates/audiomix-backend-windows",
+    "crates/audiomix-control-api",
+    "app/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+audiomix-core = { path = "crates/audiomix-core" }
+audiomix-backend-windows = { path = "crates/audiomix-backend-windows" }
+audiomix-control-api = { path = "crates/audiomix-control-api" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+parking_lot = "0.12"
+arc-swap = "1"
+ringbuf = "0.4"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+winreg = "0.55"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

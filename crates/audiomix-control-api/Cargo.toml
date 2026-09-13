@@ -1,0 +1,16 @@
+[package]
+name = "audiomix-control-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+audiomix-core.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
