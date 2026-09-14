@@ -77,6 +77,27 @@ iso 包 `offset` 是否连续（实测连续）、采样率/位深（换 48k/16 
   或等待上游把高速 iso 补齐），必要时评估替换虚拟主机控制器方案。本机装的是
   `C:\Program Files\USBip`（usbip-win2 0.9.8.0，Cloudyne 签名）。
 
+**改动 usbip-win2 的可行性分层（2026-09-14 分析，配合上条决策）**：
+
+- 请求链：usbaudio2 → usbccgp → **usbip2_filter** → UsbHub3 → **ucx01000.sys（微软，闭源）** →
+  **usbip2_ude（UDE 客户端）** → TCP → 我们的服务器。iso URB 死在 ucx 的
+  `UrbHandler_USBPORTStyle_Legacy_IsochTransfer` 校验，**到不了 usbip2_ude**——UDE 客户端是
+  被动回调（UCX 校验通过才派发进它的端点队列），单改 usbip2_ude 绕不过校验。
+- **路线 A（先做，零改驱动）**：描述符实验矩阵。描述符是我们服务器发的（经 usbip2_ude 的 EP0
+  转发原样上交），URB 形状由端点描述符间接决定。逐个变量试：mult 位域编码（wMaxPacketSize
+  bits 12:11）、bInterval 1/2/3、包长 8/64/1024 对齐（#35 里 bozax 提过高速要"match 64"）、
+  async OUT 补显式 feedback 端点（MS 文档的高速音频常见拓扑，usbaudio2 提交的 URB 形状会变）。
+  一次一个变量 + 真机验证。运气好直接过校验，不用碰 usbip-win2。
+- **路线 B（A 穷尽后）**：usbip2_filter 在 UsbHub3/ucx **之前**看到原始 IRP，可把 SUBMIT iso /
+  ABORT_PIPE / SYNC_RESET_PIPE 全部拦截、自己配对转发到服务器，不往下传（= 绕过 ucx 校验）。
+  作者 2023 年在 #35 试过失败了，但当时失败的请求生命周期问题后来在 #181/#182 重构过，
+  0.9.8 基础比当年好。WDK 内核 C 开发（P0 级难度，周级），调试要 WinDbg。
+- **签名门槛（比技术更硬）**：改过的驱动失去微软签名。出路：①上游 PR/issue 推动 vadimgrn
+  （零成本、保持 HVCI 兼容，我们的「描述符可控 + EP0 trace 干净 + 稳定复现」虚拟测试床是推动
+  上游的最好筹码）；②自购 EV 证书做 attestation 签名（约 $99/年 + 合作伙伴中心流程）；
+  ③本机关 HVCI + `bcdedit /set testsigning on`（立即可用，但失去当初选 usbip-win2 的理由，
+  无法部署他人机器）。
+
 ### P1 · 虚拟麦克风（capture 方向）应用侧几乎收不到声音
 
 - **设备侧完全正常**：`ISO IN` 统计 100 URB/s、187 KB/s、峰值 0.25、**零样本仅 0.1%**
