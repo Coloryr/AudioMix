@@ -1,4 +1,4 @@
-//! 虚拟线缆设备：UAC2 类请求状态机 + PCM↔f32 数据通路。
+//! 虚拟线缆设备：UAC1 类请求状态机 + PCM↔f32 数据通路。
 //!
 //! 每条线缆两条 f32 环：
 //! - `play_ring`：ISO OUT（Windows 应用播放进虚拟扬声器）写入，混音引擎 Source 读取；
@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::descriptors::{self, CableFormat, CableProtocol, Descriptors};
+use super::descriptors::{self, CableFormat, Descriptors};
 use super::ring::AudioRing;
 
 // —— 标准请求 ——
@@ -25,39 +25,16 @@ const REQ_CLEAR_FEATURE: u8 = 0x01;
 const REQ_SET_FEATURE: u8 = 0x03;
 
 // —— UAC 类请求（bRequest）——
-// USB Audio 2.0 A.14：bit7 置位 = GET；UAC1 用 GET_MIN/GET_MAX/GET_RES 分段查询范围
+// USB Audio 1.0 §A.1：bit7 置位 = GET；范围查询用分开的 GET_MIN/GET_MAX/GET_RES
 const UAC_SET_CUR: u8 = 0x01;
 const UAC_GET_CUR: u8 = 0x81;
-const UAC_SET_RANGE: u8 = 0x02;
-const UAC_GET_RANGE: u8 = 0x82;
-/// UAC1 专用：最小值 / 最大值 / 步进（端点采样率控制的常用查询方式）
+/// UAC1 专用：最小值 / 最大值 / 步进（端点采样率、特性单元音量的范围查询）
 const UAC_GET_MIN: u8 = 0x82;
 const UAC_GET_MAX: u8 = 0x83;
 const UAC_GET_RES: u8 = 0x84;
 
-/// 请求码种类（低 7 位）：CUR / RANGE
-const UAC_KIND_CUR: u8 = 0x01;
-const UAC_KIND_RANGE: u8 = 0x02;
-
-/// 归一化请求码。真实驱动（usbaudio2.sys / Linux usb-audio）发 GET_CUR=0x81、
-/// GET_RANGE=0x82；同时容忍少数实现把 GET 写成不带方向位的 0x01/0x02。
-fn uac_kind(request: u8) -> u8 {
-    match request {
-        UAC_SET_CUR | UAC_GET_CUR => UAC_KIND_CUR,
-        UAC_SET_RANGE | UAC_GET_RANGE => UAC_KIND_RANGE,
-        other => other & 0x7F,
-    }
-}
-
-/// 请求是否为 GET（方向位在 bmRequestType 的 bit7）
-fn is_dir_in(request_type: u8) -> bool {
-    (request_type & RT_DIR_IN) != 0
-}
-
 // —— 控制选择器（wValue 高字节）——
 const CS_SAMPLING_FREQ: u8 = 0x01;
-/// Clock Source 的时钟有效性（描述符宣告为只读）
-const CS_CLOCK_VALID: u8 = 0x02;
 const CS_MUTE: u8 = 0x01;
 const CS_VOLUME: u8 = 0x02;
 
@@ -66,7 +43,6 @@ const VOLUME_MIN_DB_256: i16 = -60 * 256;
 const VOLUME_RES_DB_256: i16 = 256;
 
 // bmRequestType 位域
-const RT_DIR_IN: u8 = 0x80;
 const RT_TYPE_CLASS: u8 = 0x20; // class + interface recipient = 0x21/0xA1
 const RT_RECIPIENT_STANDARD: u8 = 0x00;
 
@@ -101,9 +77,6 @@ pub struct CableConfig {
     pub mode: CableMode,
     /// 环形缓冲容量（毫秒）
     pub buffer_ms: u32,
-    /// USB 音频类版本（默认 UAC1）
-    #[serde(default)]
-    pub protocol: CableProtocol,
 }
 
 impl CableConfig {
@@ -162,7 +135,7 @@ impl Cable {
         Ok(Arc::new(Self {
             bus_id: format!("1-{number}"),
             cfg: CableConfig { buffer_ms, ..cfg },
-            descriptors: descriptors::build(number, &name, &fmt, cfg.protocol)?,
+            descriptors: descriptors::build(number, &name, &fmt)?,
             play_ring: AudioRing::new(capacity),
             cap_ring: AudioRing::new(capacity),
             state: Mutex::new(DevState {
@@ -273,13 +246,14 @@ impl Cable {
             );
         } else {
             tracing::trace!(
-                "EP0 {} bmRequestType=0x{:02x} bRequest=0x{:02x} wValue=0x{:04x} wIndex=0x{:04x} wLength={} -> {} 字节, status={}",
+                "EP0 {} bmRequestType=0x{:02x} bRequest=0x{:02x} wValue=0x{:04x} wIndex=0x{:04x} wLength={} out={:02x?} -> {} 字节, status={}",
                 if setup.request_type & 0x80 != 0 { "IN " } else { "OUT" },
                 setup.request_type,
                 setup.request,
                 setup.value,
                 setup.index,
                 setup.length,
+                out,
                 r.0.len(),
                 r.1
             );
@@ -351,155 +325,80 @@ impl Cable {
         }
     }
 
-    /// UAC2 类请求：wIndex 高字节 = 实体 ID，wValue 高字节 = 控制选择器
+    /// UAC1 类请求：wIndex 低字节 = 端点地址（端点请求）/ 高字节 = 实体 ID（接口请求），
+    /// wValue 高字节 = 控制选择器。
+    ///
+    /// 与 UAC2 的两处关键差别（照抄参考实现 Virtual-Cables 的处理）：
+    /// 1) 采样率控制挂在**端点**上（recipient=endpoint，wIndex 低字节 = 端点地址），值 3 字节；
+    /// 2) 范围查询是**分开的** GET_MIN(0x82)/GET_MAX(0x83)/GET_RES(0x84)，
+    ///    UAC2 的 GET_RANGE(0x82) 一次返回整块范围在这里会被当成 2 字节的 MIN 值 ——
+    ///    实测 usbaudio.sys 拿到 8 字节后直接启动失败（设备管理器代码 10）。
     fn handle_class(&self, setup: SetupPacket, out: &[u8]) -> (Vec<u8>, i32) {
         use super::protocol::{STATUS_OK, STATUS_PIPE};
 
         let entity = (setup.index >> 8) as u8;
         let selector = (setup.value >> 8) as u8;
-        let kind = uac_kind(setup.request);
-        let get = is_dir_in(setup.request_type);
         let mut s = self.state.lock();
 
-        // —— UAC1（usbaudio.sys）——
-        //
-        // 与 UAC2 的两处关键差别（照抄参考实现 Virtual-Cables 的处理）：
-        // 1) 采样率控制挂在**端点**上（recipient=endpoint，wIndex 低字节 = 端点地址），值 3 字节；
-        // 2) 范围查询是**分开的** GET_MIN(0x82)/GET_MAX(0x83)/GET_RES(0x84)，
-        //    UAC2 的 GET_RANGE(0x82) 一次返回整块范围在这里会被当成 2 字节的 MIN 值 ——
-        //    实测 usbaudio.sys 拿到 8 字节后直接启动失败（设备管理器代码 10）。
-        if self.descriptors.protocol() == CableProtocol::Uac1 {
-            let recipient = setup.request_type & 0x1F;
-            let low_byte = (setup.index & 0xFF) as u8;
-            let le = |v: i16| v.to_le_bytes().to_vec();
+        let recipient = setup.request_type & 0x1F;
+        let low_byte = (setup.index & 0xFF) as u8;
+        let le = |v: i16| v.to_le_bytes().to_vec();
 
-            // 端点采样率（3 字节）
-            if recipient == 0x02 && selector == CS_SAMPLING_FREQ && (low_byte == 0x01 || low_byte == 0x82)
-            {
-                let rate = s.sample_rate;
-                let rate24 = |v: u32| {
-                    vec![(v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8]
-                };
-                return match setup.request {
-                    UAC_SET_CUR => {
-                        if out.len() >= 3 {
-                            let got = u32::from_le_bytes([out[0], out[1], out[2], 0]);
-                            if got != rate {
-                                return (Vec::new(), STATUS_PIPE);
-                            }
-                        }
-                        (Vec::new(), STATUS_OK)
-                    }
-                    UAC_GET_CUR | UAC_GET_MIN | UAC_GET_MAX => (rate24(rate), STATUS_OK),
-                    UAC_GET_RES => (rate24(1), STATUS_OK),
-                    _ => (Vec::new(), STATUS_PIPE),
-                };
-            }
-
-            // 特性单元静音/音量（recipient=interface，wIndex 高字节 = 实体 ID）
-            if recipient == 0x01
-                && (entity == ID_FEATURE_PLAY_ENTITY || entity == ID_FEATURE_CAPTURE_ENTITY)
-            {
-                let unit = if entity == ID_FEATURE_PLAY_ENTITY { 0 } else { 1 };
-                return match (selector, setup.request) {
-                    (CS_MUTE, UAC_SET_CUR) => {
-                        if !out.is_empty() {
-                            s.mute[unit] = out[0] != 0;
-                        }
-                        (Vec::new(), STATUS_OK)
-                    }
-                    (CS_MUTE, UAC_GET_CUR) => {
-                        (vec![u8::from(s.mute[unit])], STATUS_OK)
-                    }
-                    (CS_VOLUME, UAC_SET_CUR) => {
-                        if out.len() >= 2 {
-                            s.volume[unit] = i16::from_le_bytes([out[0], out[1]]);
-                        }
-                        (Vec::new(), STATUS_OK)
-                    }
-                    (CS_VOLUME, UAC_GET_CUR) => (le(s.volume[unit]), STATUS_OK),
-                    (CS_VOLUME, UAC_GET_MIN) => (le(VOLUME_MIN_DB_256), STATUS_OK),
-                    (CS_VOLUME, UAC_GET_MAX) => (le(0), STATUS_OK),
-                    (CS_VOLUME, UAC_GET_RES) => (le(VOLUME_RES_DB_256), STATUS_OK),
-                    _ => (Vec::new(), STATUS_PIPE),
-                };
-            }
-        }
-
-        match entity {
-            // Clock Source：采样率（描述符 bmControls=0x03：频率可读写）。
-            // 播放/采集各一个时钟源，采样率一致
-            ID_CLOCK_ENTITY | ID_CLOCK_CAP_ENTITY => match (selector, kind) {
-                // —— 采样率（4 字节 LE）——
-                (CS_SAMPLING_FREQ, UAC_KIND_CUR) if !get => {
-                    // SET_CUR：只接受描述符宣告的采样率
-                    if out.len() >= 4 {
-                        let rate = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
-                        if rate != s.sample_rate {
+        // 端点采样率（3 字节）
+        if recipient == 0x02 && selector == CS_SAMPLING_FREQ && (low_byte == 0x01 || low_byte == 0x82) {
+            let rate = s.sample_rate;
+            let rate24 = |v: u32| {
+                vec![(v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8]
+            };
+            return match setup.request {
+                UAC_SET_CUR => {
+                    if out.len() >= 3 {
+                        let got = u32::from_le_bytes([out[0], out[1], out[2], 0]);
+                        if got != rate {
                             return (Vec::new(), STATUS_PIPE);
                         }
                     }
                     (Vec::new(), STATUS_OK)
                 }
-                (CS_SAMPLING_FREQ, UAC_KIND_CUR) => (s.sample_rate.to_le_bytes().to_vec(), STATUS_OK),
-                (CS_SAMPLING_FREQ, UAC_KIND_RANGE) if get => {
-                    // wNumSubRanges=1 + min + max + res（各 4 字节 LE）
-                    let rate = s.sample_rate;
-                    let mut data = 1u16.to_le_bytes().to_vec();
-                    data.extend_from_slice(&rate.to_le_bytes());
-                    data.extend_from_slice(&rate.to_le_bytes());
-                    data.extend_from_slice(&0u32.to_le_bytes());
-                    (data, STATUS_OK)
-                }
-                (CS_SAMPLING_FREQ, UAC_KIND_RANGE) => (Vec::new(), STATUS_OK),
-                // —— 时钟有效性：1 字节，1 = 有效（设备内部时钟恒有效）——
-                (CS_CLOCK_VALID, UAC_KIND_CUR) if !get => (Vec::new(), STATUS_OK),
-                (CS_CLOCK_VALID, UAC_KIND_CUR) => (vec![1u8], STATUS_OK),
+                UAC_GET_CUR | UAC_GET_MIN | UAC_GET_MAX => (rate24(rate), STATUS_OK),
+                UAC_GET_RES => (rate24(1), STATUS_OK),
                 _ => (Vec::new(), STATUS_PIPE),
-            },
-            // Feature Unit（播放=ID_FEATURE_PLAY, 采集=ID_FEATURE_CAPTURE）
-            ID_FEATURE_PLAY_ENTITY | ID_FEATURE_CAPTURE_ENTITY => {
-                let unit = if entity == ID_FEATURE_PLAY_ENTITY { 0 } else { 1 };
-                match (selector, kind) {
-                    (CS_MUTE, UAC_KIND_CUR) if !get => {
-                        if !out.is_empty() {
-                            s.mute[unit] = out[0] != 0;
-                        }
-                        (Vec::new(), STATUS_OK)
-                    }
-                    (CS_MUTE, UAC_KIND_CUR) => (
-                        if s.mute[unit] { 1u8.to_le_bytes().to_vec() } else { 0u8.to_le_bytes().to_vec() },
-                        STATUS_OK,
-                    ),
-                    (CS_VOLUME, UAC_KIND_CUR) if !get => {
-                        if out.len() >= 2 {
-                            s.volume[unit] = i16::from_le_bytes([out[0], out[1]]);
-                        }
-                        (Vec::new(), STATUS_OK)
-                    }
-                    (CS_VOLUME, UAC_KIND_CUR) => (
-                        s.volume[unit].to_le_bytes().to_vec(),
-                        STATUS_OK,
-                    ),
-                    (CS_VOLUME, UAC_KIND_RANGE) if get => {
-                        // 1/256 dB，-60dB..0dB，步进 1dB（16 位音量控制 → 8 字节）
-                        let mut data = 1u16.to_le_bytes().to_vec();
-                        data.extend_from_slice(&(-60 * 256i16).to_le_bytes());
-                        data.extend_from_slice(&(0i16).to_le_bytes());
-                        data.extend_from_slice(&(256i16).to_le_bytes());
-                        (data, STATUS_OK)
-                    }
-                    (CS_VOLUME, UAC_KIND_RANGE) => (Vec::new(), STATUS_OK),
-                    _ => (Vec::new(), STATUS_PIPE),
-                }
-            }
-            _ => (Vec::new(), STATUS_PIPE),
+            };
         }
+
+        // 特性单元静音/音量（recipient=interface，wIndex 高字节 = 实体 ID）
+        if recipient == 0x01
+            && (entity == ID_FEATURE_PLAY_ENTITY || entity == ID_FEATURE_CAPTURE_ENTITY)
+        {
+            let unit = if entity == ID_FEATURE_PLAY_ENTITY { 0 } else { 1 };
+            return match (selector, setup.request) {
+                (CS_MUTE, UAC_SET_CUR) => {
+                    if !out.is_empty() {
+                        s.mute[unit] = out[0] != 0;
+                    }
+                    (Vec::new(), STATUS_OK)
+                }
+                (CS_MUTE, UAC_GET_CUR) => {
+                    (vec![u8::from(s.mute[unit])], STATUS_OK)
+                }
+                (CS_VOLUME, UAC_SET_CUR) => {
+                    if out.len() >= 2 {
+                        s.volume[unit] = i16::from_le_bytes([out[0], out[1]]);
+                    }
+                    (Vec::new(), STATUS_OK)
+                }
+                (CS_VOLUME, UAC_GET_CUR) => (le(s.volume[unit]), STATUS_OK),
+                (CS_VOLUME, UAC_GET_MIN) => (le(VOLUME_MIN_DB_256), STATUS_OK),
+                (CS_VOLUME, UAC_GET_MAX) => (le(0), STATUS_OK),
+                (CS_VOLUME, UAC_GET_RES) => (le(VOLUME_RES_DB_256), STATUS_OK),
+                _ => (Vec::new(), STATUS_PIPE),
+            };
+        }
+
+        (Vec::new(), STATUS_PIPE)
     }
 }
 
-const ID_CLOCK_ENTITY: u8 = 10; // 播放侧时钟
-const ID_CLOCK_CAP_ENTITY: u8 = 11; // 采集侧时钟
 const ID_FEATURE_PLAY_ENTITY: u8 = 2;
 const ID_FEATURE_CAPTURE_ENTITY: u8 = 5;
 
@@ -580,15 +479,7 @@ mod tests {
     use crate::usbip::protocol::{STATUS_OK, STATUS_PIPE};
 
     fn cfg(number: u8, rate: u32, bits: u16, mode: CableMode) -> CableConfig {
-        CableConfig {
-            number,
-            name: String::new(),
-            sample_rate: rate,
-            bits,
-            mode,
-            buffer_ms: 250,
-            protocol: CableProtocol::Uac2,
-        }
+        CableConfig { number, name: String::new(), sample_rate: rate, bits, mode, buffer_ms: 250 }
     }
 
     #[test]
@@ -726,75 +617,52 @@ mod tests {
         assert!(play.iter().all(|&v| v == 0.0), "mixer 模式不应回灌");
     }
 
+    /// UAC1 采样率控制挂在**端点**上：recipient=endpoint、值 3 字节、
+    /// 范围查询用分开的 GET_MIN/GET_MAX/GET_RES。
     #[test]
-    fn clock_source_rate_control() {
-        let c = Cable::new(cfg(4, 192_000, 32, CableMode::Mixer)).unwrap();
-        // GET_CUR（真实驱动发的 0x81：class IN，entity 10，CS 0x01）
-        let get = SetupPacket { request_type: 0xA1, request: UAC_GET_CUR, value: 0x0100, index: 0x0A00, length: 4 };
+    fn endpoint_sampling_frequency_control() {
+        let c = Cable::new(cfg(4, 192_000, 16, CableMode::Mixer)).unwrap();
+        // GET_CUR（真实驱动发的 0xA2：class IN + endpoint recipient，wIndex 低字节 = 端点 0x01）
+        let get = SetupPacket { request_type: 0xA2, request: UAC_GET_CUR, value: 0x0100, index: 0x0001, length: 3 };
         let (data, st) = c.handle_control(get, &[]);
         assert_eq!(st, STATUS_OK);
-        assert_eq!(data, 192_000u32.to_le_bytes());
-        // 兼容非标准实现把 GET 写成 0x01（方向位为 IN）
-        let legacy = SetupPacket { request_type: 0xA1, request: 0x01, value: 0x0100, index: 0x0A00, length: 4 };
-        assert_eq!(c.handle_control(legacy, &[]).0, 192_000u32.to_le_bytes());
-        // SET_CUR 错误速率 → STALL
-        let mut bad = 48_000u32.to_le_bytes().to_vec();
-        let set = SetupPacket { request_type: 0x21, request: UAC_SET_CUR, value: 0x0100, index: 0x0A00, length: 4 };
-        assert_eq!(c.handle_control(set, &bad).1, STATUS_PIPE);
-        // SET_CUR 正确速率 → OK
-        bad.clear();
-        bad.extend_from_slice(&192_000u32.to_le_bytes());
-        assert_eq!(c.handle_control(set, &bad).1, STATUS_OK);
-        // GET_RANGE：14 字节
-        let range = SetupPacket { request_type: 0xA1, request: UAC_GET_RANGE, value: 0x0100, index: 0x0A00, length: 14 };
-        let (data, st) = c.handle_control(range, &[]);
-        assert_eq!(st, STATUS_OK);
-        assert_eq!(data.len(), 14);
-        assert_eq!(&data[2..6], &192_000u32.to_le_bytes());
-        // 未知选择器（Clock Multiplier 等）→ STALL
-        let unknown = SetupPacket { request_type: 0xA1, request: UAC_GET_CUR, value: 0x0300, index: 0x0A00, length: 4 };
+        assert_eq!(data, vec![0x00, 0xEE, 0x02], "192000 = 0x02EE00 小端 3 字节");
+        // GET_MIN / GET_MAX 返回同一个离散值，GET_RES 返回 1
+        for (req, want) in [(UAC_GET_MIN, data.clone()), (UAC_GET_MAX, data.clone()), (UAC_GET_RES, vec![1, 0, 0])] {
+            let q = SetupPacket { request_type: 0xA2, request: req, value: 0x0100, index: 0x0001, length: 3 };
+            assert_eq!(c.handle_control(q, &[]).0, want, "bRequest=0x{req:02x}");
+        }
+        // 采集端点（0x82）同样应答
+        let cap = SetupPacket { request_type: 0xA2, request: UAC_GET_CUR, value: 0x0100, index: 0x0082, length: 3 };
+        assert_eq!(c.handle_control(cap, &[]).0, data);
+        // SET_CUR：错误速率 → STALL；正确速率 → OK
+        let set = SetupPacket { request_type: 0x22, request: UAC_SET_CUR, value: 0x0100, index: 0x0001, length: 3 };
+        assert_eq!(c.handle_control(set, &48_000u32.to_le_bytes()[0..3]).1, STATUS_PIPE);
+        assert_eq!(c.handle_control(set, &data).1, STATUS_OK);
+        // 未知选择器 → STALL
+        let unknown = SetupPacket { request_type: 0xA2, request: UAC_GET_CUR, value: 0x0300, index: 0x0001, length: 3 };
         assert_eq!(c.handle_control(unknown, &[]).1, STATUS_PIPE);
     }
 
+    /// UAC2 的 Clock Source 实体（10/11）已经没有对应描述符实体，必须 STALL，
+    /// 否则等于还在对不存在的实体答话。
     #[test]
-    fn capture_clock_source_entity_is_wired() {
-        // 采集侧时钟（实体 11，对应描述符里 Mic IT / USB streaming OT 的源）
-        // 必须与播放时钟应答一致——两套时钟采样率相同，只是各管各的方向
-        let c = Cable::new(cfg(5, 48_000, 16, CableMode::Mixer)).unwrap();
-        let get = SetupPacket { request_type: 0xA1, request: UAC_GET_CUR, value: 0x0100, index: 0x0B00, length: 4 };
-        let (data, st) = c.handle_control(get, &[]);
-        assert_eq!(st, STATUS_OK, "采集时钟 GET_CUR 不能 STALL");
-        assert_eq!(data, 48_000u32.to_le_bytes());
-        // SET_CUR 同样按描述符速率校验
-        let set = SetupPacket { request_type: 0x21, request: UAC_SET_CUR, value: 0x0100, index: 0x0B00, length: 4 };
-        let mut rate = 48_000u32.to_le_bytes().to_vec();
-        assert_eq!(c.handle_control(set, &rate).1, STATUS_OK);
-        rate.clear();
-        rate.extend_from_slice(&96_000u32.to_le_bytes());
-        assert_eq!(c.handle_control(set, &rate).1, STATUS_PIPE);
-        // GET_RANGE 与播放时钟同构（14 字节）
-        let range = SetupPacket { request_type: 0xA1, request: UAC_GET_RANGE, value: 0x0100, index: 0x0B00, length: 14 };
-        let (data, st) = c.handle_control(range, &[]);
-        assert_eq!(st, STATUS_OK);
-        assert_eq!(data.len(), 14);
-        assert_eq!(&data[2..6], &48_000u32.to_le_bytes());
-    }
-
-    #[test]
-    fn clock_source_validity_is_readable() {
-        // 描述符 bmControls=0x03 只宣告了频率控制，但若主机仍问有效性
-        // （selector 0x02），多答不亏——STALL 反而可能让枚举半途而废
+    fn uac2_clock_entities_are_gone() {
         let c = Cable::new(cfg(7, 48_000, 16, CableMode::Mixer)).unwrap();
-        let get = SetupPacket { request_type: 0xA1, request: UAC_GET_CUR, value: 0x0200, index: 0x0A00, length: 1 };
-        let (data, st) = c.handle_control(get, &[]);
-        assert_eq!(st, STATUS_OK, "时钟有效性不能 STALL");
-        assert_eq!(data, vec![1u8], "内部时钟恒有效");
-        let set = SetupPacket { request_type: 0x21, request: UAC_SET_CUR, value: 0x0200, index: 0x0A00, length: 1 };
-        assert_eq!(c.handle_control(set, &[1]).1, STATUS_OK);
+        for entity in [10u16, 11] {
+            let get = SetupPacket {
+                request_type: 0xA1,
+                request: UAC_GET_CUR,
+                value: 0x0100,
+                index: entity << 8,
+                length: 4,
+            };
+            assert_eq!(c.handle_control(get, &[]).1, STATUS_PIPE, "实体 {entity} 不应答");
+        }
     }
 
     #[test]
-    fn feature_unit_uses_get_cur() {
+    fn feature_unit_mute_and_volume() {
         let c = Cable::new(cfg(8, 48_000, 16, CableMode::Mixer)).unwrap();
         // 播放 Feature Unit（实体 2）静音 GET_CUR
         let get_mute = SetupPacket { request_type: 0xA1, request: UAC_GET_CUR, value: 0x0100, index: 0x0200, length: 1 };
@@ -805,17 +673,19 @@ mod tests {
         let set_mute = SetupPacket { request_type: 0x21, request: UAC_SET_CUR, value: 0x0100, index: 0x0200, length: 1 };
         assert_eq!(c.handle_control(set_mute, &[1]).1, STATUS_OK);
         assert_eq!(c.handle_control(get_mute, &[]).0, vec![1u8]);
-        // 音量 GET_RANGE（16 位控制 → 8 字节）
-        let range = SetupPacket { request_type: 0xA1, request: UAC_GET_RANGE, value: 0x0200, index: 0x0200, length: 8 };
-        let (data, st) = c.handle_control(range, &[]);
-        assert_eq!(st, STATUS_OK);
-        assert_eq!(data.len(), 8);
-        assert_eq!(&data[0..2], &1u16.to_le_bytes(), "1 个子范围");
-        assert_eq!(&data[2..4], &(-60i16 * 256).to_le_bytes());
-        assert_eq!(&data[4..6], &0i16.to_le_bytes());
-        // 音量 GET_CUR
+        // 音量范围：UAC1 分开的 GET_MIN / GET_MAX / GET_RES（16 位控制 → 各 2 字节）
+        let min = SetupPacket { request_type: 0xA1, request: UAC_GET_MIN, value: 0x0200, index: 0x0200, length: 2 };
+        assert_eq!(c.handle_control(min, &[]).0, (-60i16 * 256).to_le_bytes().to_vec());
+        let max = SetupPacket { request_type: 0xA1, request: UAC_GET_MAX, value: 0x0200, index: 0x0200, length: 2 };
+        assert_eq!(c.handle_control(max, &[]).0, 0i16.to_le_bytes().to_vec());
+        let res = SetupPacket { request_type: 0xA1, request: UAC_GET_RES, value: 0x0200, index: 0x0200, length: 2 };
+        assert_eq!(c.handle_control(res, &[]).0, 256i16.to_le_bytes().to_vec());
+        // 音量 GET_CUR / SET_CUR
         let cur = SetupPacket { request_type: 0xA1, request: UAC_GET_CUR, value: 0x0200, index: 0x0500, length: 2 };
         assert_eq!(c.handle_control(cur, &[]).0, 0i16.to_le_bytes().to_vec());
+        let set_vol = SetupPacket { request_type: 0x21, request: UAC_SET_CUR, value: 0x0200, index: 0x0500, length: 2 };
+        assert_eq!(c.handle_control(set_vol, &(-1000i16).to_le_bytes()).1, STATUS_OK);
+        assert_eq!(c.handle_control(cur, &[]).0, (-1000i16).to_le_bytes().to_vec());
     }
 
     #[test]
@@ -827,13 +697,12 @@ mod tests {
     }
 
     #[test]
-    fn get_descriptor_includes_qualifier() {
+    fn get_descriptor_has_no_qualifier() {
         let c = Cable::new(cfg(6, 48_000, 16, CableMode::Mixer)).unwrap();
-        let get = SetupPacket { request_type: 0x80, request: REQ_GET_DESCRIPTOR, value: 0x0600, index: 0, length: 10 };
-        let (data, st) = c.handle_control(get, &[]);
-        assert_eq!(st, STATUS_OK);
-        assert_eq!(data.len(), 10);
-        assert_eq!(data[1], 0x06);
+        // 全速设备请求 device qualifier 应 STALL（标准做法，主机据此判定「无另一种速度」）
+        let qual = SetupPacket { request_type: 0x80, request: REQ_GET_DESCRIPTOR, value: 0x0600, index: 0, length: 10 };
+        assert_eq!(c.handle_control(qual, &[]).1, STATUS_PIPE);
+        // 语言 ID 字符串
         let get = SetupPacket { request_type: 0x80, request: REQ_GET_DESCRIPTOR, value: 0x0300, index: 0, length: 255 };
         let (data, st) = c.handle_control(get, &[]);
         assert_eq!(st, STATUS_OK);

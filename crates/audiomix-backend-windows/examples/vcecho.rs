@@ -7,9 +7,8 @@
 //! 做法：往虚拟声卡播白噪声，同时采 A（Windows→我们）与 B（Minifuse 输出），
 //! 抽取后在 0–3 秒范围内求归一化互相关，列出所有 >0.3 的峰。
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use audiomix_backend_windows::wasapi::capture;
 use audiomix_backend_windows::wasapi::device::enumerate_devices;

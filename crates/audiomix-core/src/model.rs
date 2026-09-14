@@ -163,26 +163,12 @@ impl Default for UsbIpCableMode {
     }
 }
 
-/// 虚拟线缆对外暴露的 USB 音频类版本。
-///
-/// - `Uac1`：USB Audio 1.0（设备描述符 bDeviceClass/SubClass/Protocol = 0x00，
-///   采样率控制挂在**端点**上，3 字节值）—— 由 Windows 自带的 `usbaudio.sys` 驱动。
-/// - `Uac2`：USB Audio 2.0（复合设备 0xEF/0x02/0x01 + IAD，采样率挂在 **Clock Source**
-///   上，4 字节值）—— 由 `usbaudio2.sys` 驱动，192kHz 需要它。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum UsbIpCableProtocol {
-    Uac1,
-    Uac2,
-}
-
-impl Default for UsbIpCableProtocol {
-    fn default() -> Self {
-        Self::Uac1
-    }
-}
-
 /// 一条虚拟线缆的格式与模式
+///
+/// 内置虚拟线路**只有 UAC1**（Windows 自带的 `usbaudio.sys`，USB 1.1 全速，
+/// 每 1ms 一个包、单包上限 1023 字节）。需要更高规格（例如 192k/24bit）的线路，
+/// 由用户自行安装第三方虚拟声卡（VB-CABLE 等），在混音画布里当普通节点接线即可；
+/// 见 `is_supported` / `MULTIBIT_MAX_RATE`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UsbIpCableSettings {
@@ -198,8 +184,6 @@ pub struct UsbIpCableSettings {
     pub mode: UsbIpCableMode,
     /// 设备侧环形缓冲容量（毫秒）
     pub buffer_ms: u32,
-    /// USB 音频类版本（UAC1 / UAC2）
-    pub protocol: UsbIpCableProtocol,
 }
 
 impl Default for UsbIpCableSettings {
@@ -211,7 +195,6 @@ impl Default for UsbIpCableSettings {
             bits: 16,
             mode: UsbIpCableMode::Loopback,
             buffer_ms: 250,
-            protocol: UsbIpCableProtocol::default(),
         }
     }
 }
@@ -222,6 +205,10 @@ impl UsbIpCableSettings {
     pub const MAX_NUMBER: u8 = 32;
     /// 自定义名长度上限（USB 字符串描述符上限较宽，这里取一个稳妥值）
     pub const MAX_NAME_CHARS: usize = 64;
+    /// 内置线路（UAC1 全速）每毫秒的字节上限：USB 1.1 全速等时端点单包 1023 字节
+    pub const MAX_BYTES_PER_MS: u64 = 1023;
+    /// 超过这个采样率时内置线路只提供 16-bit（176.4k/192k 的 24/32bit 需要 >1023 B/ms）
+    pub const MULTIBIT_MAX_RATE: u32 = 96_000;
 
     /// 最终显示名：自定义名去空白，空则 `Virtual Cable NN`
     pub fn display_name(&self) -> String {
@@ -275,24 +262,85 @@ impl UsbIpCableSettings {
                 self.number, self.buffer_ms
             )));
         }
-        // UAC1 是 USB 1.1 全速设备：每 1ms 一个包，单包上限 1023 字节
-        if self.protocol == UsbIpCableProtocol::Uac1 {
-            let bytes_per_ms = Self::bytes_per_ms(self.sample_rate, self.bits);
-            if bytes_per_ms > 1023 {
-                return Err(crate::Error::InvalidSettings(format!(
-                    "线缆 {} 在 UAC1（全速）下每毫秒需要 {} 字节，超过 1023 上限 —— \
-                     请把采样率/位深调低，或把该线路改成 UAC2",
-                    self.number, bytes_per_ms
-                )));
-            }
+        // 内置线路只有 UAC1（USB 1.1 全速）：每 1ms 一个包，单包上限 1023 字节；
+        // 且 96 kHz 以上只提供 16-bit。更高规格请用户自装第三方虚拟声卡。
+        if self.sample_rate > Self::MULTIBIT_MAX_RATE && self.bits != 16 {
+            return Err(crate::Error::InvalidSettings(format!(
+                "线缆 {} 的 {} Hz / {}-bit 不受支持：内置线路在 {} Hz 以上只提供 16-bit \
+                 （更高规格请自装第三方虚拟声卡，如 VB-CABLE）",
+                self.number,
+                self.sample_rate,
+                self.bits,
+                Self::MULTIBIT_MAX_RATE
+            )));
+        }
+        let bytes_per_ms = Self::packet_bytes_per_ms(self.sample_rate, self.bits);
+        if bytes_per_ms > Self::MAX_BYTES_PER_MS {
+            return Err(crate::Error::InvalidSettings(format!(
+                "线缆 {} 的 {} Hz / {}-bit 每毫秒需要 {} 字节，超过内置线路（UAC1）上限 {} —— \
+                 请降低采样率或位深，或自装第三方虚拟声卡来获得更高规格",
+                self.number,
+                self.sample_rate,
+                self.bits,
+                bytes_per_ms,
+                Self::MAX_BYTES_PER_MS
+            )));
         }
         Ok(())
+    }
+
+    /// 该采样率/位深在内置线路（UAC1 全速）下是否可用。
+    pub fn is_supported(sample_rate: u32, bits: u16) -> bool {
+        (Self::MIN_RATE..=Self::MAX_RATE).contains(&sample_rate)
+            && matches!(bits, 16 | 24 | 32)
+            && (sample_rate <= Self::MULTIBIT_MAX_RATE || bits == 16)
+            && Self::packet_bytes_per_ms(sample_rate, bits) <= Self::MAX_BYTES_PER_MS
+    }
+
+    /// 把不受支持的格式降到最近的可用组合（载入旧配置时用）。
+    /// 返回一句给用户看的说明；本来就是合法组合时返回 `None`。
+    pub fn clamp_supported(&mut self) -> Option<String> {
+        let original = (self.sample_rate, self.bits);
+        if Self::is_supported(self.sample_rate, self.bits) {
+            return None;
+        }
+        if !matches!(self.bits, 16 | 24 | 32) {
+            self.bits = 16;
+        }
+        if !(Self::MIN_RATE..=Self::MAX_RATE).contains(&self.sample_rate) {
+            self.sample_rate = 48_000;
+        }
+        // 高位深降 16-bit 优先（保住采样率），再不行退回 96k/24
+        if self.sample_rate > Self::MULTIBIT_MAX_RATE && self.bits != 16 {
+            self.bits = 16;
+        } else if Self::packet_bytes_per_ms(self.sample_rate, self.bits) > Self::MAX_BYTES_PER_MS {
+            self.sample_rate = Self::MULTIBIT_MAX_RATE;
+            self.bits = 24;
+        }
+        if !Self::is_supported(self.sample_rate, self.bits) {
+            self.sample_rate = 48_000;
+            self.bits = 16;
+        }
+        Some(format!(
+            "线缆 {}：{}/{}bit 超出内置线路（UAC1）规格，已改为 {}/{}bit",
+            self.number, original.0, original.1, self.sample_rate, self.bits
+        ))
     }
 
     /// 每毫秒的 PCM 字节数（2 通道，向上取整）——判断 UAC1 全速能否承载
     pub fn bytes_per_ms(sample_rate: u32, bits: u16) -> u64 {
         let total = sample_rate as u64 * 2 * (bits as u64 / 8);
         total.div_ceil(1000)
+    }
+
+    /// 端点描述符里实际写出的每毫秒包长：**按整数个采样帧向上取整**。
+    ///
+    /// 与后端 `usbip::descriptors::CableFormat::fs_wmax_packet` 同规则 ——
+    /// 44.1k 系每毫秒是小数帧（44.1k/24bit = 264.6 字节 = 44.1 帧），标称向上取整得到的
+    /// 265 字节不是合法音频包，真机上 Windows 会认不出该端点格式（见 TASK P0）。
+    pub fn packet_bytes_per_ms(sample_rate: u32, bits: u16) -> u64 {
+        let frame = 2 * (bits as u64 / 8);
+        (sample_rate as u64).div_ceil(1000) * frame
     }
 }
 
@@ -349,13 +397,19 @@ impl UsbIpSettings {
     pub fn next_free_number(&self) -> Option<u8> {
         (1..=UsbIpCableSettings::MAX_NUMBER).find(|n| self.cable(*n).is_none())
     }
+
+    /// 载入旧配置时把超出内置线路规格的线缆降到可用组合；
+    /// 返回每条被改动线缆的说明，交给界面/日志提示用户。
+    pub fn clamp_cables_to_supported(&mut self) -> Vec<String> {
+        self.cables.iter_mut().filter_map(|c| c.clamp_supported()).collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub control_api: ControlApiSettings,
-    /// 内置 USB/IP 虚拟声卡（UAC2）线缆
+    /// 内置 USB/IP 虚拟声卡（UAC1）线缆
     pub usbip: UsbIpSettings,
     /// 开机自启时以 headless 模式运行（不显示窗口）
     pub autostart_headless: bool,
@@ -536,17 +590,16 @@ mod tests {
         s.usbip.cables.push(UsbIpCableSettings {
             number: 3,
             name: "游戏耳返".into(),
-            sample_rate: 192_000,
-            bits: 32,
+            sample_rate: 96_000,
+            bits: 24,
             mode: UsbIpCableMode::Mixer,
             buffer_ms: 120,
-            protocol: UsbIpCableProtocol::Uac2,
         });
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         let c = back.usbip.cable(3).unwrap();
-        assert_eq!(c.sample_rate, 192_000);
-        assert_eq!(c.bits, 32);
+        assert_eq!(c.sample_rate, 96_000);
+        assert_eq!(c.bits, 24);
         assert_eq!(c.mode, UsbIpCableMode::Mixer);
         assert_eq!(c.buffer_ms, 120);
         assert_eq!(c.name, "游戏耳返");
@@ -620,6 +673,17 @@ mod tests {
     }
 
     #[test]
+    fn legacy_cable_json_with_protocol_still_parses() {
+        // 旧配置里带 protocol 字段（UAC1/UAC2 选择）：已删除该字段，但必须仍能解析
+        // （serde 默认忽略未知字段），否则老用户一升级就"配置损坏"。
+        let legacy: UsbIpCableSettings =
+            serde_json::from_str(r#"{"number":1,"sample_rate":48000,"bits":16,"protocol":"uac2"}"#)
+                .unwrap();
+        assert_eq!((legacy.number, legacy.sample_rate, legacy.bits), (1, 48_000, 16));
+        assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
     fn usbip_cable_partial_json_uses_defaults() {
         let c: UsbIpCableSettings = serde_json::from_str(r#"{"number":2}"#).unwrap();
         assert_eq!(c.number, 2);
@@ -631,39 +695,51 @@ mod tests {
 
     #[test]
     fn usbip_validate_accepts_range_boundaries() {
-        // UAC2（高速）允许到 192k/32bit
-        for (rate, bits) in [(44_100u32, 16u16), (48_000, 24), (96_000, 32), (192_000, 32)] {
-            let cfg = UsbIpCableSettings {
-                number: 1,
-                sample_rate: rate,
-                bits,
-                protocol: UsbIpCableProtocol::Uac2,
-                ..Default::default()
-            };
-            assert!(cfg.validate().is_ok(), "UAC2 {rate}/{bits} 应合法");
+        // 内置线路 = UAC1 全速：96 kHz 及以下 16/24/32bit 都行
+        for (rate, bits) in [
+            (44_100u32, 16u16),
+            (48_000, 16),
+            (48_000, 24),
+            (48_000, 32),
+            (96_000, 24),
+            (96_000, 32),
+        ] {
+            let cfg = UsbIpCableSettings { number: 1, sample_rate: rate, bits, ..Default::default() };
+            assert!(cfg.validate().is_ok(), "{rate}/{bits} 应合法");
         }
-        // UAC1（全速）受 1023 字节/包 限制：48k/16、96k/32 可以，192k/32 不行
-        for (rate, bits) in [(44_100u32, 16u16), (48_000, 24), (96_000, 32)] {
-            let cfg = UsbIpCableSettings {
-                number: 1,
-                sample_rate: rate,
-                bits,
-                protocol: UsbIpCableProtocol::Uac1,
-                ..Default::default()
-            };
-            assert!(cfg.validate().is_ok(), "UAC1 {rate}/{bits} 应合法");
+        // 96 kHz 以上只给 16-bit（176.4k/192k）
+        for rate in [176_400u32, 192_000] {
+            let cfg = UsbIpCableSettings { number: 1, sample_rate: rate, bits: 16, ..Default::default() };
+            assert!(cfg.validate().is_ok(), "{rate}/16 应合法");
+            for bits in [24u16, 32] {
+                let cfg =
+                    UsbIpCableSettings { number: 1, sample_rate: rate, bits, ..Default::default() };
+                assert!(
+                    matches!(cfg.validate(), Err(crate::Error::InvalidSettings(_))),
+                    "{rate}/{bits} 必须被拒绝（超出内置线路规格）"
+                );
+                assert!(!UsbIpCableSettings::is_supported(rate, bits));
+            }
         }
-        let too_wide = UsbIpCableSettings {
-            number: 1,
-            sample_rate: 192_000,
-            bits: 32,
-            protocol: UsbIpCableProtocol::Uac1,
-            ..Default::default()
-        };
-        assert!(
-            matches!(too_wide.validate(), Err(crate::Error::InvalidSettings(_))),
-            "UAC1 192k/32bit 必须被拒绝"
-        );
+    }
+
+    #[test]
+    fn usbip_cable_clamps_unsupported_format() {
+        // 旧配置里可能是 192k/24（当年 UAC2 规划的规格）：载入时应降级而不是报错
+        let mut c =
+            UsbIpCableSettings { number: 2, sample_rate: 192_000, bits: 24, ..Default::default() };
+        let note = c.clamp_supported().expect("应给出降级说明");
+        assert!(note.contains("192000/24bit"), "{note}");
+        assert_eq!((c.sample_rate, c.bits), (192_000, 16));
+        assert!(c.validate().is_ok());
+        // 合法组合不该被改动
+        let mut ok = UsbIpCableSettings { number: 1, sample_rate: 96_000, bits: 24, ..Default::default() };
+        assert!(ok.clamp_supported().is_none());
+        assert_eq!((ok.sample_rate, ok.bits), (96_000, 24));
+        // 垃圾值兜底
+        let mut bad = UsbIpCableSettings { number: 1, sample_rate: 1, bits: 9, ..Default::default() };
+        assert!(bad.clamp_supported().is_some());
+        assert!(bad.validate().is_ok(), "{:?}", (bad.sample_rate, bad.bits));
     }
 
     #[test]

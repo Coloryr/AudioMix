@@ -16,13 +16,23 @@ pub fn load(app: &tauri::AppHandle) -> GraphSettings {
         return GraphSettings::default();
     };
     match fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str(&text) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("配置解析失败，使用默认配置: {e}");
-                GraphSettings::default()
+        Ok(text) => {
+            let parsed: Result<GraphSettings, _> = serde_json::from_str(&text);
+            match parsed {
+                Ok(mut c) => {
+                    // 内置线路只有 UAC1：把旧配置里超规格的线缆（例如 192k/24bit）降到可用组合，
+                    // 而不是让整份配置校验失败、应用起不来。
+                    for note in c.settings.usbip.clamp_cables_to_supported() {
+                        tracing::warn!("{note}");
+                    }
+                    c
+                }
+                Err(e) => {
+                    tracing::warn!("配置解析失败，使用默认配置: {e}");
+                    GraphSettings::default()
+                }
             }
-        },
+        }
         Err(_) => GraphSettings::default(),
     }
 }

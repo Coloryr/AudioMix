@@ -23,6 +23,8 @@ fn rms(x: &[f32]) -> f32 {
 }
 
 fn main() {
+    // 可选参数：线路名过滤（默认取第一条 "Virtual Cable"），用来逐条线路跑格式矩阵
+    let filter = std::env::args().nth(1).unwrap_or_else(|| "Virtual Cable".to_string());
     let devices = match enumerate_devices() {
         Ok(d) => d,
         Err(e) => {
@@ -32,16 +34,20 @@ fn main() {
     };
     let vc_out = devices
         .iter()
-        .find(|d| d.name.contains("Virtual Cable") && d.kind == DeviceKind::Output)
+        .find(|d| d.name.contains(&filter) && d.kind == DeviceKind::Output)
         .cloned();
     let vc_in = devices
         .iter()
-        .find(|d| d.name.contains("Virtual Cable") && d.kind == DeviceKind::Input)
+        .find(|d| d.name.contains(&filter) && d.kind == DeviceKind::Input)
         .cloned();
     let (Some(vc_out), Some(vc_in)) = (vc_out, vc_in) else {
-        println!("(缺少虚拟声卡端点)");
+        println!("(缺少虚拟声卡端点: {filter})");
         return;
     };
+    println!(
+        "线路「{}」播放端 {}Hz/{}ch · 录音端 {}Hz/{}ch",
+        filter, vc_out.sample_rate, vc_out.channels, vc_in.sample_rate, vc_in.channels
+    );
 
     let rec = Arc::new(Mutex::new(Vec::<f32>::new()));
     let r2 = rec.clone();

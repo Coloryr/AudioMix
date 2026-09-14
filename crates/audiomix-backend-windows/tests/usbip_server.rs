@@ -2,7 +2,7 @@
 //!
 //! 用真实 TCP 连接模拟 usbip-win2 客户端（`usbip port` / vhci 的行为）：
 //! `OP_REQ_DEVLIST` 握手 → `OP_REQ_IMPORT` 取出设备描述符 → EP0 控制传输完成
-//! USB 枚举（SET_CONFIGURATION + SET_INTERFACE + UAC2 类请求）→ ISO OUT 写入
+//! USB 枚举（SET_CONFIGURATION + SET_INTERFACE + UAC1 类请求）→ ISO OUT 写入
 //! PCM → ISO IN 读回（Loopback 线缆应原样回环）。
 //!
 //! 客户端的编解码刻意**不复用** server 侧写函数，独立按 USB/IP v1.1.1
@@ -11,7 +11,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use audiomix_backend_windows::usbip::descriptors::CableProtocol;
 use audiomix_backend_windows::usbip::device::{CableConfig, CableMode};
 use audiomix_backend_windows::usbip::UsbIpManager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,7 +33,7 @@ const DIR_IN: u32 = 1;
 const HEADER_LEN: usize = 48;
 /// usbip_usb_device 线格式长度
 const DEVICE_LEN: usize = 312;
-const SPEED_HIGH: u32 = 3;
+const SPEED_FULL: u32 = 2;
 const STATUS_OK: i32 = 0;
 const STATUS_PIPE: i32 = -32;
 const STATUS_CONN_RESET: i32 = -104;
@@ -267,15 +266,7 @@ impl Client {
 }
 
 fn cable_config(number: u8, rate: u32, bits: u16) -> CableConfig {
-    CableConfig {
-        number,
-        name: String::new(),
-        sample_rate: rate,
-        bits,
-        mode: CableMode::Loopback,
-        buffer_ms: 250,
-    protocol: CableProtocol::Uac2,
-        }
+    CableConfig { number, name: String::new(), sample_rate: rate, bits, mode: CableMode::Loopback, buffer_ms: 250 }
 }
 
 /// 探一个当前空闲的端口（绑定 :0 拿到端口号后立刻释放）
@@ -318,8 +309,8 @@ fn pcm_ramp(bytes: usize) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn devlist_reports_high_speed_uac2_device() {
-    let (_m, addr) = start_server(vec![cable_config(1, 48_000, 16), cable_config(2, 192_000, 32)]);
+async fn devlist_reports_full_speed_uac1_device() {
+    let (_m, addr) = start_server(vec![cable_config(1, 48_000, 16), cable_config(2, 192_000, 16)]);
 
     let mut c = Client::connect(addr).await;
     c.op_request(OP_REQ_DEVLIST).await;
@@ -331,19 +322,19 @@ async fn devlist_reports_high_speed_uac2_device() {
     assert_eq!(first.busid, "1-1");
     assert_eq!(first.busnum, 1);
     assert_eq!(first.devnum, 1);
-    assert_eq!(first.speed, SPEED_HIGH, "UAC2 必须是高速设备");
+    assert_eq!(first.speed, SPEED_FULL, "内置线路是 UAC1 全速设备");
     assert_eq!(first.id_vendor, 0xFFFF);
     assert_eq!(first.id_product, 0xCA01, "PID = 0xCA00 + 线缆号");
     assert_eq!(first.bcd_device, 0x0100);
-    assert_eq!(first.class, 0xEF, "IAD 复合设备");
-    assert_eq!(first.subclass, 0x02);
-    assert_eq!(first.protocol, 0x01);
+    assert_eq!(first.class, 0x00, "UAC1 设备级类字段全 0");
+    assert_eq!(first.subclass, 0x00);
+    assert_eq!(first.protocol, 0x00);
     assert_eq!(first.config_value, 1);
     assert_eq!(first.num_configs, 1);
     assert_eq!(first.num_interfaces, 3, "AC + 播放 AS + 录音 AS");
     assert!(first.path.contains("1-1"), "path 应包含 busid：{}", first.path);
-    // 接口记录：AC + 2×AS，class/subclass/proto 必须与 usbaudio2.inf 的 Prot_20 匹配
-    let expected = [[0x01u8, 0x01, 0x20], [0x01, 0x02, 0x20], [0x01, 0x02, 0x20]];
+    // 接口记录：AC + 2×AS（UAC1：class=AUDIO、subclass=AC/AS、proto=0）
+    let expected = [[0x01u8, 0x01, 0x00], [0x01, 0x02, 0x00], [0x01, 0x02, 0x00]];
     for exp in expected.iter().take(first.num_interfaces as usize) {
         let iface = c.read_n(4).await;
         assert_eq!(&iface[..3], &exp[..], "接口记录 class/subclass/proto：{iface:02x?}");
@@ -387,7 +378,7 @@ async fn full_session_control_then_iso_roundtrip() {
     assert_eq!((code, status), (OP_REP_IMPORT, 0), "import 应成功");
     let dev = c.read_device().await;
     assert_eq!(dev.busid, "1-1");
-    assert_eq!(dev.speed, SPEED_HIGH);
+    assert_eq!(dev.speed, SPEED_FULL);
 
     // —— EP0 枚举 ——
     let r = c.control(1, [0x00, 0x09, 1, 0, 0, 0, 0, 0], &[], 0).await;
@@ -403,17 +394,17 @@ async fn full_session_control_then_iso_roundtrip() {
     assert_eq!(r.data[1], 0x01);
     assert_eq!(r.data[8], 0xFF, "idVendor = 0xFFFF");
 
-    // UAC2 时钟源：GET_CUR 采样率（真实 usbaudio2 发的 0x81）
-    let r = c.control(5, [0xA1, 0x81, 0x00, 0x01, 0x00, 0x0A, 4, 0], &[], 4).await;
+    // UAC1 端点采样率：GET_CUR（真实 usbaudio.sys 发的 0xA2：class IN + endpoint recipient）
+    let r = c.control(5, [0xA2, 0x81, 0x00, 0x01, 0x01, 0x00, 3, 0], &[], 3).await;
     assert_eq!(r.status, STATUS_OK, "GET_CUR(采样率) 不能 STALL");
-    assert_eq!(r.data, 48_000u32.to_le_bytes().to_vec());
-    // 时钟有效性（描述符 bmControls 宣告为只读）
-    let r = c.control(6, [0xA1, 0x81, 0x00, 0x02, 0x00, 0x0A, 1, 0], &[], 1).await;
-    assert_eq!(r.status, STATUS_OK, "GET_CUR(时钟有效性) 不能 STALL");
-    assert_eq!(r.data, vec![1u8]);
+    assert_eq!(r.data, vec![0x80, 0xBB, 0x00], "48000 = 0x00BB80 小端 3 字节");
+    // GET_MIN / GET_MAX 也返回该离散值
+    let r = c.control(6, [0xA2, 0x83, 0x00, 0x01, 0x01, 0x00, 3, 0], &[], 3).await;
+    assert_eq!(r.status, STATUS_OK, "GET_MAX(采样率) 不能 STALL");
+    assert_eq!(r.data, vec![0x80, 0xBB, 0x00]);
     // 不支持的采样率 SET_CUR → STALL（EPIPE）
     let r = c
-        .control(7, [0x21, 0x01, 0x00, 0x01, 0x00, 0x0A, 4, 0], &44_100u32.to_le_bytes(), 0)
+        .control(7, [0x22, 0x01, 0x00, 0x01, 0x01, 0x00, 3, 0], &44_100u32.to_le_bytes()[0..3], 0)
         .await;
     assert_eq!(r.status, STATUS_PIPE, "未配置的采样率必须 STALL");
 
@@ -554,8 +545,7 @@ async fn trace_capture_path_feeds_iso_in_after_activation() {
         bits: 16,
         mode: CableMode::Mixer,
         buffer_ms: 250,
-    protocol: CableProtocol::Uac2,
-        }]);
+    }]);
 
     let mut c = Client::connect(addr).await;
     c.op_request(OP_REQ_IMPORT).await;

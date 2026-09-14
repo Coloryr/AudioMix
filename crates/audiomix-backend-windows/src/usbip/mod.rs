@@ -20,7 +20,6 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 
 pub use backend::UsbIpBackend;
-pub use descriptors::CableProtocol;
 use device::{Cable, CableConfig, CableMode};
 
 use audiomix_core::model::{UsbIpCableMode, UsbIpCableSettings, UsbIpSettings};
@@ -44,10 +43,6 @@ impl From<UsbIpCableSettings> for CableConfig {
             bits: c.bits,
             mode: c.mode.into(),
             buffer_ms: c.buffer_ms,
-            protocol: match c.protocol {
-                audiomix_core::model::UsbIpCableProtocol::Uac1 => CableProtocol::Uac1,
-                audiomix_core::model::UsbIpCableProtocol::Uac2 => CableProtocol::Uac2,
-            },
         }
     }
 }
@@ -254,7 +249,6 @@ mod tests {
             bits: 16,
             mode: CableMode::Loopback,
             buffer_ms: 250,
-            protocol: CableProtocol::default(),
         }
     }
 
@@ -266,20 +260,18 @@ mod tests {
             cables: vec![UsbIpCableSettings {
                 number: 2,
                 name: "直播线".into(),
-                sample_rate: 192_000,
-                bits: 32,
+                sample_rate: 96_000,
+                bits: 24,
                 mode: UsbIpCableMode::Mixer,
                 buffer_ms: 120,
-                // 192k/32bit 超出全速带宽，必须用 UAC2
-                protocol: audiomix_core::model::UsbIpCableProtocol::Uac2,
             }],
         };
         let cfgs = cable_configs(&settings);
         assert_eq!(cfgs.len(), 1);
         assert_eq!(cfgs[0].number, 2);
         assert_eq!(cfgs[0].name, "直播线", "自定义名要带到后端配置");
-        assert_eq!(cfgs[0].sample_rate, 192_000);
-        assert_eq!(cfgs[0].bits, 32);
+        assert_eq!(cfgs[0].sample_rate, 96_000);
+        assert_eq!(cfgs[0].bits, 24);
         assert_eq!(cfgs[0].mode, CableMode::Mixer);
         assert_eq!(cfgs[0].buffer_ms, 120);
         // 转换后的配置必须能真正建起线缆（描述符自检通过），且产品名就是自定义名

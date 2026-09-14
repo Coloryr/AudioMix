@@ -625,7 +625,7 @@ pub fn set_autostart(state: State<AppState>, enabled: bool) -> Result<(), String
     crate::autostart::set(enabled, headless)
 }
 
-// ---------- USB/IP 虚拟声卡（usbip-win2 + UAC2）----------
+// ---------- USB/IP 虚拟声卡（usbip-win2 + UAC1）----------
 
 /// 一条线缆的运行态（UI 用）
 #[derive(Debug, Clone, serde::Serialize)]
@@ -635,8 +635,6 @@ pub struct UsbIpCableStatus {
     pub name: String,
     /// 实际显示名（空名回退 Virtual Cable NN）
     pub display_name: String,
-    /// USB 音频类版本："uac1"（usbaudio.sys，全速，兼容优先）| "uac2"（usbaudio2.sys，高速）
-    pub protocol: String,
     pub sample_rate: u32,
     pub bits: u16,
     /// "loopback" | "mixer"
@@ -734,10 +732,6 @@ fn build_usbip_status(
                     audiomix_core::UsbIpCableMode::Loopback => "loopback".into(),
                     audiomix_core::UsbIpCableMode::Reverse => "reverse".into(),
                     audiomix_core::UsbIpCableMode::Mixer => "mixer".into(),
-                },
-                protocol: match c.protocol {
-                    audiomix_core::UsbIpCableProtocol::Uac1 => "uac1".into(),
-                    audiomix_core::UsbIpCableProtocol::Uac2 => "uac2".into(),
                 },
                 buffer_ms: c.buffer_ms,
                 device_id_playback: format!("usbip://{}/playback", c.number),

@@ -20,5 +20,5 @@ pub use engine::{Engine, EngineEvent};
 pub use error::{Error, Result};
 pub use model::{
     ControlApiSettings, DeviceInfo, DeviceKind, GraphConfig, GraphSettings, Route, Settings, Sink, Source, SourceMode,
-    UsbIpCableMode, UsbIpCableProtocol, UsbIpCableSettings, UsbIpSettings,
+    UsbIpCableMode, UsbIpCableSettings, UsbIpSettings,
 };

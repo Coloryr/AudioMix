@@ -128,14 +128,9 @@ async fn write_devlist(w: &mut tokio::net::tcp::OwnedWriteHalf, cables: &[Arc<Ca
     for c in cables {
         write_usb_device(w, c).await?;
         // devlist 应答为活动配置中的每个接口写一条 class/subclass/proto 记录：
-        // 接口 0 = AudioControl，接口 1/2 = AudioStreaming
-        // （UAC2 的 bInterfaceProtocol = 0x20；UAC1 = 0x00）
-        let iproto = match c.descriptors.protocol() {
-            crate::usbip::descriptors::CableProtocol::Uac1 => 0x00u8,
-            crate::usbip::descriptors::CableProtocol::Uac2 => 0x20,
-        };
+        // 接口 0 = AudioControl，接口 1/2 = AudioStreaming（UAC1 的 bInterfaceProtocol = 0x00）
         for (class, subclass) in [(0x01u8, 0x01u8), (0x01, 0x02), (0x01, 0x02)] {
-            w.write_all(&[class, subclass, iproto, 0]).await?;
+            w.write_all(&[class, subclass, 0x00, 0]).await?;
         }
     }
     Ok(())
@@ -152,11 +147,8 @@ async fn write_usb_device(w: &mut tokio::net::tcp::OwnedWriteHalf, c: &Cable) ->
     let mut frame = Vec::with_capacity(32);
     frame.extend_from_slice(&1u32.to_be_bytes()); // busnum
     frame.extend_from_slice(&(c.cfg.number as u32).to_be_bytes()); // devnum
-    // UAC1（USB 1.1 全速）必须按全速上报，否则主机按高速的包/帧语义解析描述符会失败
-    let speed = match c.descriptors.protocol() {
-        crate::usbip::descriptors::CableProtocol::Uac1 => protocol::SPEED_FULL,
-        crate::usbip::descriptors::CableProtocol::Uac2 => protocol::SPEED_HIGH,
-    };
+    // UAC1（USB 1.1 全速）必须按全速上报，否则主机按高速的包/帧语义解析描述符会失败。
+    let speed = protocol::SPEED_FULL;
     frame.extend_from_slice(&speed.to_be_bytes());
     // 描述符里的多字节字段本身是小端，按协议要求转大端写出
     for o in [8usize, 10, 12] {
@@ -168,11 +160,11 @@ async fn write_usb_device(w: &mut tokio::net::tcp::OwnedWriteHalf, c: &Cable) ->
     frame.push(dev[6]); // bDeviceProtocol
     frame.push(1); // bConfigurationValue
     frame.push(dev[17]); // bNumConfigurations
-    frame.push(3); // bNumInterfaces
+    frame.push(c.descriptors.num_interfaces()); // bNumInterfaces（按描述符实际接口数，不能写死）
     w.write_all(&frame).await
 }
 
-/// 每端点的 iso 完成时间线：按端点的真实服务间隔（bInterval 决定，0.125–1ms）预留
+/// 每端点的 iso 完成时间线：按端点的服务间隔（全速 UAC1 固定 1ms）预留
 struct IsoTimeline {
     next: Mutex<HashMap<u32, Instant>>,
     /// 一个 iso 包代表的服务间隔（微秒）
@@ -184,8 +176,7 @@ impl IsoTimeline {
         Self { next: Mutex::new(HashMap::new()), packet_micros }
     }
 
-    /// 为一个 iso 批次预留完成时刻。每包 = 一个服务间隔
-    /// （bInterval=4 → 1ms、3 → 0.5ms、2 → 0.25ms、1 → 0.125ms），
+    /// 为一个 iso 批次预留完成时刻。每包 = 一个服务间隔（内置 UAC1 全速固定 1ms），
     /// 一批的时长封顶 MAX_BATCH_MS。
     ///
     /// **绝对节拍**：基准取「上一次排定的完成时刻」，即使它已经过去也照用，
@@ -482,17 +473,9 @@ async fn handle_urbs(
     writer: tokio::net::tcp::OwnedWriteHalf,
     cable: Arc<Cable>,
 ) {
-    // 服务间隔由描述符的 bInterval 决定（高码率会自动缩短），节拍必须跟着它走，
-    // 否则采集端会按错误的速率出数据（bInterval=3 时快一倍）。
-    let packet_micros = match cable.descriptors.protocol() {
-        // UAC1 全速：bInterval=1 → 1 帧 = 1ms
-        crate::usbip::descriptors::CableProtocol::Uac1 => 1000u64,
-        crate::usbip::descriptors::CableProtocol::Uac2 => {
-            super::descriptors::CableFormat::service_interval_micros(
-                cable.format().iso_b_interval(),
-            ) as u64
-        }
-    };
+    // 服务间隔来自描述符（内置 UAC1 全速 = 1ms），节拍必须跟着它走，
+    // 否则采集端会按错误的速率出数据。
+    let packet_micros = cable.descriptors.iso_service_micros();
     let state = Arc::new(ConnState {
         write: tokio::sync::Mutex::new(writer),
         timeline: IsoTimeline::new(packet_micros),
@@ -784,7 +767,7 @@ mod tests {
 
     #[test]
     fn iso_budget_reservation_is_sequential() {
-        let timeline = IsoTimeline::new(1000); // 1ms 服务间隔（bInterval=4）
+        let timeline = IsoTimeline::new(1000); // 1ms 服务间隔（全速 UAC1）
         let now = Instant::now();
         // Windows 深队列：一次排 4 个 10ms URB → 完成时刻依次错开
         let d1 = timeline.reserve(1, 10, now);
@@ -801,7 +784,7 @@ mod tests {
 
     #[test]
     fn half_millisecond_service_interval_paces_correctly() {
-        // 192k/32bit/2ch 会退到 bInterval=3（0.5ms），节拍必须按 0.5ms/包
+        // 时间线本身与描述符解耦：即使将来服务间隔变了，节拍也要按给定值走
         let timeline = IsoTimeline::new(500);
         let now = Instant::now();
         let d1 = timeline.reserve(1, 10, now);

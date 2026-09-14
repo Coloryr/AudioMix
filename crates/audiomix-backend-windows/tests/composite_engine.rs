@@ -2,7 +2,7 @@
 //!
 //! 覆盖单元测试覆盖不到的一环：真实 `WindowsBackend` 与真实 `UsbIpBackend`
 //! 经 `CompositeBackend` 合并后，引擎能看到物理设备**与**虚拟线缆设备，
-//! 且线缆的采样率/位深/名称取自配置（UAC2 的核心验收点）。
+//! 且线缆的采样率/位深/名称取自配置。
 //!
 //! USB/IP 服务器绑在 `127.0.0.1:0`（随机端口），不干扰真实运行的实例。
 
@@ -10,9 +10,7 @@ use std::sync::Arc;
 
 use audiomix_backend_windows::usbip::{cable_configs, UsbIpBackend, UsbIpManager};
 use audiomix_backend_windows::WindowsBackend;
-use audiomix_core::model::{
-    UsbIpCableMode, UsbIpCableProtocol, UsbIpCableSettings, UsbIpSettings,
-};
+use audiomix_core::model::{UsbIpCableMode, UsbIpCableSettings, UsbIpSettings};
 use audiomix_core::{AudioBackend, CompositeBackend, Engine};
 
 fn cable(number: u8, rate: u32, bits: u16, mode: UsbIpCableMode) -> UsbIpCableSettings {
@@ -23,8 +21,6 @@ fn cable(number: u8, rate: u32, bits: u16, mode: UsbIpCableMode) -> UsbIpCableSe
         bits,
         mode,
         buffer_ms: 250,
-        // 本测试含 192k/32bit → 超出全速带宽，用 UAC2
-        protocol: UsbIpCableProtocol::Uac2,
     }
 }
 
@@ -34,7 +30,7 @@ fn test_settings() -> UsbIpSettings {
         bind: "127.0.0.1:0".into(),
         cables: vec![
             cable(1, 48_000, 16, UsbIpCableMode::Loopback),
-            cable(3, 192_000, 32, UsbIpCableMode::Mixer),
+            cable(3, 96_000, 24, UsbIpCableMode::Mixer),
         ],
     }
 }
@@ -83,11 +79,11 @@ fn engine_sees_physical_and_usbip_devices() {
         assert!(capture.is_virtual);
     }
 
-    // 格式随配置走（UAC2 验收点：44.1–192kHz / 16–32bit 可配）
+    // 格式随配置走（内置 UAC1：44.1–96kHz 的 16/24/32bit，176.4/192kHz 只 16bit）
     let c1 = devices.iter().find(|d| d.id == "usbip://1/playback").unwrap();
     assert_eq!(c1.sample_rate, 48_000);
     let c3 = devices.iter().find(|d| d.id == "usbip://3/capture").unwrap();
-    assert_eq!(c3.sample_rate, 192_000);
+    assert_eq!(c3.sample_rate, 96_000);
 
     // 物理设备（若本机存在）与虚拟设备共存，且 id 不冲突
     let mut ids: Vec<&str> = devices.iter().map(|d| d.id.as_str()).collect();

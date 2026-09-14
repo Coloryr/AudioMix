@@ -30,3 +30,6 @@ windows = { version = "0.62", features = [
 ] }
 # `#[interface]` 宏生成的代码引用 `::windows_core`，需要显式依赖（与 windows 0.62 对齐）
 windows-core = "0.62"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

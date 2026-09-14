@@ -266,7 +266,9 @@ onUnmounted(() => window.clearInterval(timer));
       <n-card title="关于" size="small">
         <n-text depth="3" style="font-size: 12px; line-height: 1.9">
           AudioMix v0.1.0 — Windows WASAPI 混音引擎 + Vue 前端。<br />
-          虚拟声卡：usbip-win2（BSD-2）+ UAC2 描述符 → Windows 自带的 usbaudio2.sys 端点。
+          虚拟声卡：usbip-win2（BSD-2）+ UAC1 描述符 → Windows 自带的 usbaudio.sys 端点
+          （44.1–96kHz 的 16/24/32bit，176.4/192kHz 只 16bit）。<br />
+          更高规格请自装第三方虚拟声卡（VB-CABLE、VoiceMeeter 等），可直接拖进混音画布接线。
         </n-text>
         <n-divider />
         <n-popconfirm @positive-click="api.quitApp()">

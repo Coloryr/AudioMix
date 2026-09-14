@@ -65,12 +65,13 @@ export interface ApiStatus {
 export type UsbIpCableMode = "loopback" | "mixer" | "reverse";
 
 /**
- * USB 音频类版本：
- * - `uac1`：USB Audio 1.0（USB 1.1 全速）→ Windows 自带 usbaudio.sys，兼容性最好；
- *   每 1ms 一个包，单包上限 1023 字节，因此高位深/高采样率受限（如 48k/16 可以，192k/32 不行）
- * - `uac2`：USB Audio 2.0（高速）→ usbaudio2.sys，192kHz/32bit 需要它
+ * 内置虚拟线路只有 **UAC1**（USB Audio 1.0 / USB 1.1 全速 → Windows 自带 usbaudio.sys）。
+ *
+ * 每 1ms 一个包、单包上限 1023 字节，所以支持矩阵是：
+ * 44.1–96 kHz 的 16/24/32bit，176.4/192 kHz 只 16bit。
+ * 需要更高规格（192k/24bit 等）的线路请自行安装第三方虚拟声卡（VB-CABLE 等），
+ * 它们会作为普通 Windows 端点出现在混音画布里。
  */
-export type UsbIpCableProtocol = "uac1" | "uac2";
 
 /** 一条虚拟线缆的配置（后端 UsbIpCableSettings） */
 export interface UsbIpCable {
@@ -80,12 +81,10 @@ export interface UsbIpCable {
   name: string;
   /** 44100 / 48000 / 88200 / 96000 / 176400 / 192000 */
   sample_rate: number;
-  /** 16 / 24 / 32 */
+  /** 16 / 24 / 32（>96 kHz 时只允许 16） */
   bits: number;
   mode: UsbIpCableMode;
   buffer_ms: number;
-  /** USB 音频类版本 */
-  protocol: UsbIpCableProtocol;
 }
 
 /** 一条线缆的运行态 */
@@ -95,8 +94,6 @@ export interface UsbIpCableStatus {
   name: string;
   /** 实际显示名（空名回退 Virtual Cable NN） */
   display_name: string;
-  /** "uac1" | "uac2" */
-  protocol: string;
   sample_rate: number;
   bits: number;
   mode: string;

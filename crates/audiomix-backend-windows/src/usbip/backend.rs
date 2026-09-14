@@ -212,7 +212,6 @@ impl AudioBackend for UsbIpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usbip::descriptors::CableProtocol;
     use crate::usbip::device::{CableConfig, CableMode};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -224,7 +223,6 @@ mod tests {
             bits: 16,
             mode: CableMode::Loopback,
             buffer_ms: 250,
-            protocol: CableProtocol::Uac2,
         }
     }
 

@@ -20,7 +20,6 @@ import {
   type AttachReport,
   type UsbIpCable,
   type UsbIpCableMode,
-  type UsbIpCableProtocol,
   type UsbIpStatus,
 } from "../api";
 import { useApp } from "../store";
@@ -44,14 +43,45 @@ const RATE_OPTIONS = [44100, 48000, 88200, 96000, 176400, 192000].map((v) => ({
   value: v,
 }));
 const BIT_OPTIONS = [16, 24, 32].map((v) => ({ label: `${v} bit`, value: v }));
-const PROTOCOL_OPTIONS: { label: string; value: UsbIpCableProtocol }[] = [
-  { label: "UAC1（全速 · 兼容优先）", value: "uac1" },
-  { label: "UAC2（高速 · 192K 用）", value: "uac2" },
-];
 
-/** 每毫秒 PCM 字节数（2 通道）——UAC1 是全速设备，上限 1023 字节/包 */
+/** 内置线路（UAC1 全速）的规格上限：每毫秒 ≤1023 字节，且 >96kHz 只给 16bit */
+const MAX_BYTES_PER_MS = 1023;
+const MULTIBIT_MAX_RATE = 96000;
+
+/** 每毫秒 PCM 字节数：按整数个采样帧向上取整（与后端端点包长同规则；UAC1 全速上限 1023） */
 function bytesPerMs(c: UsbIpCable): number {
-  return Math.ceil((c.sample_rate * 2 * (c.bits / 8)) / 1000);
+  return Math.ceil(c.sample_rate / 1000) * 2 * (c.bits / 8);
+}
+
+/** 该格式内置线路是否支持（与后端 UsbIpCableSettings::is_supported 同规则） */
+function formatSupported(c: UsbIpCable): boolean {
+  return !(c.sample_rate > MULTIBIT_MAX_RATE && c.bits !== 16) && bytesPerMs(c) <= MAX_BYTES_PER_MS;
+}
+
+/** 采样率下拉：当前位深为 24/32bit 时，>96kHz 的档位不可选 */
+function rateOptionsFor(c: UsbIpCable) {
+  return RATE_OPTIONS.map((o) => ({
+    ...o,
+    disabled: c.bits !== 16 && o.value > MULTIBIT_MAX_RATE,
+    title: c.bits !== 16 && o.value > MULTIBIT_MAX_RATE ? "内置线路在 96kHz 以上只提供 16bit" : undefined,
+  }));
+}
+
+/** 位深下拉：当前采样率 >96kHz 时，24/32bit 不可选 */
+function bitOptionsFor(c: UsbIpCable) {
+  return BIT_OPTIONS.map((o) => ({
+    ...o,
+    disabled: c.sample_rate > MULTIBIT_MAX_RATE && o.value !== 16,
+    title: c.sample_rate > MULTIBIT_MAX_RATE && o.value !== 16 ? "内置线路在 96kHz 以上只提供 16bit" : undefined,
+  }));
+}
+
+/** 格式不支持时的提示 */
+function formatHint(c: UsbIpCable): string {
+  if (c.sample_rate > MULTIBIT_MAX_RATE && c.bits !== 16) {
+    return `内置线路在 ${MULTIBIT_MAX_RATE / 1000}kHz 以上只提供 16bit；需要 ${c.sample_rate / 1000}kHz/${c.bits}bit 请自装第三方虚拟声卡（如 VB-CABLE）`;
+  }
+  return `内置线路（UAC1 全速）每毫秒上限 ${MAX_BYTES_PER_MS} 字节，该格式需要 ${bytesPerMs(c)} 字节`;
 }
 
 const driverReady = computed(() => status.value?.driver.installed === true);
@@ -68,7 +98,6 @@ async function load() {
     bits: c.bits,
     mode: c.mode as UsbIpCableMode,
     buffer_ms: c.buffer_ms,
-    protocol: (c.protocol === "uac2" ? "uac2" : "uac1") as UsbIpCableProtocol,
   }));
   dirty.value = false;
   return s;
@@ -100,8 +129,6 @@ function addCable() {
     bits: 16,
     mode: "loopback",
     buffer_ms: 250,
-    // 新线路默认 UAC1（全速、兼容性最好；需要 192K/32bit 再切 UAC2）
-    protocol: "uac1",
   });
   dirty.value = true;
 }
@@ -148,6 +175,15 @@ function attachedOf(number: number) {
  */
 async function saveCables() {
   await guarded(async () => {
+    const bad = cables.value.filter((c) => !formatSupported(c));
+    if (bad.length) {
+      message.error(
+        `线路 ${bad.map((c) => c.number).join("、")} 的格式超出内置线路规格：${bad
+          .map((c) => formatHint(c))
+          .join("；")}`,
+      );
+      return;
+    }
     const s = await api.usbipSetCables(enabled.value, cables.value);
     status.value = s;
     enabled.value = s.enabled;
@@ -221,7 +257,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <n-card title="虚拟声卡（usbip-win2 + UAC2）" size="small">
+  <n-card title="虚拟声卡（usbip-win2 + UAC1）" size="small">
     <!-- 传输驱动安装状态 -->
     <n-alert
       v-if="status && !driverReady"
@@ -230,7 +266,7 @@ onMounted(() => {
       style="margin-bottom: 12px"
     >
       虚拟声卡由 <b>usbip-win2</b>（BSD-2，微软签名驱动，内存完整性 HVCI 兼容）把应用内置的
-      USB/IP 服务器仿真的设备接入 Windows，再由系统自带的 usbaudio2.sys 暴露为标准播放/录音端点。
+      USB/IP 服务器仿真的设备接入 Windows，再由系统自带的 usbaudio.sys（UAC1）暴露为标准播放/录音端点。
       <template v-if="status.driver.installer_path">
         已随包提供安装包，点击下面按钮一键安装（需要管理员权限，安装过程会短暂重启 USB 集线器）。
       </template>
@@ -287,11 +323,15 @@ onMounted(() => {
     <n-divider style="margin: 4px 0 12px" />
 
     <!-- 线路列表：名称 / 格式 / 接线 -->
-    <div class="section-title">虚拟线路（1–32 条，采样率 44.1–192kHz / 位深 16–32bit 独立可配）</div>
+    <div class="section-title">虚拟线路（1–32 条，格式独立可配）</div>
     <n-text depth="3" style="font-size: 12px; display: block; margin-bottom: 10px; line-height: 1.8">
       线路两端对应 Windows 里的两个端点：<br />
       · <b>线路输入</b> ＝ 系统<b>录音</b>端（麦克风）——混音器写到这里，别的软件从「Virtual Cable NN 麦克风」录；<br />
       · <b>线路输出</b> ＝ 系统<b>播放</b>端（扬声器）——别的软件选「Virtual Cable NN 扬声器」播放，声音从这进混音器。<br />
+      内置线路是 <b>UAC1（USB 1.1 全速，系统自带 usbaudio.sys）</b>，格式上限：
+      <b>44.1–96 kHz 的 16/24/32bit</b>，<b>176.4/192 kHz 只支持 16bit</b>。<br />
+      需要更高规格（例如 192kHz/24bit）或更低延迟的线路，请自行安装第三方虚拟声卡（VB-CABLE、VoiceMeeter 等）——
+      它们会作为普通 Windows 端点出现在混音画布左侧设备列表里，直接拖进来接线即可。<br />
       内部拷贝方向：<b>直接点接线图上的箭头</b>选（点中间那条线也可以循环切换；再点一次箭头即取消）——
       <b>线路输出 → 拷贝到 → 线路输入</b>（播放端的声音原样出现在录音端）、
       <b>线路输入 → 拷贝到 → 线路输出</b>（写进录音端的数据回灌到播放端）、或都不点＝<b>不拷贝</b>（只走混音图）。
@@ -301,7 +341,7 @@ onMounted(() => {
     <n-list v-if="cables.length" :show-divider="false" style="margin-bottom: 10px">
       <n-list-item v-for="c in cables" :key="c.number">
         <div class="cable-row">
-          <!-- 第一行：身份与格式（名称/采样率/位深/协议/带宽告警/接入状态/删除） -->
+          <!-- 第一行：身份与格式（名称/采样率/位深/带宽告警/接入状态/删除） -->
           <div class="cable-row-line">
             <n-tag size="small" type="warning" :bordered="false">{{ String(c.number).padStart(2, "0") }}</n-tag>
             <n-input
@@ -315,38 +355,26 @@ onMounted(() => {
             />
             <n-select
               v-model:value="c.sample_rate"
-              :options="RATE_OPTIONS"
+              :options="rateOptionsFor(c)"
               size="small"
               style="width: 112px"
               @update:value="dirty = true"
             />
             <n-select
               v-model:value="c.bits"
-              :options="BIT_OPTIONS"
+              :options="bitOptionsFor(c)"
               size="small"
               style="width: 92px"
               @update:value="dirty = true"
             />
-            <n-select
-              v-model:value="c.protocol"
-              :options="PROTOCOL_OPTIONS"
-              size="small"
-              style="width: 168px"
-              :title="
-                c.protocol === 'uac2'
-                  ? 'UAC2（高速，usbaudio2.sys）：192kHz/32bit 需要它'
-                  : 'UAC1（USB 1.1 全速，usbaudio.sys）：兼容性最好，每毫秒上限 1023 字节'
-              "
-              @update:value="dirty = true"
-            />
             <n-tag
-              v-if="c.protocol === 'uac1' && bytesPerMs(c) > 1023"
+              v-if="!formatSupported(c)"
               size="small"
               type="error"
               :bordered="false"
-              title="UAC1 是全速设备，每毫秒最多 1023 字节；该采样率/位深需要更多带宽，请改成 UAC2"
+              :title="formatHint(c)"
             >
-              UAC1 带宽不足
+              超出内置线路规格
             </n-tag>
             <n-tag
               size="small"
@@ -525,7 +553,7 @@ onMounted(() => {
     <n-text depth="3" style="display: block; font-size: 12px; line-height: 1.8; margin-top: 8px">
       混音页用法：设备面板里每条线路拆成两个可分别拖入的节点 ——
       <b>线路输入</b>（系统录音端，混音图写到这）和 <b>线路输出</b>（系统播放端，混音图当源用）。
-      所有声卡设备（含第三方虚拟声卡）也都能直接拖进画布。
+      所有声卡设备（含第三方虚拟声卡）也都能直接拖进画布：自装的虚拟声卡（VB-CABLE 等）就是走这条路接入混音的。
     </n-text>
   </n-card>
 </template>

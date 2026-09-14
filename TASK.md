@@ -1,25 +1,25 @@
-# TASK：USB/IP 虚拟声卡（usbip-win2 + UAC）
+# TASK：USB/IP 虚拟声卡（usbip-win2 + UAC1）
 
-> 更新时间：2026-09-14。历史过程已删，**已完成的任务已从列表移除**，只留待办与仍然有效的结论。
-> 优先级：**P0 UAC2 → P1 虚拟麦克风 → P2 界面/功能**。
+> 更新时间：2026-09-15。历史过程已删，**已完成的任务已从列表移除**，只留待办与仍然有效的结论。
+> 优先级：**P0 传输层天花板与内置规格（已定论）→ P1 虚拟麦克风 → P2 界面/功能**。
 
 ## 目标
 
 应用内置 **USB/IP 服务器**（TCP 127.0.0.1:3240，协议 v1.1.1）仿真 USB 声卡，
-用 **usbip-win2**（微软签名、HVCI 兼容）把它接进 Windows，系统自带驱动
-（UAC1 → `usbaudio.sys`，UAC2 → `usbaudio2.sys`）暴露成标准播放/录音端点。
-每条线缆采样率 44.1–192kHz、位深 16/24/32bit 可配。
+用 **usbip-win2**（微软签名、HVCI 兼容）把它接进 Windows，系统自带 **UAC1** 驱动
+`usbaudio.sys` 暴露成标准播放/录音端点。
 
+- **内置线路只做 UAC1（USB 1.1 全速）**：44.1–96kHz 的 16/24/32bit，176.4/192kHz 只 16bit；
+  超出规格的线路由用户自装第三方虚拟声卡（VB-CABLE 等），见 P0。
 - HVCI 开启，MTT 内核驱动报错 52 → 弃用自研内核驱动，改走 USB/IP。
 - usbip 模块放在 `audiomix-backend-windows`，**不新建 crate**；安装包随应用捆绑。
-- 参考实现：`tarekwasfy01/Virtual-Cables`（Go，BSD-2；本地 `H:\Temp\vc-src`）
-  与 Linux `f_uac2.c`。**UAC1 已打通并在真机验证**（见「关键结论」）。
-- UAC1 全速带宽上限 1023 B/ms → `192k/24bit`、`176.4k/24bit` 在 UAC1 下直接报错提示改用 UAC2。
+- 参考实现：`tarekwasfy01/Virtual-Cables`（Go，BSD-2；本地 `H:\Temp\vc-src`）的 UAC1 描述符与
+  USB/IP 数据通路。UAC1 已打通并在真机验证（见「关键结论」）。
 
 ## 数据流
 
 ```
-Windows 应用播放 → 扬声器 (Virtual Cable NN)  [usbaudio/usbaudio2]
+Windows 应用播放 → 扬声器 (Virtual Cable NN)  [usbaudio.sys]
   → usbip-win2 vhci → TCP:3240 → ISO OUT PCM（小端）→ pcm_to_f32 → play_ring
       a) 引擎 Source tap（start_capture）→ 混音图路由 → Sink → 物理输出设备
       b) loopback 模式：同份数据写 cap_ring → ISO IN → 麦克风端
@@ -31,83 +31,129 @@ Windows 应用播放 → 扬声器 (Virtual Cable NN)  [usbaudio/usbaudio2]
 
 ## 待办（按优先级）
 
-### P0 · UAC2 仍未打通（最高优先级）
+### P0 · 传输层天花板与内置规格（已定论）
 
-设备能枚举（`usbaudio2.sys`，Problem 0），但 Windows 拿不到「设备格式」：
-`GetMixFormat` → `0x88890008 (AUDCLNT_E_UNSUPPORTED_FORMAT)`；KS 独占下 48k/16 PCM 仍被接受，
-驱动却不停 `SET_CUR(采样率)` + `SET_INTERFACE(alt1→alt0)` 死循环、从不发起 iso 传输。
+**结论：内置虚拟线路只做 UAC1（USB 1.1 全速）。超出规格的线路由用户自装第三方虚拟声卡。UAC2 已从代码中删除。**
 
-已排除：包长余量、bInterval(1/3/4)、单/双 clock、clock 类型与 bmControls、有无 Feature Unit、
-端点同步类型、AC 中断端点（有/回包/NAK/无）、bCategory、终端拷贝控制位、
-iso 包 `offset` 是否连续（实测连续）、采样率/位深（换 48k/16 照样失败）。
+#### 为什么不可能有 192k/24bit（上限来自 Microsoft 的 UDE 类扩展，不在我们手里）
 
-**本轮进展（2026-09-14，逐字对照 Linux `f_uac2.c` 后的结论与改动）**：
+- USB/IP 在 Windows 侧由 **UDE（USB Device Emulation）+ `ucx01000.sys`（USBHUB3）** 处理等时传输，
+  它一律按 0.125ms 微帧解读 `bInterval`，因此 **iso 端点的 `bInterval` 必须 ≥ 4（服务间隔 ≥1ms）**。
+  usbip-win2 源码里就是给不满足的端点打补丁：`drivers/ude/wsk_receive.cpp::patch_config()`
+  `case UsbdPipeTypeIsochronous: e.bInterval = min(e.bInterval + 3, 16)`；
+  上游 issue #35 第 29 条（Nefarius）把「虚拟 USB 音频在 UDE 上能工作的三件套」总结为
+  ①以高速呈现 ②QueryBusTime 返回成功 ③**iso bInterval ≥ 4**；修复 commit `2cee7e0` 同义。
+- ⇒ **每个 iso 端点每毫秒最多 1024 字节 ⇒ 立体声 24bit 上限约 170.6 kHz**；
+  192k/24 = 1152 B/ms 必然超限。UAC1 与 UAC2 受同一条约束。
+- 另有一道 `usbaudio.sys` 的限制：它按 `min(wMaxPacketSize, 1024)` 判断单包容量 ——
+  所以「把 wMaxPacketSize 直接写成 1152」这类绕法（当时的 `rawbig` 变体）实测直接失败。
+- 实测（每项都核对过注册表 `PKEY_AudioEngine_DeviceFormat` 并真的开流）：
 
-- **步骤 2 的假设可以排除**：读 `get_max_bw_for_bint()` 源码，playback 与 async capture 走的是
-  同一分支——速率先按 `fb_max=5` 膨胀 0.5%（`srate*1005/1000`）再 `DIV_ROUND_UP` 到服务间隔，
-  **恒比标称多 1 帧**，两个方向都加；「+1 帧只加在 capture」的说法不成立（那是 sync capture 分支）。
-  48k/96k/192k 下我们的 `wMaxPacketSize` 与 f_uac2 **逐字节相同**（如 48k/16 → 196B@bInterval=4）；
-  仅 44.1k 系比 f_uac2 多 1 帧（我们更大，不太可能导致失败）。
-- 描述符已对齐 f_uac2 拓扑（`descriptors.rs`）：**两个 Clock Source**（播放=10 / 采集=11，
-  对应 MS 文档「limited support for devices using a shared clock」），
-  `bmAttributes=0x03`（internal fixed，f_uac2 的 `INT_FIXED`），
-  `packet_bytes_at()` 改为 f_uac2 同款公式；`device.rs` 的 EP0 处理本来就同时支持实体 10/11。
-- 步骤 1 的工具已就位：`device.rs::handle_control` 对每条类请求打 trace（含 wLength 与应答长度）、
-  STALL 打 debug。
+  | 格式 | 结果 |
+  |---|---|
+  | 48k/16（192 B/ms）| ✓ 流式正常 |
+  | 96k/24（576 B/ms）| ✓ |
+  | 192k/16（768 B/ms）| ✓ |
+  | 176.4k/24（1059）、192k/24（1152）| ✗ 无设备格式、无 ISO URB |
 
-**2026-09-14 下午 trace 实测（`RUST_LOG=audiomix_backend_windows=trace`，48k/16/uac2，步骤 1 已执行）**：
+- UAC2（`usbaudio2.sys`）在这条通路上**功能上没有意义**：它唯一的优势是亚毫秒服务间隔，
+  而这恰是 UDE 明令禁止的。多轮实验（9 组配置 + 逐字段复刻 TinyUSB / `f_uac2` / XMOS 量产固件描述符）
+  都停在「设备能枚举、端点已建立、EP0 零 STALL，但 Windows 拿不到设备格式、一个 iso URB 都不发」。
+- **换客户端也没用**：Windows 上真正的 USB/IP 客户端只有 usbip-win2（BSD-2，活跃）与
+  cezanne/usbip-win（GPL-3，README 自述已被 usbip-win2 取代 —— 它的 `vhci(wdm)` 正是
+  "不能完整支持 USB 应用" 才补了 `vhci(ude)`）；2026 年仍在更新的同类框架（VIIPER）
+  在 Windows 上同样依赖 usbip-win2。任何 UDE 客户端共享同一条上限。
+  （若将来必须更高规格，唯一出路是离开 USB/IP 走内核音频驱动，见 P3 备选方案。）
 
-- **EP0 完全干净**：枚举/字符串/SET_CONFIG/GET_STATUS/时钟 GET_RANGE（驱动以 `wLength=256`
-  请求、答 14 字节属正常读法）/Feature Unit 音量 GET_RANGE/GET_CUR 全部 wLength 吻合、零 STALL
-  —— **步骤 4 的描述符字节级 diff 不必做了，描述符已排除**。
-- **死循环抓到**：`SET_INTERFACE(if1/if2, alt1) → 立即 alt0 → SET_CUR(clock 实体)` 每 ~1.5ms 一轮，
-  **零 ISO URB 到达服务器**（server 的 URB trace 只有 EP3 中断轮询）——失败发生在 Windows 内部，
-  驱动反复尝试激活 iso 管道、瞬间被否决。界面症状与之一致：声音设置里端点属性只有空的「级别」栏
-  （usbaudio2 没建出任何可用格式/KS pin）。
-- **根因定位（usbip-win2 issue #35 同款，官方也只修了全速）**：usbip-win2 0.9.8 的 UDE 虚拟控制器里，
-  `ucx01000!UrbHandler_USBPORTStyle_Legacy_IsochTransfer` 会把 iso URB 以 USBD_STATUS_INVALID_PARAMETER
-  直接否决（URB 不下发到服务器）。UDE 对 bInterval 永远按 0.125ms 微帧解释；官方修复
-  （commit 2cee7e0）只在**返回的配置描述符里把「iso OUT 且 bInterval==1」补丁成 4**——即 UDE 只验证过
-  「全速设备 + 1ms 包」形态（UAC1 即此形态）。原生高速（SPEED_HIGH + 高速 bInterval 语义）iso
-  没有可用先例（Xbox 手柄 iso 设备同类失败：#170/#125）。
-- **决策（用户拍板，2026-09-14）：全部改用高速模式（High-Speed，480 Mbps）**——UAC2 保持原生高速
-  描述符（bInterval=4、包长按 1ms 服务间隔）与 `SPEED_HIGH` 上报，**不降级全速**（全速会失去
-  192k/24bit、192k/32bit，违背 UAC2 的存在意义）。本地暂无绕过手段；后续方向：跟进/推动
-  usbip-win2 修复 UDE 高速 iso（issue #35 思路：其 filter 驱动可在 ucx 校验前拦截/改造 iso URB，
-  或等待上游把高速 iso 补齐），必要时评估替换虚拟主机控制器方案。本机装的是
-  `C:\Program Files\USBip`（usbip-win2 0.9.8.0，Cloudyne 签名）。
+#### 内置规格（唯一支持矩阵）
 
-**改动 usbip-win2 的可行性分层（2026-09-14 分析，配合上条决策）**：
+| 位深 | 44.1 / 48 / 88.2 / 96 kHz | 176.4 / 192 kHz |
+|---|---|---|
+| 16 bit | ✓ | ✓ |
+| 24 bit | ✓ | ✗ |
+| 32 bit | ✓ | ✗ |
 
-- 请求链：usbaudio2 → usbccgp → **usbip2_filter** → UsbHub3 → **ucx01000.sys（微软，闭源）** →
-  **usbip2_ude（UDE 客户端）** → TCP → 我们的服务器。iso URB 死在 ucx 的
-  `UrbHandler_USBPORTStyle_Legacy_IsochTransfer` 校验，**到不了 usbip2_ude**——UDE 客户端是
-  被动回调（UCX 校验通过才派发进它的端点队列），单改 usbip2_ude 绕不过校验。
-- **路线 A（先做，零改驱动）**：描述符实验矩阵。描述符是我们服务器发的（经 usbip2_ude 的 EP0
-  转发原样上交），URB 形状由端点描述符间接决定。逐个变量试：mult 位域编码（wMaxPacketSize
-  bits 12:11）、bInterval 1/2/3、包长 8/64/1024 对齐（#35 里 bozax 提过高速要"match 64"）、
-  async OUT 补显式 feedback 端点（MS 文档的高速音频常见拓扑，usbaudio2 提交的 URB 形状会变）。
-  一次一个变量 + 真机验证。运气好直接过校验，不用碰 usbip-win2。
-- **路线 B（A 穷尽后）**：usbip2_filter 在 UsbHub3/ucx **之前**看到原始 IRP，可把 SUBMIT iso /
-  ABORT_PIPE / SYNC_RESET_PIPE 全部拦截、自己配对转发到服务器，不往下传（= 绕过 ucx 校验）。
-  作者 2023 年在 #35 试过失败了，但当时失败的请求生命周期问题后来在 #181/#182 重构过，
-  0.9.8 基础比当年好。WDK 内核 C 开发（P0 级难度，周级），调试要 WinDbg。
-- **签名门槛（比技术更硬）**：改过的驱动失去微软签名。出路：①上游 PR/issue 推动 vadimgrn
-  （零成本、保持 HVCI 兼容，我们的「描述符可控 + EP0 trace 干净 + 稳定复现」虚拟测试床是推动
-  上游的最好筹码）；②自购 EV 证书做 attestation 签名（约 $99/年 + 合作伙伴中心流程）；
-  ③本机关 HVCI + `bcdedit /set testsigning on`（立即可用，但失去当初选 usbip-win2 的理由，
-  无法部署他人机器）。
+- 端点由系统自带 `usbaudio.sys` 驱动；描述符 = UAC1 全速（`bcdUSB=0x0110`、类字段全 0、无 IAD、
+  无 device qualifier、iso `bInterval=1`、包长 = 每毫秒 PCM 字节数 ≤1023）。
+- 校验在 `audiomix-core::UsbIpCableSettings::{validate,is_supported}` 与
+  `usbip::descriptors::CableFormat::validate` 两处一致实现；旧配置里超规格的组合
+  在载入时自动降级（`clamp_supported`，写一条 warning 日志），不会让应用起不来。
+- **超出规格怎么办**：用户自行安装第三方虚拟声卡（VB-CABLE、VoiceMeeter 等）。
+  它们作为普通 Windows 端点出现在混音页左侧设备列表，可直接拖进画布接线，我们不需要适配。
 
-### P1 · 虚拟麦克风（capture 方向）应用侧几乎收不到声音
+#### 端点包长必须按「整数个采样帧」取整（2026-09-15 真机发现并已修）
 
-- **设备侧完全正常**：`ISO IN` 统计 100 URB/s、187 KB/s、峰值 0.25、**零样本仅 0.1%**
-  —— 我们交给主机的 PCM 是满幅、连续的。
-- **应用侧却是 −57 dB 的近似静音**（`GetMixFormat` 正常、端点音量 1.0、未静音、无精确零缺口）；
-  偶尔某次能录到完美的 1kHz（倍率 1.0000、RMS 0.015）。
+- 44.1k 系每毫秒是**小数帧**（44.1k/24bit/stereo = 264.6 字节 = 44.1 帧）。早期实现把
+  标称字节数向上取整写进 `wMaxPacketSize`（265 = 44 帧 + 1 字节）——**不是合法音频包**：
+  该线路的渲染端点在 Windows 里拿不到任何设备格式（`GetMixFormat` → `AUDCLNT_E_UNSUPPORTED_FORMAT`，
+  注册表也没有 `PKEY_AudioEngine_DeviceFormat`），而 48k 系（192/576/768 恰好整帧）全部正常。
+- 修法：`fs_wmax_packet() = ceil(rate/1000) × 帧长`（44.1k/24 → 45 帧 = 270 B，176.4k/16 → 708 B），
+  核侧同规则（`UsbIpCableSettings::packet_bytes_per_ms`）；48k 系数值不变。
+- 实测（`examples/uac1bench.rs` + `usbip.exe attach` + 注册表 `PKEY_AudioEngine_DeviceFormat`
+  + `examples/vcfmt.rs` 真开流 + 服务端 `play_ring` 统计）：
+  44.1k/16、44.1k/24、88.2k/24、176.4k/16、48k/16、96k/24、96k/32、48k/32、192k/16
+  **全部「设备格式正确 + 开流成功 + 服务端确认在收数据」**。
+  **注意这是单向（渲染 → 设备）的结论**；出去方向（虚拟麦克风）的回环测试尚未通过，见 P1。
+- 排障注意：Windows 会按 **vhci 端口/设备实例**缓存音频端点属性，同一个线缆号在同一端口上
+  换格式重新 attach 时，注册表里可能还是上一轮的旧格式（会误判成"没生效"）。
+  验证时**换线缆号**（新 PID/序列号 → 新实例）最干净。
+
+#### 保留备查的上游引用
+
+- usbip-win2 issue #35（含 #29 Nefarius 的「unholy trinity」）、issue #181（0.9.7.8 上 ISO 音频可用）、
+  commit `2cee7e0`「Fix isoch out transfers」、`drivers/ude/wsk_receive.cpp::patch_config()`。
+- Windows 侧校验点：`ucx01000.sys::UrbHandler_USBPORTStyle_Legacy_IsochTransfer`
+  → `USBD_STATUS_INVALID_PARAMETER`。
+- 描述符实验（UAC2 的一整套变体、逐字段对齐参考实现）的记录保留在 git 历史与
+  `H:\Temp\AudioMix\` 下的日志/脚本里，不再留在代码中。
+
+### P1 · 虚拟麦克风（capture 方向）出不了声 —— **回环端到端尚未通过**
+
+> **验证状态（2026-09-15，UAC1-only 重构后逐格式实测）**
+>
+> 已通过的部分：**创建**（Windows 出现设备）、**端点设备格式**（注册表
+> `PKEY_AudioEngine_DeviceFormat` 与配置一致）、**打开**（渲染流 + 采集流都能开）、
+> **渲染 → 设备**（`play_ring` 持续收到数据）。
+>
+> **未通过：回环（播进虚拟声卡 → 从虚拟麦克风录回）—— 6 种格式全部失败**
+> （`examples/uac1bench.rs` + `usbip.exe attach` + `examples/vcmic.rs`，播 1kHz/0.25 共 8 秒）：
+>
+> | 线缆格式 | 渲染/采集端点格式 | 回环结果 |
+> |---|---|---|
+> | 48k/16 | 48000 / 48000 | ❌ 100ms RMS 中位 0.0000（−53.5 dB），频率读数乱 |
+> | 44.1k/24 | 44100 / 48000 | ❌ 有信号但音高错（倍率 1.0695）、RMS 中位 0.0399 |
+> | 96k/24 | 96000 / 48000 | ❌ 中位 0.0000（−48.6 dB） |
+> | 96k/32 | 96000 / 48000 | ❌ 中位 0.0000（−47.2 dB） |
+> | 176.4k/16 | 176400 / 48000 | ❌ 有信号但音高错（倍率 1.0154）、RMS 中位 0.0224 |
+> | 192k/16 | 192000 / 48000 | ❌ 中位 0.0000（−29.5 dB） |
+>
+> 与 App 里那条 48k/16 线路现象一致（旧记录 −57 dB）⇒ **不是本轮 UAC1 重构引入的**
+> （本次只改了描述符/协议选择，没碰 ISO IN、环形缓冲与控制时序），**也与格式无关**
+> （48k/16 无需重采样，同样失败 ⇒ 排除"非 48k 重采样破坏数据"这一方向）。
+
+- **设备侧确实在发**：回环测试期间 `play_ring` 持续收数据（48k/16 累计丢 74.6 万样本），
+  `cap_ring` 也有数据、**欠载仅约 4%**（≈96% 的 ISO IN 包有内容），端点音量 1.0000、未静音
+  ⇒ 数据是在**设备之外**（驱动 / 音频引擎 / 采集 API 这一段）掉的。
+- 早期记录仍有效：`ISO IN` 侧 100 URB/s、187 KB/s、峰值 0.25、零样本 0.1%（我们交出去的 PCM
+  是满幅连续的）；App 采集侧却是 −57 dB 近似静音，偶尔某次能录到完美的 1kHz（倍率 1.0000）。
 - 已修的**真问题**：loopback 拷贝只在「主机真的在读麦克风（录音接口 alt1）」时才做，
   否则 `cap_ring` 会被灌满、之后每次 push 都丢掉**还没被读走**的音频（实测丢接近 100%）。
-- 下一步：统计 `AUDCLNT_BUFFERFLAGS_SILENT` 占比；用另一种宿主（独占采集 / KS 直读）交叉验证；
-  对比 ISO IN 完成时刻与驱动采集缓冲的对齐关系。
+- **已撤回的线索（2026-09-14 晚）**：曾怀疑「采集端点永远报 48000Hz/2ch」是元凶，
+  但注册表 `PKEY_AudioEngine_DeviceFormat` 显示**采集端点的设备格式是正确的**
+  （192k/16 线缆 → 192000/16 ✓，96k/24 → 96000/24 ✓）；`GetMixFormat` 对采集端点返回的
+  是**音频引擎的共享混音格式**（48k/32f），属正常现象。判定设备侧格式**一律以注册表为准**。
+- **诊断环境噪声（重要）**：这台机器积累了大量历史遗留虚拟端点（`2- Virtual Cable xx`、
+  `MTX1 uac1` 等），它们在 WASAPI 里仍可能显示为 active，**按名字筛设备的诊断工具会选到它们**；
+  本次回环测试用**全新线缆号 27–32** 规避。同理，Windows 按 vhci 端口/设备实例缓存端点属性，
+  换格式重测要换线缆号。
+- **下一步（待排期，按信息量排序）**：
+  1. `examples/vcmeter`：播 1kHz 时用 `IAudioMeterInformation` 读虚拟麦克风端点的**引擎电平** ——
+     有电平 ⇒ 数据到了引擎、丢在采集回调；−∞ ⇒ 没进引擎，问题在驱动/端点格式层。**一步砍一半范围。**
+  2. `examples/vcks`：**独占模式 / KS 直读**对比（绕过共享引擎）。共享失败、独占成功 ⇒
+     共享混音/重采样路径问题。
+  3. 服务端加**边界电平日志**：分别打 ISO OUT 解码后与 ISO IN 读出前的 1 秒 RMS，
+     钉死"我们发出去的是不是那个正弦"。
+  4. 核对 App 里 `usbip://1/capture` 解析到的是**本次 attach 的新实例**，不是历史同名端点。
 
 ### P2 · 界面 / 功能清单
 
@@ -150,6 +196,12 @@ undefined×数=NaN，整条 path 画不出来**；dir 缺省按 0 处理即修�
 3. **单实例**：重复启动时唤醒已有窗口（而不是起第二个引擎/第二份 USB/IP 服务器）。
 4. **便携版（绿色）**：配置与日志跟随可执行文件目录，而不是 `%APPDATA%`。
 5. 安装包体积（已捆绑 usbip 安装包约 26MB）与首次安装体验（驱动安装 + 一条线缆的引导）。
+6. **（备选，仅在需要突破 P0 天花板时）换传输层**：如果将来确实要 192k/24bit 或 <15ms 延迟，
+   USB/IP 这条路走不通，只能自写**内核音频驱动**（Microsoft 的 `sysvad` 示例 MS-PL /
+   ACX AudioCodec 示例为起点，纯用户态做不到创建音频端点）。代价：驱动开发数周、内核调试风险、
+   **每个设备实例的增删都需要管理员**（除非连虚拟总线一起写）、以及签名
+   （开发用测试签名需关 Secure Boot + `bcdedit /set testsigning on`；分发要 Microsoft
+   attestation 或 WHQL）。当前 50–150ms 延迟与 ≤96k/24bit 规格够用，故只记录不排期。
 
 ## 关键结论（仍然有效的坑）
 
@@ -164,22 +216,21 @@ undefined×数=NaN，整条 path 画不出来**；dir 缺省按 0 处理即修�
   节拍=流速率；落后过多要**重新起拍**，而不是让主机一次性追平
   （后者让播放变快，并一次丢掉数秒音频：实测 `丢=562868` 样本 ≈ 5.9 秒）。
 
-### UAC1 vs UAC2 的类请求差异（UAC1 曾因此起不来）
+### UAC1 类请求（照抄参考实现 Virtual-Cables，写错就起不来）
 
-- UAC1 采样率控制挂在**端点**上（recipient=endpoint，wIndex 低字节 = 端点地址），值 **3 字节**；
-  UAC2 挂在 **Clock Source 实体**上，值 **4 字节**，且有 `GET_RANGE(0x82)`。
-- UAC1 查音量范围用**分开的三条**：`GET_MIN(0x82)`/`GET_MAX(0x83)`/`GET_RES(0x84)`，各 **2 字节**；
-  UAC2 用 `GET_RANGE` 一次返回「子范围数(2) + MIN/MAX/RES(各 2 或 4 字节）」。
-  按 UAC2 回 8 字节会被 `wLength=2` 截断 → `usbaudio.sys` StartDevice 失败（设备代码 10）。
-- UAC2 的 GET 请求码必须置 bit7（`GET_CUR=0x81`、`GET_RANGE=0x82`）；解析按 `request & 0x7F` 归一化。
-- Clock Source 若宣告了有效性控制（bmControls bit pair1），必须应答 `CS=0x02` 的 GET_CUR（1 字节）。
-- UAC2 描述符按 `f_uac2.c` 对齐：播放/采集**各一个** Clock Source（ID 10/11），
-  `bmAttributes=0x03`（internal fixed）、`bmControls=0x03`（频率可读写）；
-  高速 `wMaxPacketSize` 用 `get_max_bw_for_bint` 同款公式——`srate*1005/1000` 向上取整到服务间隔
-  × 帧长（fb_max=5，恒比标称多 1 帧），见 `descriptors.rs::packet_bytes_at`。
-- UAC1 描述符：`bcdUSB=0x0110`、类/子类/协议**全 0**、**不提供 device qualifier**、`bInterval=1`、
-  包长 = 每毫秒字节数（48k/16 → 192，精确不加余量）、播放 `bmAttributes=0x09`、采集 `0x0D`；
-  USB/IP devlist 按全速上报（`SPEED_FULL=2`）。
+- 采样率控制挂在**端点**上（recipient=endpoint，wIndex 低字节 = 端点地址），值 **3 字节**：
+  `GET_CUR(0x81)` / `GET_MIN(0x82)` / `GET_MAX(0x83)` / `GET_RES(0x84)`、`SET_CUR(0x01)`
+  （`device.rs::handle_class`，实测 `usbaudio.sys` 会问 MIN/MAX/RES）。
+- 音量/静音走**接口接收方 + Feature Unit 实体**（wIndex 高字节 = 实体 ID）：静音 1 字节，
+  音量 2 字节（1/256 dB，-60..0dB），范围同样用分开的 GET_MIN/GET_MAX/GET_RES。
+- **绝不能按 UAC2 的 `GET_RANGE` 回整块范围**：那是 8 字节，会被 `wLength=2` 截断 →
+  `usbaudio.sys` StartDevice 失败（设备管理器代码 10）。
+- 描述符：`bcdUSB=0x0110`、类/子类/协议**全 0**、**不提供 device qualifier**（请求即 STALL）、
+  iso `bInterval=1`、包长 = 每毫秒字节数（48k/16 → 192，精确不加余量）、
+  播放 `bmAttributes=0x09`、采集 `0x0D`；AC 块 wTotalLength=72；CS 端点 7 字节。
+- USB/IP devlist 按**全速**上报（`SPEED_FULL=2`），接口记录的 proto 字节 = 0x00。
+- 能力边界：`usbaudio.sys` 按「**每毫秒载荷 ≤ min(wMaxPacketSize, 1024)**（全速单包 1023）」校验格式，
+  且 `wMaxPacketSize` **必须是整数个采样帧**（44.1k 系踩过，见 P0）；24bit 立体声上限约 170 kHz。
 
 ### 音频数据面
 
@@ -234,7 +285,6 @@ undefined×数=NaN，整条 path 画不出来**；dir 缺省按 0 处理即修�
   变成每秒上千次轮询。
 - 渲染/采集回调线程要注册 **MMCSS「Pro Audio」**（`wasapi::ProAudio`），否则系统一忙就被抢占，
   输出会被补静音（实测出现过 645ms 静音空洞）。
-- 高速 iso `wMaxPacketSize`：bits 10:0 = 单事务字节数（≤1024），bits 12:11 = 额外事务机会。
 
 ## 工程约定
 

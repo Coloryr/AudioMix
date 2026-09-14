@@ -10,8 +10,14 @@ Tauri 2 + Vue 3 音频混合软件：把多个音频源（物理输入设备 / �
 - **USB/IP 虚拟声卡**（本项目的核心特性）：应用内置 USB/IP 服务器仿真一条 USB 声卡线缆，配合 usbip-win2 接入 Windows，系统自带驱动暴露成标准端点：
   - `扬声器 (Virtual Cable NN)` ＝ **线路输出**（别的软件往这里播放，声音进混音器）
   - `麦克风 (Virtual Cable NN)` ＝ **线路输入**（混音器写这里，别的软件从这里录）
-  - 每条线缆可配置名称（作为 USB 产品名显示在 Windows 里）、采样率（44.1–192kHz）、位深（16/24/32）、协议（UAC1/UAC2）与接线方式（loopback / mixer）
-  - **UAC1（`usbaudio.sys`，全速）已打通并真机验证**；UAC2（`usbaudio2.sys`，高速 192K）仍在开发，见「后续路线」
+  - 每条线缆可配置名称（作为 USB 产品名显示在 Windows 里）、格式（采样率/位深）与接线方式（loopback / mixer）
+  - **内置线路是 UAC1**（系统自带 `usbaudio.sys`，USB 1.1 全速）：
+    支持 **44.1–96kHz 的 16/24/32bit**，**176.4/192kHz 只支持 16bit**
+    （上限来自 Microsoft 的 UDE 类扩展：iso 端点服务间隔不得短于 1ms ⇒ 每端点 ≤1024 B/ms，见 TASK P0）
+  - ⚠️ 当前状态：设备创建、端点格式、播放/录音流打开、播放方向数据通路都已实测通过；
+    **虚拟麦克风（回环出音）尚未通过**，见「已知事项」P1
+  - 需要更高规格（192kHz/24bit 等）或更低延迟的线路，请自行安装第三方虚拟声卡（VB-CABLE、VoiceMeeter 等）——
+    它们会作为普通 Windows 端点出现在混音页设备列表，直接拖进画布接线即可
 - **Windows 默认设备管理**：混音页可直接把某个端点设为系统默认播放/录音设备；常驻守护会在虚拟线路接入时恢复用户偏好（不会被虚拟线缆抢走）
 - **电平表**：源与输出的实时峰值电平
 - **日志面板**：设置页可查看并复制运行日志（同时落盘 `audiomix.log`）
@@ -49,7 +55,7 @@ crates/audiomix-backend-windows WASAPI 实现 + Windows 策略 + USB/IP 虚拟�
   ├─ policy.rs     Windows 默认设备切换（IPolicyConfig）、端点音量/静音
   └─ usbip/        USB/IP 服务器与虚拟线缆
       ├─ protocol.rs    USB/IP v1.1.1 线格式
-      ├─ descriptors.rs UAC1/UAC2 描述符构建（按采样率/位深参数化）
+      ├─ descriptors.rs UAC1 描述符构建（按采样率/位深参数化）
       ├─ device.rs      线缆状态机：类请求 + PCM↔f32 + 播放/录音环形缓冲
       ├─ server.rs      tokio 服务：devlist/import 握手、EP0 串行、iso URB 节拍
       ├─ ring.rs        drop-oldest / silence-fill 环形缓冲
@@ -73,12 +79,18 @@ Windows 应用 → 扬声器 (Virtual Cable NN) → usbip-win2 → ISO OUT PCM
 
 ## 虚拟声卡（USB/IP）
 
-不装任何内核驱动：应用自己仿真 USB 声卡，用 [usbip-win2](https://github.com/vadimgrn/usbip-win2)（微软签名、HVCI 兼容）把设备接入 Windows，由系统自带的 `usbaudio.sys` / `usbaudio2.sys` 暴露成标准音频端点。
+不装任何内核驱动：应用自己仿真 USB 声卡，用 [usbip-win2](https://github.com/vadimgrn/usbip-win2)（微软签名、HVCI 兼容）把设备接入 Windows，由系统自带的 `usbaudio.sys`（UAC1）暴露成标准音频端点。
 
 1. 「虚拟声卡」页 → **一键安装 USB/IP 驱动**（安装包随应用捆绑，需要一次 UAC）
-2. 添加/配置线路（名称、采样率、位深、协议、接线方式）→ **保存并应用**
+2. 添加/配置线路（名称、采样率、位深、接线方式）→ **保存并应用**
 3. **附加全部**（需要一次 UAC；此后 attach/detach 都不再需要提权）
 4. 系统声音设置里即出现 `扬声器/麦克风 (Virtual Cable NN)`，可参与混音路由
+
+格式上限：**44.1–96kHz 的 16/24/32bit，176.4/192kHz 只 16bit**（界面上超出规格的组合会被禁用/拦截）。
+更高规格请自装第三方虚拟声卡，它们同样能拖进混音画布当节点用。
+
+> **验证状态**：上述格式矩阵已实测到「Windows 里设备出现 + 端点设备格式正确 + 播放/录音流都能打开
+> + 播放方向数据确实流到设备」；但**虚拟麦克风的回环出音尚未通过**（见「已知事项」P1）。
 
 > 建议只保留一处附加：每次 `usbip attach` 都会新占一个 vhci 端口，重复附加会在 Windows 里堆出
 > `(2- Virtual Cable NN)`、`(3- …)` 之类的重复端点；`断开全部`（`usbip detach --all`）即可清理，无需管理员。
@@ -104,17 +116,24 @@ Windows 应用 → 扬声器 (Virtual Cable NN) → usbip-win2 → ISO OUT PCM
 
 按优先级（详细排查记录与结论见 `TASK.md`）：
 
-- [ ] **P0 · UAC2 打通**：设备能枚举（`usbaudio2.sys`，Problem 0），但 Windows 拿不到「设备格式」
-      （`GetMixFormat` → `AUDCLNT_E_UNSUPPORTED_FORMAT`），驱动在 `SET_CUR(采样率)` 与
-      `SET_INTERFACE(alt0/alt1)` 之间死循环。UAC1（`usbaudio.sys`）正常，192K/24bit 需要 UAC2
-- [ ] **P1 · 虚拟麦克风应用侧收不到声音**：设备侧实测完美（100 URB/s、187 KB/s、峰值 0.25、零样本 0.1%），
-      但应用录音得到 ≈ −57 dB 的近似静音，怀疑驱动/音频引擎把采集流判为静音
+- [x] **P0 · 传输层天花板（已定论）**：USB/IP 在 Windows 侧走 UDE，iso 端点服务间隔不得短于 1ms
+      ⇒ 每端点 ≤1024 B/ms ⇒ 192kHz/24bit 不可能。因此**内置线路只做 UAC1**（44.1–96kHz 的
+      16/24/32bit，176.4/192kHz 只 16bit），UAC2 相关代码已删除；更高规格由用户自装第三方虚拟声卡
+      （可直接拖进混音画布）。详见 `TASK.md` P0
+- [ ] **P1 · 虚拟麦克风（回环）出不了声 —— 当前最大问题**：逐格式实测（48k/16、44.1k/24、
+      96k/24、96k/32、176.4k/16、192k/16）**回环全部失败**：设备能创建、端点格式正确、
+      流能打开、播放方向数据也确实到了设备，但「播进虚拟声卡 → 从虚拟麦克风录回」得到的是
+      近似静音（−30…−53 dB，两条 44.1k 系线路是音高错的碎片）。设备侧 `cap_ring` 欠载仅约 4%
+      ⇒ 数据丢在设备之外（驱动/音频引擎/采集 API 段）。详见 `TASK.md` P1 的验证状态与排查计划
 - [ ] **P2 · 功能节点**：开关 / 延迟 / 强度 / 均衡器 / 高通 / 低通 / 带通（需要引擎侧 DSP 节点）
 - [ ] **P2 · 节点音量指示条**（绿→黄→红分段阈值 + 峰值保持）与 **FFT 频谱展示（可开关）**
 - [ ] **P2 · 界面**：设备面板与画布等高、虚拟声卡线路两行布局、画布自动排布、缩放时节点位置保持、
       节点文字换行、连线箭头不出圈、拉线虚线跟随
 - [ ] **P3 · 产品化**：开机自启做到「无窗口、无 WebView、自动恢复线缆附加」；提供**不依赖 WebView2** 的
       headless 运行模式；单实例；便携版（配置/日志跟随 exe）
+- [ ] **P3 · 线缆热增删**：目前新增/删除线路走「保存 → 重新附加」，计划做成单条线路的即时增删/附加
+      （常驻提权 broker 已支持，零 UAC）
 - [ ] Linux / macOS 后端（`AudioBackend` trait 已就位）
 - [ ] 高质量 sinc 重采样、时钟漂移自适应比率微调
-- [ ] 驱动 attestation 签名（免去测试签名与 UAC 提示）
+- [ ] **（仅在需要突破 P0 时）换传输层**：自写内核音频驱动（sysvad / ACX 为起点）才能拿到
+      192k/24bit 与更低延迟，代价是驱动开发 + 内核调试 + 设备增删需管理员 + 驱动签名
