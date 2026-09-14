@@ -49,6 +49,7 @@ textarea,
 }
 
 .meter-track {
+  position: relative;
   flex: 1;
   min-width: 120px;
   height: 8px;
@@ -61,6 +62,29 @@ textarea,
   height: 100%;
   background: linear-gradient(90deg, #18a058, #f0a020 80%, #d03050);
   transition: width 0.12s linear;
+}
+
+/* 分段变色（MeterBar）：颜色由当前电平所在 dBFS 区间决定，整条同色 */
+.meter-fill.safe {
+  background: #18a058;
+}
+.meter-fill.warm {
+  background: #f0a020;
+}
+.meter-fill.hot {
+  background: #d03050;
+}
+
+/* 峰值保持标记：缓慢回落（回落节奏在 MeterBar 里推进） */
+.meter-peak {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.7);
+  transition: left 0.15s linear;
 }
 
 .section-title {

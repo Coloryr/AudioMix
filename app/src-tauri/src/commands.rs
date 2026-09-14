@@ -1,9 +1,10 @@
 //! Tauri invoke 命令：与控制 API 共享同一个引擎，无重复逻辑。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use audiomix_backend_windows::driver;
-use audiomix_backend_windows::usbip::{attach as usbip_attach, cable_configs};use audiomix_core::engine::EngineStats;
+use audiomix_backend_windows::usbip::{attach as usbip_attach, broker as usbip_broker, cable_configs};use audiomix_core::engine::EngineStats;
 use audiomix_core::model::NodePos;
 use audiomix_core::{
     DeviceInfo, DeviceKind, GraphConfig, Settings, UsbIpCableSettings, UsbIpSettings,
@@ -134,29 +135,115 @@ pub fn spawn_default_device_guard(app: AppHandle) {
 
     /// 接入后守护窗口长度
     const GUARD_WINDOW: Duration = Duration::from_secs(30);
+    /// 重复端口自愈的冷却：attach 要弹 UAC，用户取消后不能 15 秒一弹
+    const REPAIR_COOLDOWN: Duration = Duration::from_secs(60);
+
+    use std::sync::Arc;
 
     std::thread::spawn(move || {
         let mut known: HashSet<String> = HashSet::new();
         let mut guard_until: Option<Instant> = None;
         let mut ticks: u64 = 0;
+        let mut last_repair: Option<Instant> = None;
+        let repairing = Arc::new(AtomicBool::new(false));
         loop {
             std::thread::sleep(Duration::from_secs(1));
             ticks += 1;
 
-            // 每 ~15 秒顺手做一次「重复附加」自检：
-            // 每次 `usbip attach` 都会新占一个 vhci 端口 → Windows 里多出一对
-            // 「扬声器/麦克风 (N- Virtual Cable …)」端点。端口数超过线缆数就断开重来。
+            // 每 ~15 秒顺手做一次「重复附加」自检 + 自愈：
+            // vhci 偶尔会自己重复 import（Windows 重新枚举 usbaudio2 时又拉一次），
+            // 同一条线缆占两个端口。**只拆多余/失效的端口，保留正常工作的那个**——
+            // 不需要 detach --all 重来，正常会话不断、设备端点不消失；
+            // 实在分类不了（端口没有 bus_id 等）才退回「全断 + 重新附加」。
+            // 清理走提权 broker（在线时零 UAC），所以随时清理都不打扰用户。
             if ticks % 15 == 0 {
                 let state = app.state::<AppState>();
-                let cables = state.usbip.cables().len();
-                if cables > 0 {
+                let cable_bus_ids: std::collections::HashSet<String> =
+                    state.usbip.cables().iter().map(|c| c.bus_id.clone()).collect();
+                if !cable_bus_ids.is_empty() {
                     if let Ok(ports) = usbip_attach::ports() {
-                        if ports.len() > cables {
+                        let in_use: Vec<_> = ports.iter().filter(|p| p.in_use).collect();
+                        // 同一 bus_id 占多个端口：保留最小端口号（最早附加、在流式的那个）
+                        let mut by_bus: std::collections::BTreeMap<String, Vec<u32>> = Default::default();
+                        let mut stale: Vec<u32> = Vec::new(); // bus_id 不在线缆表里（线缆已删除）
+                        let mut unclassified = 0usize; // bus_id 解析不出来，没法分类
+                        for p in &in_use {
+                            match &p.bus_id {
+                                Some(b) if cable_bus_ids.contains(b) => {
+                                    by_bus.entry(b.clone()).or_default().push(p.port);
+                                }
+                                Some(_) => stale.push(p.port),
+                                None => unclassified += 1,
+                            }
+                        }
+                        let mut dup_ports: Vec<u32> = Vec::new();
+                        for (bus, mut ps) in by_bus {
+                            if ps.len() > 1 {
+                                ps.sort_unstable();
+                                tracing::warn!(
+                                    "线缆 {bus} 占了 {} 个端口（vhci 重复 import），保留端口 {}，拆除 {:?}",
+                                    ps.len(),
+                                    ps[0],
+                                    &ps[1..]
+                                );
+                                dup_ports.extend_from_slice(&ps[1..]);
+                            }
+                        }
+                        let to_detach: Vec<u32> = dup_ports.iter().chain(&stale).copied().collect();
+                        // 有解析不出 bus_id 的占用端口、且总数对不上线缆数 → 没法定位多余的，全断重来
+                        let needs_full_repair =
+                            unclassified > 0 && in_use.len() > cable_bus_ids.len();
+                        if needs_full_repair
+                            && last_repair.map_or(true, |t| t.elapsed() > REPAIR_COOLDOWN)
+                            && !repairing.load(Ordering::Relaxed)
+                        {
                             tracing::warn!(
-                                "检测到 {} 个已附加端口但只有 {cables} 条线缆（重复 attach），先全部断开",
-                                ports.len()
+                                "检测到 {} 个占用中的端口但无法定位多余的（线缆 {} 条），全断后重新附加",
+                                in_use.len(),
+                                cable_bus_ids.len()
                             );
-                            let _ = usbip_attach::detach_all();
+                            last_repair = Some(Instant::now());
+                            repairing.store(true, Ordering::Relaxed);
+                            let app2 = app.clone();
+                            let repairing2 = repairing.clone();
+                            // 附加要弹 UAC、可能等几分钟，放独立线程，别卡住守护循环
+                            std::thread::spawn(move || {
+                                let result = repair_cables(&app2);
+                                repairing2.store(false, Ordering::Relaxed);
+                                if let Err(e) = result {
+                                    tracing::warn!(
+                                        "重复端口自愈失败（冷却 60s 后会自动重试，也可手动点「附加全部」）: {e}"
+                                    );
+                                }
+                            });
+                        } else if !to_detach.is_empty()
+                            && last_repair.map_or(true, |t| t.elapsed() > REPAIR_COOLDOWN)
+                            && !repairing.load(Ordering::Relaxed)
+                        {
+                            last_repair = Some(Instant::now());
+                            repairing.store(true, Ordering::Relaxed);
+                            let app2 = app.clone();
+                            let repairing2 = repairing.clone();
+                            std::thread::spawn(move || {
+                                // 优先走提权 broker（零 UAC）；不在时回退一次性提权
+                                let result = if usbip_broker::ensure_broker().is_ok() {
+                                    usbip_broker::broker_detach_ports(&to_detach)
+                                } else {
+                                    usbip_attach::detach_ports(&to_detach)
+                                };
+                                repairing2.store(false, Ordering::Relaxed);
+                                let state = app2.state::<AppState>();
+                                match result {
+                                    Ok(_) => {
+                                        let _ = state.engine.refresh_devices();
+                                        tracing::info!("重复端口拆除完成，正常会话未受影响");
+                                        emit_usbip_status(&app2);
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        "拆除重复端口失败（冷却 60s 后会自动重试）: {e}"
+                                    ),
+                                }
+                            });
                         }
                     }
                 }
@@ -203,6 +290,70 @@ pub fn spawn_default_device_guard(app: AppHandle) {
             }
         }
     });
+}
+
+/// 重复端口自愈：断开全部端口后按当前线缆表重新附加（与手动「附加全部」
+/// 同一条路径：detach --all + 逐条 attach，一次 UAC）。服务器没在跑时只断开。
+fn repair_cables(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let Some(addr) = state.usbip.local_addr() else {
+        let out = detach_via_broker_or_elevated()?;
+        tracing::info!("USB/IP 服务器未运行，自愈仅执行断开: {out}");
+        return Ok(());
+    };
+    let bus_ids: Vec<String> = state.usbip.cables().iter().map(|c| c.bus_id.clone()).collect();
+    if bus_ids.is_empty() {
+        return Ok(());
+    }
+    let (host, port) = (addr.ip().to_string(), addr.port());
+    // broker 在线（或本次 UAC 启动成功）→ 零 UAC；用户取消 UAC 则中止，不回退再弹
+    let result = if usbip_broker::ensure_broker().is_ok() {
+        usbip_broker::broker_attach_all(&host, port, &bus_ids)
+    } else {
+        usbip_attach::attach_all(&host, port, &bus_ids)
+    };
+    tracing::info!("重复端口自愈完成: {result:?}");
+    let _ = state.engine.refresh_devices();
+    // 无论成败都广播：附加可能部分成功（或自愈只做了断开），前端不能被蒙在鼓里
+    emit_usbip_status(app);
+    result.map(|_| ())
+}
+
+/// 断开全部端口：优先提权 broker（零 UAC），不在时回退一次性提权
+fn detach_via_broker_or_elevated() -> Result<String, String> {
+    if usbip_broker::ensure_broker().is_ok() {
+        usbip_broker::broker_detach_all()
+    } else {
+        usbip_attach::detach_all()
+    }
+}
+
+/// 启动时自动恢复线缆附加（放后台线程跑）。
+///
+/// vhci 的附加状态独立于本应用：上次 attach 过、又没 detach/重启的话，端口还挂着
+/// ——这时什么都不做（也就**不弹 UAC**）。只有端口空了（如重启过电脑）才走
+/// 「附加全部」路径，弹一次 UAC；用户取消也不影响其他启动流程，等手动附加即可。
+pub fn auto_attach_if_needed(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.usbip.cables().is_empty() {
+        return;
+    }
+    let bus_ids: std::collections::HashSet<String> =
+        state.usbip.cables().iter().map(|c| c.bus_id.clone()).collect();
+    let attached = usbip_attach::ports().map_or(false, |ports| {
+        ports
+            .iter()
+            .any(|p| p.in_use && p.bus_id.as_deref().map_or(false, |b| bus_ids.contains(b)))
+    });
+    if attached {
+        tracing::info!("线缆仍处于附加状态，启动无需重新附加");
+        return;
+    }
+    tracing::info!("线缆未附加，启动时自动附加（如弹出 UAC 请确认）");
+    match repair_cables(app) {
+        Ok(()) => tracing::info!("启动自动附加完成"),
+        Err(e) => tracing::warn!("启动自动附加未完成（可在「虚拟声卡」页手动点「附加全部」）: {e}"),
+    }
 }
 
 /// 把某个端点设为 Windows 默认设备（播放/录音都适用；三种角色一并设置），
@@ -389,9 +540,20 @@ pub fn get_settings(state: State<AppState>) -> Settings {
 
 #[tauri::command]
 pub fn update_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> Result<(), String> {
+    let old_settings = state.config.lock().settings.clone();
     {
         let mut cfg = state.config.lock();
         cfg.settings = settings.clone();
+    }
+    // 重采样质量变化 → 引擎重建各边重采样器（渲染线程自动跟随快照）
+    if settings.resample_quality != old_settings.resample_quality {
+        state
+            .engine
+            .set_resample_quality(settings.resample_quality);
+    }
+    // 边缓冲容量变化 → 重建边缓冲（瞬时可能有一小段间隙）
+    if settings.edge_buffer_ms != old_settings.edge_buffer_ms {
+        state.engine.set_edge_buffer_ms(settings.edge_buffer_ms);
     }
     // 控制 API 开关/端口变化 → 重启服务
     restart_control_api(&state)?;
@@ -511,6 +673,41 @@ pub struct UsbIpStatus {
     pub ports: Vec<usbip_attach::AttachedPort>,
     /// `usbip port` 失败原因（多为需要管理员权限）
     pub ports_error: Option<String>,
+}
+
+/// 广播 USB/IP 状态给前端（附加/断开/自愈完成后调用，前端监听 `usbip-status`
+/// 事件刷新，不用轮询）。`usbip port` 是阻塞的外部调用，丢到后台线程跑。
+pub fn emit_usbip_status(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let (enabled, bind, cables, running, local_addr) = {
+            let state = app.state::<AppState>();
+            let (enabled, bind, cables) = {
+                let cfg = state.config.lock();
+                (
+                    cfg.settings.usbip.enabled,
+                    cfg.settings.usbip.bind.clone(),
+                    cfg.settings.usbip.cables.clone(),
+                )
+            };
+            (
+                enabled,
+                bind,
+                cables,
+                state.usbip.running(),
+                state.usbip.local_addr().map(|a| a.to_string()),
+            )
+        };
+        let status = tauri::async_runtime::spawn_blocking(move || {
+            build_usbip_status(enabled, bind, running, local_addr, &cables)
+        })
+        .await
+        .ok();
+        if let Some(status) = status {
+            use tauri::Emitter;
+            let _ = app.emit("usbip-status", &status);
+        }
+    });
 }
 
 fn build_usbip_status(
@@ -651,6 +848,8 @@ pub async fn usbip_set_cables(
     persist(&app, &state)?;
     // 设备列表随线缆变化
     let _ = state.engine.refresh_devices();
+    // 混音页等其它页面监听事件同步线缆状态
+    emit_usbip_status(&app);
 
     let running = state.usbip.running();
     let local_addr = state.usbip.local_addr().map(|a| a.to_string());
@@ -663,7 +862,10 @@ pub async fn usbip_set_cables(
 
 /// 重新附加全部线缆（提权：先 detach --all，再逐条 attach）
 #[tauri::command]
-pub async fn usbip_attach_all(state: State<'_, AppState>) -> Result<usbip_attach::AttachReport, String> {
+pub async fn usbip_attach_all(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usbip_attach::AttachReport, String> {
     let Some(addr) = state.usbip.local_addr() else {
         return Err("USB/IP 服务器未运行——请先启用虚拟声卡并保存线缆".into());
     };
@@ -673,21 +875,43 @@ pub async fn usbip_attach_all(state: State<'_, AppState>) -> Result<usbip_attach
     }
     let (host, port) = (addr.ip().to_string(), addr.port());
     let report = tauri::async_runtime::spawn_blocking(move || {
-        usbip_attach::attach_all(&host, port, &bus_ids)
+        // broker 在线（或本次 UAC 启动成功）→ 零 UAC；取消 UAC 则中止，不回退再弹
+        if usbip_broker::ensure_broker().is_ok() {
+            match usbip_broker::broker_attach_all(&host, port, &bus_ids) {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    tracing::warn!("broker 附加失败，回退一次性提权: {e}");
+                    usbip_attach::attach_all(&host, port, &bus_ids)
+                }
+            }
+        } else {
+            usbip_attach::attach_all(&host, port, &bus_ids)
+        }
     })
     .await
-    .map_err(|e| format!("附加任务失败: {e}"))??;
+    .map_err(|e| format!("附加任务失败: {e}"));
+    let report = match report {
+        Ok(r) => r,
+        Err(e) => {
+            // 失败也可能已经动了端口（先 detach 再 attach 中途失败），照样广播状态
+            let _ = state.engine.refresh_devices();
+            emit_usbip_status(&app);
+            return Err(e);
+        }
+    };
     let _ = state.engine.refresh_devices();
-    Ok(report)
+    emit_usbip_status(&app);
+    Ok(report?)
 }
 
-/// 断开全部已接入的线缆（提权）
+/// 断开全部已接入的线缆（提权 broker 优先，回退一次性提权）
 #[tauri::command]
-pub async fn usbip_detach_all(state: State<'_, AppState>) -> Result<String, String> {
-    let out = tauri::async_runtime::spawn_blocking(usbip_attach::detach_all)
+pub async fn usbip_detach_all(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    let out = tauri::async_runtime::spawn_blocking(detach_via_broker_or_elevated)
         .await
         .map_err(|e| format!("断开任务失败: {e}"))??;
     let _ = state.engine.refresh_devices();
+    emit_usbip_status(&app);
     Ok(out)
 }
 
@@ -730,6 +954,8 @@ pub fn open_main_window(app: AppHandle) {
 pub fn quit_app(app: AppHandle) {
     let state = app.state::<AppState>();
     state.engine.shutdown();
+    // 通知提权代理收工（连接断开后它也会自行退出）
+    usbip_broker::shutdown_broker();
     app.exit(0);
 }
 

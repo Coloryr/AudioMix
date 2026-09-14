@@ -5,6 +5,7 @@
 //! 每条线缆的采样率（44.1–192kHz）与位深（16/24/32bit）独立可配置。
 
 pub mod backend;
+pub mod broker;
 pub mod descriptors;
 pub mod device;
 pub mod protocol;
@@ -96,6 +97,7 @@ impl Default for UsbIpManager {
 }
 
 impl UsbIpManager {
+    /// 创建管理器（未启动）；`bind` 形如 `127.0.0.1:3240`。
     pub fn new(bind: impl Into<String>) -> Self {
         Self {
             registry: Arc::new(RwLock::new(Vec::new())),
@@ -115,11 +117,13 @@ impl UsbIpManager {
         self.registry.read().clone()
     }
 
+    /// 服务器 accept 任务是否存活。
     pub fn running(&self) -> bool {
         // 任务句柄存在但已经跑完（panic / 被 abort）时不算运行中
         self.task.lock().as_ref().is_some_and(|t| !t.is_finished())
     }
 
+    /// 配置的监听地址（`:0` 时与实际端口可能不同，见 [`Self::local_addr`]）。
     pub fn bind_addr(&self) -> &str {
         &self.bind
     }
@@ -217,6 +221,7 @@ impl UsbIpManager {
         *self.local_addr.lock() = None;
     }
 
+    /// 停止服务器并清空线缆注册表（设备端点随之消失）。
     pub fn stop(&self) {
         let was_running = self.task.lock().is_some();
         self.close_task(STOP_RELEASE_WAIT);

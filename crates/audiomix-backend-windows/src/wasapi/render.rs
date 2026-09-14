@@ -22,6 +22,8 @@ use super::capture::check_float_format;
 /// 50ms 足够（事件回调 + MMCSS 下不会欠载），同时把延迟砍掉约 150ms。
 const BUFFER_DURATION_HNS: i64 = 500_000;
 
+/// 在指定输出设备上启动事件驱动的渲染流。
+/// 调用线程先查一次设备格式（供引擎配置重采样），流线程内重新打开设备。
 pub fn start_render(device_id: &str, on_fill: RenderCallback) -> Result<StartedStream> {
     let info = mix_format_of_by_id(device_id)?;
     let device_id = HSTRING::from(device_id);

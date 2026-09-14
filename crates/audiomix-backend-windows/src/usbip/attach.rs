@@ -7,7 +7,7 @@
 //!
 //! 命令语义（以 usbip-win2 v0.9.8.0 源码为准）：
 //! - `usbip attach -r <host> -b <busid> [-t] [--once]` → "succesfully attached to port N"
-//! - `usbip port` → 逐行 "Port NN: device in use at <speed>" + 缩进详情（含 usbip://host:port/busid）
+//! - `usbip port` → 逐行 "Port NN: device in use at \<speed\>" + 缩进详情（含 usbip://host:port/busid）
 //! - `usbip detach -p N` / `usbip detach --all`
 //! - 全局选项 `--tcp-port <port>` 必须写在子命令**之前**（attach 的 `-t` 是 --terse）
 
@@ -231,7 +231,7 @@ pub struct RunOutput {
 }
 
 /// 同步执行并捕获 stdout+stderr（带超时；Windows 下不弹控制台窗口）
-fn run_capture(program: &Path, args: &[String], timeout: Duration) -> Result<RunOutput, String> {
+pub(crate) fn run_capture(program: &Path, args: &[String], timeout: Duration) -> Result<RunOutput, String> {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdout(Stdio::piped())
@@ -296,8 +296,38 @@ fn run_capture(program: &Path, args: &[String], timeout: Duration) -> Result<Run
     })
 }
 
-fn ps_quote(s: &str) -> String {
+pub(crate) fn ps_quote(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// 由各 attach 步骤的结果组装报告（提权脚本路径与 broker 路径共用）
+pub(crate) fn attach_report_from(
+    host: &str,
+    tcp_port: u16,
+    bus_ids: &[String],
+    results: Vec<RunOutput>,
+) -> AttachReport {
+    let mut report = AttachReport {
+        host: host.to_string(),
+        tcp_port,
+        ..Default::default()
+    };
+    for (bus, o) in bus_ids.iter().zip(results) {
+        report
+            .log
+            .push_str(&format!("[attach {bus}] code={}\n{}\n", o.code, o.output.trim()));
+        match o.code {
+            0 => {
+                let port = parse_attached_port(&o.output);
+                report.attached.push((bus.clone(), port));
+            }
+            _ => report.failed.push((bus.clone(), o.output.trim().to_string())),
+        }
+    }
+    if let Ok(list) = ports() {
+        report.detached = list.iter().map(|p| p.port).collect();
+    }
+    report
 }
 
 fn scratch_dir() -> PathBuf {
@@ -397,7 +427,7 @@ fn run_elevated_sequence(
 }
 
 /// 解析 `@@STEP n` / `@@CODE x` 标记的分步日志
-fn parse_sequence_log(log: &str, steps: usize) -> Vec<(i32, String)> {
+pub(crate) fn parse_sequence_log(log: &str, steps: usize) -> Vec<(i32, String)> {
     let mut out: Vec<(i32, String)> = (0..steps).map(|_| (-1, String::new())).collect();
     let mut current: Option<usize> = None;
     for line in log.lines() {
@@ -476,23 +506,23 @@ pub fn install_bundled() -> Result<String, String> {
     }
 }
 
-fn attach_args(host: &str, tcp_port: u16, bus_id: &str) -> Vec<String> {
+pub(crate) fn attach_args(host: &str, tcp_port: u16, bus_id: &str) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     // 全局 --tcp-port 必须写在子命令之前（attach 的 -t 是 --terse）
     if tcp_port != DEFAULT_TCP_PORT {
         args.push("--tcp-port".into());
         args.push(tcp_port.to_string());
     }
+    // 不带 --once：持久 attach 模式，usbip-win2 自己维持自动重连（对齐参考实现 Virtual-Cables）
     args.push("attach".into());
     args.push("-r".into());
     args.push(host.into());
     args.push("-b".into());
     args.push(bus_id.into());
-    args.push("--once".into());
     args
 }
 
-fn detach_args_all() -> Vec<String> {
+pub(crate) fn detach_args_all() -> Vec<String> {
     vec!["detach".into(), "--all".into()]
 }
 
@@ -524,8 +554,40 @@ pub fn detach_all() -> Result<String, String> {
     }
 }
 
+/// 拆掉指定的 vhci 端口（提权；多个端口在同一次 UAC 内完成）。
+/// 用于「同一 bus_id 重复 import」时只拆多余端口、保留正常工作的会话，
+/// 避免 detach --all + 重新 attach 带来的设备消失和 UAC 开销。
+pub fn detach_ports(port_list: &[u32]) -> Result<String, String> {
+    if port_list.is_empty() {
+        return Ok(String::new());
+    }
+    let exe = find_usbip().ok_or("未找到 usbip.exe，请先安装 USB/IP 驱动")?;
+    tracing::info!("拆除重复端口: {port_list:?}");
+    let steps: Vec<Vec<String>> = port_list
+        .iter()
+        .map(|p| vec!["detach".into(), "-p".into(), p.to_string()])
+        .collect();
+    let results = run_elevated_sequence(&exe, &steps, Duration::from_secs(120))?;
+    let mut log = String::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (i, o) in results.into_iter().enumerate() {
+        log.push_str(&format!("[detach -p {}] code={}\n{}\n", port_list[i], o.code, o.output.trim()));
+        match o.code {
+            0 => {}
+            1223 => return Err("已取消 UAC 授权".into()),
+            code => failures.push(format!("端口 {}（退出码 {code}）", port_list[i])),
+        }
+    }
+    if failures.is_empty() {
+        Ok(log)
+    } else {
+        Err(format!("拆除失败: {}：{}", failures.join("、"), log))
+    }
+}
+
 /// 重新附加全部线缆：先断开所有端口，再逐条 attach。
 /// **所有步骤在同一次 UAC 内完成**（N 条线缆只弹一次授权）。
+/// 有提权 broker 在线时建议走 `broker::broker_attach_all`（零 UAC）；本函数是回退路径。
 pub fn attach_all(host: &str, tcp_port: u16, bus_ids: &[String]) -> Result<AttachReport, String> {
     let exe = find_usbip().ok_or("未找到 usbip.exe，请先安装 USB/IP 驱动")?;
     tracing::info!("附加全部线缆: {bus_ids:?} @ {host}:{tcp_port}");
@@ -572,7 +634,7 @@ pub fn attach_all(host: &str, tcp_port: u16, bus_ids: &[String]) -> Result<Attac
         }
     }
 
-    // 3) 回读端口状态
+    // 回读端口状态
     if let Ok(list) = ports() {
         report.detached = list.iter().map(|p| p.port).collect();
     }
@@ -642,12 +704,13 @@ Port 00: <Port in Use> at High Speed(480Mbps)
 
     #[test]
     fn attach_args_put_tcp_port_before_subcommand() {
+        // 不带 --once：持久 attach 模式，usbip-win2 自己维持自动重连（对齐 Virtual-Cables）
         let a = attach_args("127.0.0.1", DEFAULT_TCP_PORT, "1-3");
-        assert_eq!(a, vec!["attach", "-r", "127.0.0.1", "-b", "1-3", "--once"]);
+        assert_eq!(a, vec!["attach", "-r", "127.0.0.1", "-b", "1-3"]);
         let b = attach_args("127.0.0.1", 4000, "1-3");
         assert_eq!(
             b,
-            vec!["--tcp-port", "4000", "attach", "-r", "127.0.0.1", "-b", "1-3", "--once"]
+            vec!["--tcp-port", "4000", "attach", "-r", "127.0.0.1", "-b", "1-3"]
         );
     }
 

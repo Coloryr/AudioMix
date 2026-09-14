@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { listen } from "@tauri-apps/api/event";
 import {
   NAlert,
   NButton,
@@ -22,27 +23,42 @@ import {
   type Sink,
   type Source,
   type UsbIpCableStatus,
+  type UsbIpStatus,
 } from "../api";
 import { useApp, genId } from "../store";
+import MeterBar from "../components/MeterBar.vue";
 
 const app = useApp();
 const message = useMessage();
 
 // ---------- 画布几何 ----------
 const NODE_W = 236;
-const NODE_H = 96;
+// 96 → 108：副标题放开到两行后，内容（标题 + 两行副标题 + 电平条 + 音量条）需要更高一些
+const NODE_H = 108;
 const canvasEl = ref<HTMLElement | null>(null);
 const canvasSize = ref({ w: 900, h: 520 });
 let resizeObserver: ResizeObserver | null = null;
 
 function measure() {
   const el = canvasEl.value;
-  if (el) {
-    // 至少为 1：尺寸为 0 时（页签隐藏/尚未布局）算坐标会出现 0/0 = NaN
-    const w = Math.max(1, el.clientWidth);
-    const h = Math.max(1, el.clientHeight);
-    if (w !== canvasSize.value.w || h !== canvasSize.value.h) canvasSize.value = { w, h };
+  if (!el) return;
+  // 至少为 1：尺寸为 0 时（页签隐藏/尚未布局）算坐标会出现 0/0 = NaN
+  const w = Math.max(1, el.clientWidth);
+  const h = Math.max(1, el.clientHeight);
+  const old = canvasSize.value;
+  if (w === old.w && h === old.h) return;
+  // 布局存的是归一化坐标，直接套新尺寸会让节点在像素上跟着画布缩放；
+  // 这里按「像素位置不变」重新归一化（初始 900×520 是占位值、布局还没加载，不能算）
+  if (layoutLoaded && old.w > 2 && old.h > 2) {
+    const mapped: Record<string, NodePos> = {};
+    for (const [key, p] of Object.entries(layout.value)) {
+      if (!Array.isArray(p) || p.length < 2) continue;
+      mapped[key] = [clamp01((p[0] * old.w) / w), clamp01((p[1] * old.h) / h)];
+    }
+    layout.value = mapped;
+    schedulePersistLayout();
   }
+  canvasSize.value = { w, h };
 }
 
 /** 画布是否已经量到可用尺寸（没量到就不做坐标换算） */
@@ -106,8 +122,6 @@ function fitCanvas() {
 }
 
 const canvasStyle = computed(() => ({ height: `${canvasH.value}px` }));
-/** 设备面板留出更明显的落差，保证它不会反超画布那一列（否则整页高度就不受画布控制了） */
-const paletteStyle = computed(() => ({ maxHeight: `${Math.max(160, canvasH.value - 120)}px` }));
 
 // ---------- 节点模型 ----------
 type NodeKind = "input" | "loopback" | "output" | "cable_play" | "cable_rec";
@@ -132,21 +146,63 @@ interface GNode {
 }
 
 const layout = ref<Record<string, NodePos>>({});
+/** 布局是否已从后端加载完（加载完之前画布尺寸变化不做像素换算） */
+let layoutLoaded = false;
 const cables = ref<UsbIpCableStatus[]>([]);
 const usbipRunning = ref(false);
+
+// ---------- 虚拟线路（usbip://N/playback|capture 设备本体即线路节点） ----------
+/** 是否线路的播放端（系统播放 → 混音器采集） */
+const cableIsPlay = (id: string) => /^usbip:\/\/\d+\/playback$/.test(id);
+/** 是否线路的录音端（混音器写入 → 系统录音） */
+const cableIsRec = (id: string) => /^usbip:\/\/\d+\/capture$/.test(id);
+/** 从设备 id 解析线路号，非线路设备返回 null */
+function cableNumberOf(deviceId: string): number | null {
+  const m = deviceId.match(/^usbip:\/\/(\d+)\//);
+  return m ? Number(m[1]) : null;
+}
+/** 线路运行态（usbip-status 未拉到 / 配置已删除时为 null） */
+function cableStatusOf(number: number | null): UsbIpCableStatus | null {
+  return number === null ? null : cables.value.find((c) => c.number === number) ?? null;
+}
+/** 节点标题用的线路名：优先配置显示名，回退设备名（去掉「 (输入)/(输出)」后缀） */
+function lineName(deviceId: string): string {
+  const c = cableStatusOf(cableNumberOf(deviceId));
+  if (c?.display_name) return c.display_name;
+  return app.deviceName(deviceId).replace(/\s*[(（](输入|输出)[)）]\s*$/, "");
+}
+/** 线路节点副标题里的接入状态 */
+function lineStateOf(c: UsbIpCableStatus | null): string {
+  if (!usbipRunning.value) return "服务器未运行";
+  return c?.attached ? "已接入系统" : "未接入（需附加）";
+}
+/** 线路节点副标题里的内部拷贝方向 */
+function lineCopyOf(c: UsbIpCableStatus | null): string {
+  if (!c) return "—";
+  return c.mode === "loopback" ? "输出→输入" : c.mode === "reverse" ? "输入→输出" : "不拷贝";
+}
+/**
+ * 该设备是否是某条线路的 **Windows 真实端点**（接入后 usbaudio.sys 创建的扬声器/麦克风）。
+ * 这些端点和 usbip:// 合成端点指向同一条线路，设备面板里由线路节点统一代表，不再单独出现。
+ * usbip:// 合成端点名字相同但 id 不同，不算真实端点。
+ */
+function realCableDevice(d: DeviceInfo): UsbIpCableStatus | null {
+  if (d.id.startsWith("usbip://")) return null;
+  return cables.value.find((c) => c.display_name && d.name.includes(c.display_name)) ?? null;
+}
 
 /** 底部唯一的提示（同时只显示一条，高度用于给画布让位） */
 const notice = computed(() => {
   if (!cables.value.length) {
     return {
       type: "info" as const,
-      text: "还没有虚拟线路。先到「虚拟声卡」页添加线路并保存，这里才会出现可拖入的「虚拟线路」。",
+      text: "还没有虚拟线路。先到「虚拟声卡」页添加线路并保存，再把「线路输出 / 线路输入」拖进画布接线。",
     };
   }
   if (!usbipRunning.value) {
     return {
       type: "warning" as const,
-      text: "虚拟声卡服务器当前未运行 —— 画布上的「虚拟线路」节点不会有音频进出。到「虚拟声卡」页打开「启用虚拟声卡服务器」。",
+      text: "虚拟声卡服务器当前未运行 —— 画布上的线路节点不会有音频进出。到「虚拟声卡」页打开「启用虚拟声卡服务器」。",
     };
   }
   return null;
@@ -190,90 +246,66 @@ const nodes = computed<GNode[]>(() => {
     return defaultPos(kind, counters[kind]++);
   };
 
-  // 物理输入 / 系统回声（虚拟端点由「虚拟线路」节点统一表示）
+  // 输入源：物理设备 / 系统回声 / 虚拟线路的播放端（usbip://N/playback 本体即线路输出节点）
   for (const s of app.graph.sources) {
-    if (s.device_id.startsWith("usbip://")) continue;
-    const kind: NodeKind = s.mode === "loopback" ? "loopback" : "input";
-    const key = kind === "loopback" ? nodeKey.loopback(s.device_id) : nodeKey.input(s.device_id);
+    const isCable = cableIsPlay(s.device_id);
+    const cableNum = isCable ? cableNumberOf(s.device_id) : null;
+    const kind: NodeKind = isCable ? "cable_play" : s.mode === "loopback" ? "loopback" : "input";
+    const key =
+      kind === "cable_play"
+        ? nodeKey.cablePlay(cableNum!)
+        : kind === "loopback"
+          ? nodeKey.loopback(s.device_id)
+          : nodeKey.input(s.device_id);
     const [x, y] = pos(key, kind);
+    const cs = cableStatusOf(cableNum);
     list.push({
       key,
       kind,
-      title: app.deviceName(s.device_id),
-      subtitle: s.enabled ? (kind === "loopback" ? "该系统输出正在播放的声音" : "录入设备") : "已停用",
+      title: isCable ? `${lineName(s.device_id)} · 线路输出` : app.deviceName(s.device_id),
+      subtitle: isCable
+        ? `系统播放端（扬声器） · 拷贝：${lineCopyOf(cs)} · ${lineStateOf(cs)}`
+        : s.enabled
+          ? kind === "loopback"
+            ? "该系统输出正在播放的声音"
+            : "录入设备"
+          : "已停用",
       sourceId: s.id,
+      cableNumber: cableNum ?? undefined,
       hasIn: false,
       hasOut: true,
-      // 输入设备 / 系统回声：端子贴在盒子**右**边（信号从它流向别处）
+      // 输入设备 / 系统回声 / 线路播放端：端子贴在盒子**右**边（信号从它流向别处）
       inSide: "right",
       outSide: "right",
       x,
       y,
     });
   }
-  // 物理输出
+  // 输出汇：物理输出设备 / 虚拟线路的录音端（usbip://N/capture 本体即线路输入节点）
   for (const k of app.graph.sinks) {
-    if (k.device_id.startsWith("usbip://")) continue;
-    const key = nodeKey.output(k.device_id);
-    const [x, y] = pos(key, "output");
+    const isCable = cableIsRec(k.device_id);
+    const cableNum = isCable ? cableNumberOf(k.device_id) : null;
+    const kind: NodeKind = isCable ? "cable_rec" : "output";
+    const key = isCable ? nodeKey.cableRec(cableNum!) : nodeKey.output(k.device_id);
+    const [x, y] = pos(key, kind);
+    const cs = cableStatusOf(cableNum);
     list.push({
       key,
-      kind: "output",
-      title: app.deviceName(k.device_id),
-      subtitle: "输出设备",
+      kind,
+      title: isCable ? `${lineName(k.device_id)} · 线路输入` : app.deviceName(k.device_id),
+      subtitle: isCable
+        ? `系统录音端（麦克风） · 拷贝：${lineCopyOf(cs)} · ${lineStateOf(cs)}`
+        : "输出设备",
       sinkId: k.id,
+      cableNumber: cableNum ?? undefined,
       hasIn: true,
       hasOut: false,
-      // 输出设备：端子贴在盒子**左**边（信号从别处流入它）
+      // 输出设备 / 线路录音端：端子贴在盒子**左**边（信号从别处流入它）
       inSide: "left",
       outSide: "left",
       x,
       y,
     });
-  }
-  // 虚拟线路拆成两个节点：输入＝系统播放端（混音图的源）、输出＝系统录音端（混音图的汇）
-  for (const c of cables.value) {
-    const src = app.graph.sources.find((s) => s.device_id === `usbip://${c.number}/playback`);
-    const sink = app.graph.sinks.find((s) => s.device_id === `usbip://${c.number}/capture`);
-    const name = c.display_name || `Virtual Cable ${String(c.number).padStart(2, "0")}`;
-    const copy = c.mode === "loopback" ? "输出→输入" : c.mode === "reverse" ? "输入→输出" : "不拷贝";
-    const state = !usbipRunning ? "服务器未运行" : c.attached ? "已接入系统" : "未接入（需附加）";
-    if (src) {
-      const key = nodeKey.cablePlay(c.number);
-      const [x, y] = pos(key, "cable_play");
-      list.push({
-        key,
-        kind: "cable_play",
-        title: `${name} · 线路输出`,
-        subtitle: `系统播放端（扬声器） · 拷贝：${copy} · ${state}`,
-        sourceId: src.id,
-        cableNumber: c.number,
-        hasIn: false,
-        hasOut: true,
-        inSide: "right",
-        outSide: "right",
-        x,
-        y,
-      });
-    }
-    if (sink) {
-      const key = nodeKey.cableRec(c.number);
-      const [x, y] = pos(key, "cable_rec");
-      list.push({
-        key,
-        kind: "cable_rec",
-        title: `${name} · 线路输入`,
-        subtitle: `系统录音端（麦克风） · 拷贝：${copy} · ${state}`,
-        sinkId: sink.id,
-        cableNumber: c.number,
-        hasIn: true,
-        hasOut: false,
-        inSide: "left",
-        outSide: "left",
-        x,
-        y,
-      });
-    }
   }
   return list;
 });
@@ -352,12 +384,17 @@ const wires = computed<Wire[]>(() => {
  * 连线：控制点朝两端子的**出线方向**外扩（端子朝左就往左出线、朝右就往右），
  * 并夹在画布内，避免曲线被 overflow 裁掉。
  */
-function wirePath(from: { x: number; y: number; dir: number }, to: { x: number; y: number; dir: number }) {
+function wirePath(from: { x: number; y: number; dir: number }, to: { x: number; y: number; dir?: number }) {
   const { w } = canvasSize.value;
   const d = Math.min(90, Math.max(36, Math.abs(to.x - from.x) * 0.4));
   const c1 = Math.max(6, Math.min(w - 6, from.x + from.dir * d));
-  const c2 = Math.max(6, Math.min(w - 6, to.x + to.dir * d));
-  return `M ${from.x} ${from.y} C ${c1} ${from.y}, ${c2} ${to.y}, ${to.x} ${to.y}`;
+  // 拉线预览的终点是鼠标位置、没有方向，按 0 处理（否则 undefined * d = NaN，路径直接画不出来）
+  const td = to.dir ?? 0;
+  const c2 = Math.max(6, Math.min(w - 6, to.x + td * d));
+  // 箭头停在端子圆边上（圆半径 8 + 2px 间隙），不再戳进圆里
+  const sx = from.x + from.dir * 10;
+  const ex = to.x + td * 10;
+  return `M ${sx} ${from.y} C ${c1} ${from.y}, ${c2} ${to.y}, ${ex} ${to.y}`;
 }
 
 // ---------- 指针拖拽（不依赖 HTML5 DnD：Tauri 在 Windows 上会拦截它） ----------
@@ -658,6 +695,16 @@ async function persistLayout() {
   }
 }
 
+let persistTimer: number | null = null;
+/** 画布缩放期间布局连续变化，停稳 500ms 后再写盘 */
+function schedulePersistLayout() {
+  if (persistTimer !== null) clearTimeout(persistTimer);
+  persistTimer = window.setTimeout(() => {
+    persistTimer = null;
+    void persistLayout();
+  }, 500);
+}
+
 // ---------- 连线 ----------
 async function connect(fromKey: string, fromSide: "in" | "out", toKey: string, toSide: "in" | "out") {
   // 严格单向：只能「输出 → 输入」
@@ -710,47 +757,48 @@ interface PaletteItem {
   kind: PaletteKind;
   title: string;
   deviceId?: string;
-  cable?: UsbIpCableStatus;
 }
 
 const palette = computed<PaletteItem[]>(() => {
   const items: PaletteItem[] = [];
-  // 所有声卡设备都能拖进来（物理的 + 第三方虚拟声卡；本应用自己的 usbip 端点由下面的线路条目表示）
+  // 所有声卡设备都能拖进来：物理设备、第三方虚拟声卡，
+  // 以及本应用的 usbip 线路端点（设备本体即「线路输出 / 线路输入」节点）。
+  // 线路接入后 Windows 创建的真实扬声器/麦克风端点由线路节点代表，跳过。
   for (const d of app.devices) {
-    if (d.id.startsWith("usbip://")) continue;
+    if (realCableDevice(d)) continue;
     if (d.kind === "input") {
-      items.push({ kind: "input", title: d.name, deviceId: d.id });
+      if (cableIsPlay(d.id)) {
+        items.push({ kind: "cable_play", title: `${lineName(d.id)} · 线路输出`, deviceId: d.id });
+      } else {
+        items.push({ kind: "input", title: d.name, deviceId: d.id });
+      }
+    } else if (cableIsRec(d.id)) {
+      items.push({ kind: "cable_rec", title: `${lineName(d.id)} · 线路输入`, deviceId: d.id });
     } else {
       items.push({ kind: "output", title: d.name, deviceId: d.id });
       items.push({ kind: "loopback", title: `${d.name}（系统回声）`, deviceId: d.id });
     }
   }
-  // 每条线路拆成两个可分别拖入的节点
-  for (const c of cables.value) {
-    const name = c.display_name || `Virtual Cable ${String(c.number).padStart(2, "0")}`;
-    items.push({ kind: "cable_play", title: `${name} · 线路输出`, cable: c });
-    items.push({ kind: "cable_rec", title: `${name} · 线路输入`, cable: c });
-  }
   return items;
 });
 
 function paletteKey(item: PaletteItem): string | null {
-  if (item.kind === "cable_play" && item.cable) return nodeKey.cablePlay(item.cable.number);
-  if (item.kind === "cable_rec" && item.cable) return nodeKey.cableRec(item.cable.number);
   if (!item.deviceId) return null;
+  if (item.kind === "cable_play") return nodeKey.cablePlay(cableNumberOf(item.deviceId)!);
+  if (item.kind === "cable_rec") return nodeKey.cableRec(cableNumberOf(item.deviceId)!);
   if (item.kind === "input") return nodeKey.input(item.deviceId);
   if (item.kind === "loopback") return nodeKey.loopback(item.deviceId);
   return nodeKey.output(item.deviceId);
 }
 
 function paletteExisting(item: PaletteItem): boolean {
-  if (item.kind === "cable_play" && item.cable) {
-    return !!app.graph.sources.find((s) => s.device_id === `usbip://${item.cable!.number}/playback`);
-  }
-  if (item.kind === "cable_rec" && item.cable) {
-    return !!app.graph.sinks.find((s) => s.device_id === `usbip://${item.cable!.number}/capture`);
-  }
   if (!item.deviceId) return false;
+  if (item.kind === "cable_play") {
+    return !!app.graph.sources.find((s) => s.device_id === item.deviceId);
+  }
+  if (item.kind === "cable_rec") {
+    return !!app.graph.sinks.find((s) => s.device_id === item.deviceId);
+  }
   if (item.kind === "input") {
     return !!app.graph.sources.find((s) => s.device_id === item.deviceId && s.mode === "deviceinput");
   }
@@ -770,19 +818,18 @@ function makeSink(deviceId: string, name: string): Sink {
 
 async function addFromPalette(item: PaletteItem, dropPoint?: { x: number; y: number }) {
   const key = paletteKey(item);
-  if (!key) return;
+  if (!key || !item.deviceId) return;
   if (nodes.value.some((n) => n.key === key)) {
     message.info("该设备已在画布上");
     return;
   }
-  if (item.kind === "cable_play" && item.cable) {
-    const number = item.cable.number;
-    app.graph.sources.push(makeSource(`usbip://${number}/playback`, item.title, "deviceinput"));
-  } else if (item.kind === "cable_rec" && item.cable) {
-    app.graph.sinks.push(makeSink(`usbip://${item.cable.number}/capture`, item.title));
-  } else if (item.kind === "output" && item.deviceId) {
+  if (item.kind === "cable_play") {
+    app.graph.sources.push(makeSource(item.deviceId, item.title, "deviceinput"));
+  } else if (item.kind === "cable_rec") {
+    app.graph.sinks.push(makeSink(item.deviceId, item.title));
+  } else if (item.kind === "output") {
     app.graph.sinks.push(makeSink(item.deviceId, app.deviceName(item.deviceId)));
-  } else if (item.deviceId) {
+  } else {
     app.graph.sources.push(
       makeSource(item.deviceId, item.title, item.kind === "loopback" ? "loopback" : "deviceinput"),
     );
@@ -923,10 +970,16 @@ function flushPendingVolumes() {
 const defaultOut = computed(() => app.devices.find((d) => d.kind === "output" && d.is_default)?.id ?? null);
 const defaultIn = computed(() => app.devices.find((d) => d.kind === "input" && d.is_default)?.id ?? null);
 
+/** 系统默认设备候选。排除 usbip:// 合成端点（不是真实 Windows 端点，设默认必定失败）；
+ *  线路的真实扬声器/麦克风端点改标为「XX（虚拟线路）」——默认播放选它，系统声音才进得来。 */
 function options(kind: "input" | "output") {
   return app.devices
-    .filter((d) => d.kind === kind)
-    .map((d: DeviceInfo) => ({ label: d.name + (d.is_virtual ? "（虚拟）" : ""), value: d.id }));
+    .filter((d) => d.kind === kind && !d.id.startsWith("usbip://"))
+    .map((d: DeviceInfo) => {
+      const c = realCableDevice(d);
+      if (c) return { label: `${c.display_name}（虚拟线路）`, value: d.id };
+      return { label: d.name + (d.is_virtual ? "（虚拟）" : ""), value: d.id };
+    });
 }
 
 async function setDefault(deviceId: string) {
@@ -1023,6 +1076,7 @@ function onKeyDown(e: KeyboardEvent) {
 
 // ---------- 生命周期 ----------
 let pageObserver: ResizeObserver | null = null;
+let unlistenUsbip: (() => void) | undefined;
 
 onMounted(async () => {
   measure();
@@ -1044,8 +1098,10 @@ onMounted(async () => {
   }
   try {
     layout.value = sanitizeLayout(await api.getMixerLayout());
+    layoutLoaded = true;
   } catch {
     layout.value = {};
+    layoutLoaded = true;
   }
   try {
     const s = await api.usbipStatus();
@@ -1055,6 +1111,13 @@ onMounted(async () => {
     cables.value = [];
     usbipRunning.value = false;
   }
+  // 之后不再轮询：后端在附加/断开/自愈完成后广播 `usbip-status` 事件，
+  // 这里只监听刷新（启动自动附加要等 UAC，vhci 也会自发重复 import，
+  // 状态只拉一次会一直显示「未接入（需附加）」）
+  unlistenUsbip = await listen<UsbIpStatus>("usbip-status", (e) => {
+    cables.value = e.payload.cables;
+    usbipRunning.value = e.payload.running;
+  });
   await refreshDeviceVolumes();
   fitCanvas();
 });
@@ -1075,6 +1138,8 @@ onUnmounted(() => {
   pageObserver?.disconnect();
   pageObserver = null;
   detachWindowDrag();
+  if (persistTimer !== null) clearTimeout(persistTimer);
+  unlistenUsbip?.();
   flushPendingVolumes();
 });
 
@@ -1127,13 +1192,13 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
     </div>
   </n-card>
 
-  <div style="display: grid; grid-template-columns: 262px 1fr; gap: 14px; align-items: start">
+  <div style="display: grid; grid-template-columns: 262px 1fr; gap: 14px">
     <!-- 设备面板：按住拖到画布上生成节点（也可直接点击 = 放到默认位置） -->
-    <n-card size="small" title="设备">
+    <n-card size="small" title="设备" class="dev-card">
       <n-text depth="3" style="font-size: 12px; display: block; margin-bottom: 8px">
         按住拖到右侧画布；直接点击则放到默认位置。
       </n-text>
-      <div class="palette" :style="paletteStyle">
+      <div class="palette">
         <div
           v-for="(item, i) in palette"
           :key="i"
@@ -1171,7 +1236,7 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
             <marker
               id="wire-arrow"
               viewBox="0 0 10 10"
-              refX="9"
+              refX="10"
               refY="5"
               markerWidth="6"
               markerHeight="6"
@@ -1182,7 +1247,7 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
             <marker
               id="wire-arrow-muted"
               viewBox="0 0 10 10"
-              refX="9"
+              refX="10"
               refY="5"
               markerWidth="6"
               markerHeight="6"
@@ -1193,7 +1258,7 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
             <marker
               id="wire-arrow-sel"
               viewBox="0 0 10 10"
-              refX="9"
+              refX="10"
               refY="5"
               markerWidth="6"
               markerHeight="6"
@@ -1270,12 +1335,10 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
             <span class="node-close" @pointerdown.stop @click.stop="removeNode(node)">×</span>
           </div>
           <div class="node-sub">{{ node.subtitle }}</div>
-          <div class="meter-track" style="margin-top: 4px">
-            <div
-              class="meter-fill"
-              :style="{ width: Math.max(level(node.sourceId), level(node.sinkId)) * 100 + '%' }"
-            />
-          </div>
+          <MeterBar
+            class="node-meter"
+            :level="Math.max(level(node.sourceId), level(node.sinkId))"
+          />
 
           <!-- 输出/线路输出节点：直接调该设备的 **Windows 系统音量** -->
           <div v-if="node.sinkId" class="node-vol" @pointerdown.stop @click.stop>
@@ -1451,12 +1514,25 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
   min-height: 0;
   padding-bottom: 16px;
 }
+/* 设备卡片与画布等高：网格行高由画布卡（固定 px 高）决定，左卡默认 stretch 拉满；
+   卡片内部变成纵向 flex，设备列表吃掉剩余高度、超出自己滚动 */
+.dev-card {
+  display: flex;
+  flex-direction: column;
+}
+.dev-card :deep(.n-card__content) {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
 .palette {
+  flex: 1;
+  /* 兜底：画布高度还没量出来时也保持可用 */
+  min-height: 160px;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  /* 跟随窗口高度，超出时面板自己滚动 */
-  max-height: clamp(220px, calc(100vh - 470px), 900px);
   overflow-y: auto;
 }
 .palette-item {
@@ -1595,15 +1671,23 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
   margin-top: 2px;
   opacity: 0.62;
   font-size: 11px;
+  line-height: 1.3;
+  /* 最多两行：副标题常是「系统播放端（扬声器） · 拷贝：… · 状态」长句，一行省略号看不全 */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  word-break: break-all;
 }
 .node-vol {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-top: 2px;
+}
+.node-meter {
+  margin-top: 4px;
 }
 .node-vol :deep(.n-slider) {
   flex: 1;

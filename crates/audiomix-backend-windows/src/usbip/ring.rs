@@ -18,6 +18,7 @@ struct State {
     trimmed: u64,
 }
 
+/// 线程安全的 f32 环形缓冲（单 Mutex 保护，锁内逻辑极短）。
 pub struct AudioRing {
     state: Mutex<State>,
 }
@@ -47,6 +48,7 @@ impl AudioRing {
         self.state.lock().size
     }
 
+    /// (当前占用, 累计丢弃, 累计欠载) 快照。
     pub fn stats(&self) -> (usize, u64, u64) {
         let s = self.state.lock();
         (s.size, s.dropped, s.underruns)
@@ -91,6 +93,7 @@ impl AudioRing {
         got
     }
 
+    /// 清空缓冲（不清计数器，计数器是累计指标）。
     pub fn reset(&self) {
         let mut s = self.state.lock();
         s.read = 0;

@@ -95,6 +95,7 @@ pub fn set_default_endpoint(device_id: &str) -> Result<(), String> {
     set_default_endpoint_roles(device_id, &Role::ALL)
 }
 
+/// 把 `device_id` 设为默认端点（可指定角色子集）。
 pub fn set_default_endpoint_roles(device_id: &str, roles: &[Role]) -> Result<(), String> {
     if device_id.trim().is_empty() {
         return Err("设备 id 为空".into());
@@ -213,7 +214,8 @@ pub fn set_endpoint_mute(device_id: &str, mute: bool) -> Result<(), String> {
 }
 
 /// 该端点当前是否为默认设备（三种角色任一，主要给诊断/测试用）
-pub fn is_default_endpoint(device_id: &str) -> bool {    use windows::Win32::Media::Audio::{
+pub fn is_default_endpoint(device_id: &str) -> bool {
+    use windows::Win32::Media::Audio::{
         eConsole, eMultimedia, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
     };
     use windows::Win32::System::Com::CoCreateInstance as CoCreate;

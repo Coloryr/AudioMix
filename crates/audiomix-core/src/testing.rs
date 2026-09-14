@@ -24,6 +24,7 @@ const RENDER_CHUNK_FRAMES: usize = 512;
 /// 渲染 buffer 上限（样本数），防止长时间运行内存增长
 const RENDER_BUFFER_CAP: usize = 4_000_000;
 
+/// 内存中的假后端（`#[doc(hidden)]`，仅供测试与示例使用）。
 pub struct FakeBackend {
     devices: Vec<DeviceInfo>,
     capture_data: Mutex<HashMap<String, Vec<f32>>>,
@@ -123,10 +124,12 @@ impl FakeBackend {
         }
     }
 
+    /// 仍在运行的采集流数（应与已 drop 的流数对称归零）。
     pub fn alive_captures(&self) -> usize {
         self.captures_alive.load(Ordering::SeqCst)
     }
 
+    /// 仍在运行的渲染流数。
     pub fn alive_renders(&self) -> usize {
         self.renders_alive.load(Ordering::SeqCst)
     }

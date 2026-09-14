@@ -114,6 +114,9 @@ impl AudioBackend for UsbIpBackend {
             let mut fed: u64 = 0;
             let mut ticks: u64 = 0;
             let mut buf: Vec<f32> = Vec::new();
+            // 上次心跳后的状态：用于「异常立即记录、稳态低频心跳」
+            let mut last_dropped = (0u64, 0u64);
+            let mut last_active = (false, false);
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(TICK);
                 let frames = frames_due(start.elapsed().as_secs_f64(), rate, cushion, fed);
@@ -125,21 +128,30 @@ impl AudioBackend for UsbIpBackend {
                 let got = cable.play_ring.pop(&mut buf);
                 on_data(&buf);
                 fed += frames as u64;
-                // 线缆环的自检（每 ~2 秒一条）：欠载/丢弃是「声音变慢、一卡一卡」的直接证据
+                // 线缆环自检：稳态每 ~60 秒一条心跳；丢弃计数或接口流式状态一有变化
+                // 立刻记录（丢弃是「声音变慢、一卡一卡」的直接证据；欠载空闲时自然
+                // 增长，不作为触发条件，否则空闲时也会每 2 秒刷一条）
                 ticks += 1;
                 if ticks % 200 == 0 {
                     let (p_avail, p_dropped, p_under) = cable.play_ring.stats();
                     let (c_avail, c_dropped, c_under) = cable.cap_ring.stats();
-                    let fed_secs = fed as f64 / rate as f64;
-                    let real = start.elapsed().as_secs_f64();
-                    tracing::debug!(
-                        "线缆 {} 采集: 已喂 {fed_secs:.2}s 音频 / 实际 {real:.2}s（比 {:.4}），本次取到 {got} 帧；播放接口 {} 录音接口 {}；播放环 avail={p_avail} 丢={p_dropped} 欠={p_under}；录音环 avail={c_avail} 丢={c_dropped} 欠={c_under} **裁剪={trimmed}**",
-                        cable.bus_id,
-                        fed_secs / real.max(f64::MIN_POSITIVE),
-                        if cable.playback_active() { "alt1(流式中)" } else { "alt0(未流式)" },
-                        if cable.capture_active() { "alt1(流式中)" } else { "alt0(未流式)" },
-                        trimmed = cable.cap_ring.trimmed(),
-                    );
+                    let active = (cable.playback_active(), cable.capture_active());
+                    let anomaly =
+                        (p_dropped, c_dropped) != last_dropped || active != last_active;
+                    if anomaly || ticks % 3000 == 0 {
+                        let fed_secs = fed as f64 / rate as f64;
+                        let real = start.elapsed().as_secs_f64();
+                        tracing::debug!(
+                            "线缆 {} 采集: 已喂 {fed_secs:.2}s 音频 / 实际 {real:.2}s（比 {:.4}），本次取到 {got} 帧；播放接口 {} 录音接口 {}；播放环 avail={p_avail} 丢={p_dropped} 欠={p_under}；录音环 avail={c_avail} 丢={c_dropped} 欠={c_under} **裁剪={trimmed}**",
+                            cable.bus_id,
+                            fed_secs / real.max(f64::MIN_POSITIVE),
+                            if active.0 { "alt1(流式中)" } else { "alt0(未流式)" },
+                            if active.1 { "alt1(流式中)" } else { "alt0(未流式)" },
+                            trimmed = cable.cap_ring.trimmed(),
+                        );
+                        last_dropped = (p_dropped, c_dropped);
+                        last_active = active;
+                    }
                 }
             }
         })?;

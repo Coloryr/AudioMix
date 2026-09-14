@@ -13,6 +13,9 @@ use audiomix_core::backend::{AudioBackend, CaptureCallback, RenderCallback, Star
 use audiomix_core::error::Result;
 use audiomix_core::model::DeviceInfo;
 
+/// [`AudioBackend`] 的 Windows 实现（纯 WASAPI，不含虚拟声卡——后者由
+/// [`UsbIpBackend`](crate::usbip::UsbIpBackend) 提供并通过
+/// [`CompositeBackend`](audiomix_core::CompositeBackend) 组合）。
 pub struct WindowsBackend;
 
 impl Default for WindowsBackend {

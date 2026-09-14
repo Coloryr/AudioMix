@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -23,19 +24,25 @@ use crate::backend::{AudioBackend, CaptureCallback, RenderCallback, StartedStrea
 use crate::error::{Error, Result};
 use crate::mixer::{convert_channels, mix_into, peak_of, soft_clip};
 use crate::model::{DeviceInfo, DeviceKind, GraphConfig, Id, SourceMode, Route, Sink, Source};
-use crate::resample::PullResampler;
+use crate::resample::{PullResampler, ResamplerQuality};
 use crate::ring::{new_edge_ring, EdgeReader, EdgeRing, EdgeWriter};
 
 /// 边缓冲容量：250ms（按 source 采样率折算）
 const EDGE_CAPACITY_MS: usize = 250;
 /// 渲染线程每 tick 最多拉取的样本数上限（防延迟堆积），约 500ms
 const MAX_PULL_SAMPLES: usize = 48000 * 2;
+/// 设备热插拔看门狗的轮询间隔（`spawn_device_watchdog`）
+const DEVICE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(3);
 
+/// 引擎事件（`subscribe` 广播，供 UI / SSE 推送）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EngineEvent {
+    /// 混音图已被应用（流有启动/停止/重建）
     GraphApplied,
+    /// 设备列表发生变化（热插拔）
     DevicesChanged,
+    /// 某 sink 渲染欠载（数据到达不及时被补静音）
     Underrun { sink_id: Id },
 }
 
@@ -67,29 +74,47 @@ struct Inner {
     sinks: HashMap<Id, SinkHandle>,
     edges: HashMap<(Id, Id), EdgeHandle>,
     device_cache: Vec<DeviceInfo>,
+    /// 重采样质量档位（Settings 可切换）
+    resample_quality: ResamplerQuality,
+    /// 边环形缓冲容量（ms，按 source 采样率折算帧数）
+    edge_capacity_ms: usize,
 }
 
 /// 音频线程读取的不可变运行时快照
 pub struct GraphRuntime {
+    /// sink id → 系统音量（0..=1）
     pub sink_volume: HashMap<Id, f32>,
+    /// sink id → 该 sink 的全部路由边
     pub sink_edges: HashMap<Id, Vec<EdgeRef>>,
+    /// 重采样质量档位（切换后渲染线程按此重建各边重采样器）
+    pub resample_quality: ResamplerQuality,
 }
 
+/// 快照里的一条路由边：source → sink 的采样格式与增益参数。
 pub struct EdgeRef {
+    /// 所属 Route 的 id（渲染线程用它管理每条边的重采样状态）
     pub route_id: Id,
+    /// 路由增益（muted 时实际按 0 处理）
     pub gain: f32,
     pub muted: bool,
+    /// source 侧采样率（边缓冲内的样本格式）
     pub src_rate: u32,
+    /// source 侧通道数
     pub src_ch: u16,
+    /// 该边的环形缓冲读端
     pub reader: Arc<EdgeReader>,
 }
 
+/// 引擎运行统计（`stats()` 快照）。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EngineStats {
+    /// source id → 采集侧因边缓冲满而被丢弃的样本数（持续增长 = 上游消费不及时）
     pub source_dropped: HashMap<Id, u64>,
+    /// sink id → 渲染欠载次数（每次欠载输出被补静音）
     pub sink_underruns: HashMap<Id, u64>,
 }
 
+/// 混音引擎：持有全部采集/渲染流与路由边缓冲，接收图变更并 diff 应用。
 pub struct Engine {
     backend: Arc<dyn AudioBackend>,
     inner: Mutex<Inner>,
@@ -98,6 +123,7 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// 用给定后端创建引擎并缓存首次设备枚举结果。
     pub fn new(backend: Arc<dyn AudioBackend>) -> Result<Arc<Self>> {
         let devices = backend.enumerate_devices()?;
         let (events, _) = broadcast::channel(64);
@@ -109,20 +135,26 @@ impl Engine {
                 sinks: HashMap::new(),
                 edges: HashMap::new(),
                 device_cache: devices,
+                resample_quality: ResamplerQuality::default(),
+                edge_capacity_ms: EDGE_CAPACITY_MS,
             }),
             runtime: Arc::new(ArcSwap::from_pointee(GraphRuntime {
                 sink_volume: HashMap::new(),
                 sink_edges: HashMap::new(),
+                resample_quality: ResamplerQuality::default(),
             })),
             events,
         });
+        engine.spawn_device_watchdog();
         Ok(engine)
     }
 
+    /// 后端名称（诊断/状态页用）。
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
     }
 
+    /// 订阅引擎事件（tokio broadcast；落后会收到 `Lagged`，调用方自行跳过即可）。
     pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
         self.events.subscribe()
     }
@@ -133,10 +165,12 @@ impl Engine {
 
     // ---------- 设备 ----------
 
+    /// 缓存的设备列表（上次枚举结果；要最新数据用 [`Self::refresh_devices`]）。
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
         self.inner.lock().device_cache.clone()
     }
 
+    /// 重新枚举设备；列表有变化时广播 [`EngineEvent::DevicesChanged`] 并重新对齐流。
     pub fn refresh_devices(&self) -> Result<Vec<DeviceInfo>> {
         let devices = self.backend.enumerate_devices()?;
         let changed = {
@@ -157,13 +191,37 @@ impl Engine {
         // 启动时设备还不存在 → 那条 source/sink 被「跳过」，不补启就会一直静默
         // （混音页看起来路由接好了却完全没声音）。
         if changed {
+            tracing::info!("设备列表变化（现在 {} 台），已重新对齐流", devices.len());
             self.sync_streams()?;
         }
         Ok(devices)
     }
 
+    /// 设备热插拔看门狗：蓝牙/USB 耳机插拔、虚拟线缆接入后自动重新枚举。
+    ///
+    /// 不用 `IMMNotificationClient`（纯 Rust 接 COM 事件源繁琐，还要管理回调对象
+    /// 生命周期），轮询枚举每几秒一次开销可忽略；好处是窗口关到托盘 / headless
+    /// 运行时也照常工作，且设备一出现就 `sync_streams`，路由不用手动刷新。
+    /// 引擎实例释放（Arc 归零）后线程自动退出。
+    fn spawn_device_watchdog(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        if let Err(e) = std::thread::Builder::new().name("device-watchdog".into()).spawn(move || {
+            loop {
+                std::thread::sleep(DEVICE_WATCHDOG_INTERVAL);
+                // 睡醒后引擎可能已被释放（应用退出/测试结束）
+                let Some(engine) = weak.upgrade() else { break };
+                if let Err(e) = engine.refresh_devices() {
+                    tracing::debug!("设备看门狗枚举失败（下一轮重试）: {e}");
+                }
+            }
+        }) {
+            tracing::warn!("设备看门狗线程启动失败（热插拔后需手动刷新设备）: {e}");
+        }
+    }
+
     // ---------- 图 ----------
 
+    /// 当前混音图。
     pub fn get_graph(&self) -> GraphConfig {
         self.inner.lock().config.clone()
     }
@@ -175,6 +233,7 @@ impl Engine {
         self.sync_streams()
     }
 
+    /// 修改某条路由的增益（0.0..=4.0，超范围被钳制）。
     pub fn set_route_gain(&self, route_id: &str, gain: f32) -> Result<()> {
         let mut inner = self.inner.lock();
         let route = inner
@@ -187,6 +246,7 @@ impl Engine {
         self.sync_streams_locked(&mut inner)
     }
 
+    /// 静音/取消静音某条路由。
     pub fn set_route_muted(&self, route_id: &str, muted: bool) -> Result<()> {
         let mut inner = self.inner.lock();
         let route = inner
@@ -199,6 +259,7 @@ impl Engine {
         self.sync_streams_locked(&mut inner)
     }
 
+    /// 设置 sink 音量（0.0..=1.0，超范围被钳制）。
     pub fn set_sink_volume(&self, sink_id: &str, volume: f32) -> Result<()> {
         let mut inner = self.inner.lock();
         let sink = inner
@@ -211,6 +272,7 @@ impl Engine {
         self.sync_streams_locked(&mut inner)
     }
 
+    /// 启用/停用 source（停用即停止其采集流）。
     pub fn set_source_enabled(&self, id: &str, enabled: bool) -> Result<()> {
         let mut inner = self.inner.lock();
         let src = inner
@@ -223,6 +285,7 @@ impl Engine {
         self.sync_streams_locked(&mut inner)
     }
 
+    /// 启用/停用 sink（停用即停止其渲染流）。
     pub fn set_sink_enabled(&self, id: &str, enabled: bool) -> Result<()> {
         let mut inner = self.inner.lock();
         let sink = inner
@@ -250,6 +313,7 @@ impl Engine {
         out
     }
 
+    /// 运行统计快照（丢弃/欠载计数，见 [`EngineStats`]）。
     pub fn stats(&self) -> EngineStats {
         let inner = self.inner.lock();
         EngineStats {
@@ -278,6 +342,7 @@ impl Engine {
         self.runtime.store(Arc::new(GraphRuntime {
             sink_volume: HashMap::new(),
             sink_edges: HashMap::new(),
+            resample_quality: inner.resample_quality,
         }));
     }
 
@@ -435,7 +500,8 @@ impl Engine {
                 Some(h) => h.ring,
                 None => {
                     let src = &inner.sources[&route.source_id];
-                    let cap_frames = src.info.sample_rate as usize * EDGE_CAPACITY_MS / 1000;
+                    let cap_frames =
+                        src.info.sample_rate as usize * inner.edge_capacity_ms / 1000;
                     new_edge_ring(cap_frames, src.info.channels as usize)
                 }
             };
@@ -444,6 +510,14 @@ impl Engine {
         inner.edges = new_edges;
 
         // ---- 构建并发布运行时快照 ----
+        self.publish_runtime(inner);
+
+        self.emit(EngineEvent::GraphApplied);
+        Ok(())
+    }
+
+    /// 从 Inner 构建运行时快照并原子发布（音频线程无锁读取新配置）
+    fn publish_runtime(&self, inner: &Inner) {
         let mut sink_edges: HashMap<Id, Vec<EdgeRef>> = HashMap::new();
         let mut source_writers: HashMap<Id, Vec<Arc<EdgeWriter>>> = HashMap::new();
         for (key, eh) in &inner.edges {
@@ -478,14 +552,39 @@ impl Engine {
         self.runtime.store(Arc::new(GraphRuntime {
             sink_volume,
             sink_edges,
+            resample_quality: inner.resample_quality,
         }));
         for (id, h) in &inner.sources {
             let writers = source_writers.get(id).cloned().unwrap_or_default();
             h.writers.store(Arc::new(writers));
         }
+    }
 
-        self.emit(EngineEvent::GraphApplied);
-        Ok(())
+    /// 设置重采样质量档位；立即重新发布快照，各边渲染状态在下一次渲染时重建。
+    pub fn set_resample_quality(&self, quality: ResamplerQuality) {
+        let mut inner = self.inner.lock();
+        if inner.resample_quality == quality {
+            return;
+        }
+        inner.resample_quality = quality;
+        self.publish_runtime(&inner);
+        tracing::info!("重采样质量切换为 {quality:?}，各路由重采样器将在下次渲染时重建");
+    }
+
+    /// 设置边环形缓冲容量（ms，钳制在 50..=1000）。
+    /// 容量是「卡顿时延迟/丢音频的上限」旋钮：加大更抗卡顿（引擎卡住时积缓冲
+    /// 而不是丢样本），调小则上限更低；不影响日常稳态延迟。
+    /// 变更后清除全部边缓冲，随下次 sync 按新容量重建（瞬时可能有一小段间隙）。
+    pub fn set_edge_buffer_ms(&self, ms: u32) {
+        let ms = ms.clamp(50, 1000) as usize;
+        let mut inner = self.inner.lock();
+        if inner.edge_capacity_ms == ms {
+            return;
+        }
+        inner.edge_capacity_ms = ms;
+        inner.edges.clear();
+        let _ = self.sync_streams_locked(&mut inner);
+        tracing::info!("边缓冲容量调整为 {ms}ms，已按新容量重建路由边缓冲");
     }
 }
 
@@ -508,15 +607,18 @@ fn make_capture_callback(
 /// 每个 sink 渲染线程私有的边状态
 struct SinkEdgeState {
     resampler: PullResampler,
+    /// 创建本状态时使用的质量档位（与快照不一致时重建）
+    quality: ResamplerQuality,
     scratch: Vec<f32>,
     gen: Vec<f32>,
     converted: Vec<f32>,
 }
 
 impl SinkEdgeState {
-    fn new(src_rate: u32, dst_rate: u32, src_ch: u16) -> Self {
+    fn new(src_rate: u32, dst_rate: u32, src_ch: u16, quality: ResamplerQuality) -> Self {
         Self {
-            resampler: PullResampler::new(src_rate, dst_rate, src_ch),
+            resampler: PullResampler::new(src_rate, dst_rate, src_ch, quality),
+            quality,
             scratch: Vec::new(),
             gen: Vec::new(),
             converted: Vec::new(),
@@ -558,8 +660,14 @@ fn make_render_callback(
             let created = !states.contains_key(&e.route_id);
             let st = states
                 .entry(e.route_id.clone())
-                .or_insert_with(|| SinkEdgeState::new(e.src_rate, out_rate, e.src_ch));
-            if created {
+                .or_insert_with(|| {
+                    SinkEdgeState::new(e.src_rate, out_rate, e.src_ch, rt.resample_quality)
+                });
+            // 快照里的质量档位变了 → 重建该边重采样器（设置切换即时生效）
+            if st.quality != rt.resample_quality {
+                *st = SinkEdgeState::new(e.src_rate, out_rate, e.src_ch, rt.resample_quality);
+                tracing::info!("路由 {} 重采样质量切换为 {:?}", e.route_id, rt.resample_quality);
+            } else if created {
                 tracing::info!(
                     "路由 {} 重采样器: {}Hz/{}ch → {}Hz/{}ch（step={:.6}）",
                     e.route_id,
@@ -625,6 +733,7 @@ pub fn make_source(device_id: &str, name: &str, mode: SourceMode) -> Source {
     }
 }
 
+/// 便捷构造（供控制层使用）
 pub fn make_sink(device_id: &str, name: &str) -> Sink {
     Sink {
         id: new_id("sink"),
@@ -635,6 +744,7 @@ pub fn make_sink(device_id: &str, name: &str) -> Sink {
     }
 }
 
+/// 便捷构造（供控制层使用）
 pub fn make_route(source_id: &str, sink_id: &str) -> Route {
     Route {
         id: new_id("route"),

@@ -19,12 +19,18 @@ import { useApp } from "./store";
 const app = useApp();
 const activeTab = ref("mixer");
 let levelTimer: number | undefined;
+let deviceTimer: number | undefined;
 
 onMounted(async () => {
   await app.loadAll();
   levelTimer = window.setInterval(() => app.pollLevels().catch(() => {}), 250);
+  // 设备列表轻量轮询：后端看门狗（3s）负责枚举热插拔，这里只同步 UI 展示
+  deviceTimer = window.setInterval(() => app.pollDevices().catch(() => {}), 2000);
 });
-onUnmounted(() => window.clearInterval(levelTimer));
+onUnmounted(() => {
+  window.clearInterval(levelTimer);
+  window.clearInterval(deviceTimer);
+});
 </script>
 
 <template>

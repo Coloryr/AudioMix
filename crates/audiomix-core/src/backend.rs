@@ -19,11 +19,15 @@ use crate::model::DeviceInfo;
 /// 设备流参数（共享模式引擎格式）
 #[derive(Debug, Clone, Copy)]
 pub struct StreamInfo {
+    /// 采样率 Hz（WASAPI 共享模式即 GetMixFormat 的采样率）
     pub sample_rate: u32,
+    /// 通道数
     pub channels: u16,
 }
 
+/// 采集回调：每次收到 interleaved f32 帧块（采集线程调用，禁止阻塞）。
 pub type CaptureCallback = Box<dyn FnMut(&[f32]) + Send>;
+/// 渲染回调：把 interleaved f32 写进给定缓冲（渲染线程按需调用，禁止阻塞）。
 pub type RenderCallback = Box<dyn FnMut(&mut [f32]) + Send>;
 
 /// 可停止的流句柄。Drop 时置位停止标志并等待线程退出。
@@ -33,6 +37,7 @@ pub struct StreamHandle {
 }
 
 impl StreamHandle {
+    /// 在独立线程启动 `f`，并把停止标志交给它轮询（协作式退出）。
     pub fn spawn(
         stop: Arc<AtomicBool>,
         thread: std::thread::Builder,
@@ -48,10 +53,12 @@ impl StreamHandle {
         })
     }
 
+    /// 请求流线程停止（不等待；等待由 [`Drop`] 完成）。
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
 
+    /// 停止标志是否已置位（请求停止 ≠ 线程已退出）。
     pub fn is_stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
@@ -72,6 +79,7 @@ pub struct StartedStream {
     pub handle: StreamHandle,
 }
 
+/// 平台音频后端 trait（每个平台一个实现，见模块文档）。
 pub trait AudioBackend: Send + Sync {
     /// 枚举当前活动设备
     fn enumerate_devices(&self) -> Result<Vec<DeviceInfo>>;
@@ -108,6 +116,7 @@ pub struct CompositeBackend {
 }
 
 impl CompositeBackend {
+    /// 按优先顺序组合子后端（先注册的设备在重复 id 时胜出）。
     pub fn new(backends: Vec<Arc<dyn AudioBackend>>) -> Self {
         Self {
             backends,
@@ -115,6 +124,7 @@ impl CompositeBackend {
         }
     }
 
+    /// 子后端列表（按注册顺序）。
     pub fn backends(&self) -> &[Arc<dyn AudioBackend>] {
         &self.backends
     }

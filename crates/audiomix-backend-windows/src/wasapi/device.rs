@@ -11,6 +11,7 @@ use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use audiomix_core::error::{Error, Result};
 use audiomix_core::model::{looks_virtual, DeviceInfo, DeviceKind};
 
+/// 初始化当前线程的 COM（MTA）；已初始化时的错误码直接忽略。
 pub fn com_init() {
     unsafe {
         // 已初始化时返回 RPC_E_CHANGED_MODE 等，忽略即可
@@ -84,7 +85,9 @@ pub fn default_endpoint_is_virtual(render: bool) -> bool {
     }
 }
 
-unsafe fn device_id_of(dev: &IMMDevice) -> Result<String> {    let pwstr = dev.GetId().map_err(Error::backend)?;
+/// 读取端点 id（调用方负责 COM 已初始化）。
+unsafe fn device_id_of(dev: &IMMDevice) -> Result<String> {
+    let pwstr = dev.GetId().map_err(Error::backend)?;
     let s = pwstr.to_string().unwrap_or_default();
     CoTaskMemFree(Some(pwstr.as_ptr() as *const _));
     Ok(s)

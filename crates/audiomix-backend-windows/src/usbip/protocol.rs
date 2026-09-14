@@ -8,18 +8,22 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// USB/IP 协议版本（v1.1.1，usbip-win2 期望的版本）。
 pub const PROTOCOL_VERSION: u16 = 0x0111;
 
+/// OP 包（op_header）的请求/应答码：设备列表与 import（attach）握手。
 pub const OP_REQ_IMPORT: u16 = 0x8003;
 pub const OP_REP_IMPORT: u16 = 0x0003;
 pub const OP_REQ_DEVLIST: u16 = 0x8005;
 pub const OP_REP_DEVLIST: u16 = 0x0005;
 
+/// URB 包（basic_header）的命令码：提交传输 / 取消传输 及其应答。
 pub const CMD_SUBMIT: u32 = 0x0000_0001;
 pub const CMD_UNLINK: u32 = 0x0000_0002;
 pub const RET_SUBMIT: u32 = 0x0000_0003;
 pub const RET_UNLINK: u32 = 0x0000_0004;
 
+/// URB 传输方向（host 视角：IN = 设备 → 主机）。
 pub const DIRECTION_OUT: u32 = 0;
 pub const DIRECTION_IN: u32 = 1;
 
@@ -36,11 +40,13 @@ pub const MAX_TRANSFER_LENGTH: u32 = 16 * 1024 * 1024;
 /// iso 包数上限
 pub const MAX_ISO_PACKETS: u32 = 4096;
 
+/// URB 应答状态码（沿 Linux 内核 errno 约定）。
 pub const STATUS_OK: i32 = 0;
 pub const STATUS_INVALID: i32 = -22; // -EINVAL
 pub const STATUS_PIPE: i32 = -32; // -EPIPE / STALL
 pub const STATUS_CONN_RESET: i32 = -104; // -ECONNRESET（成功 unlink 的规定状态码）
 
+/// OP 层 8 字节头（设备列表 / import 握手）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpHeader {
     pub version: u16,
@@ -48,6 +54,7 @@ pub struct OpHeader {
     pub status: u32,
 }
 
+/// 读取并解析 OP 头（8 字节，大端）。
 pub async fn read_op_header(r: &mut (impl AsyncRead + Unpin)) -> io::Result<OpHeader> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf).await?;
@@ -75,15 +82,19 @@ pub async fn write_op_header(
     w.write_all(&frame).await
 }
 
+/// URB 层 20 字节基本头，每条 URB 都以它开头。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BasicHeader {
     pub command: u32,
+    /// 请求序号（应答按它配对）
     pub sequence: u32,
+    /// 目标设备（devlist 中的下标，本服务器只有一台设备恒为 0）
     pub device_id: u32,
     pub direction: u32,
     pub endpoint: u32,
 }
 
+/// 读取并解析 URB 基本头（20 字节，大端）。
 pub async fn read_basic_header(r: &mut (impl AsyncRead + Unpin)) -> io::Result<BasicHeader> {
     let mut buf = [0u8; 20];
     r.read_exact(&mut buf).await?;
@@ -97,24 +108,31 @@ pub async fn read_basic_header(r: &mut (impl AsyncRead + Unpin)) -> io::Result<B
     })
 }
 
+/// CMD_SUBMIT 请求：一次 USB 传输（控制 / 批量 / 等时）。
 #[derive(Debug, Clone)]
 pub struct SubmitRequest {
     pub basic: BasicHeader,
     pub transfer_flags: u32,
+    /// 传输数据长度（上限 [`MAX_TRANSFER_LENGTH`]）
     pub transfer_buffer_length: u32,
+    /// 仅等时传输有意义
     pub start_frame: u32,
+    /// 等时包数；非等时为 [`NO_ISO_PACKETS`] 哨兵值
     pub number_of_packets: u32,
+    /// 轮询间隔（中断端点为 ms，等时为 2^(bInterval-1) 帧）
     pub interval: u32,
+    /// 控制传输的 8 字节 setup 包；非控制传输全 0
     pub setup: [u8; 8],
 }
 
 impl SubmitRequest {
+    /// 是否为等时传输（音频数据走这里）。
     pub fn is_isochronous(&self) -> bool {
         self.number_of_packets != NO_ISO_PACKETS && self.number_of_packets != 0
     }
 }
 
-/// 读取 SUBMIT 请求体（basic 头之后的 24 字节：5×u32 + setup[8]）
+/// 读取 SUBMIT 请求体（basic 头之后的 24 字节：5×u32 + setup\[8\]）
 pub async fn read_submit_body(
     r: &mut (impl AsyncRead + Unpin),
     basic: BasicHeader,
@@ -135,14 +153,17 @@ pub async fn read_submit_body(
     })
 }
 
+/// 等时传输的单包描述符（16 字节，随 RET_SUBMIT 返回）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IsoPacket {
+    /// 相对数据区的偏移
     pub offset: u32,
     pub length: u32,
     pub actual_length: u32,
     pub status: i32,
 }
 
+/// 读取 `count` 个等时包描述符（每个 16 字节，超限拒绝）。
 pub async fn read_iso_packets(
     r: &mut (impl AsyncRead + Unpin),
     count: u32,

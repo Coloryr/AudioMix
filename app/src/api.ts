@@ -49,6 +49,10 @@ export interface Settings {
   usbip: { enabled: boolean; bind: string; cables: UsbIpCable[] };
   autostart_headless: boolean;
   close_to_tray: boolean;
+  /** 重采样质量：sinc256（默认，高质量）/ sinc128（低延迟）/ linear（零延迟） */
+  resample_quality: "sinc256" | "sinc128" | "linear";
+  /** 边缓冲容量（ms，50..=1000，加大更抗卡顿，不影响日常延迟） */
+  edge_buffer_ms: number;
 }
 
 export interface ApiStatus {

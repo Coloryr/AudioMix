@@ -33,6 +33,19 @@ fn main() {
         .with_writer(logbuf::make_writer())
         .init();
 
+    // 提权 broker 模式：主进程经一次 UAC 把自己再启动一份（`--usbip-broker <addr> <token>`），
+    // 本进程常驻后台执行 usbip attach/detach（已提权），主进程退出即随之退出。
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--usbip-broker") {
+        let addr = args.get(i + 1).cloned().unwrap_or_default();
+        let token = args.get(i + 2).cloned().unwrap_or_default();
+        if let Err(e) = audiomix_backend_windows::usbip::broker::run_broker(&addr, &token) {
+            tracing::error!("USB/IP 提权代理异常退出: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     tauri::Builder::default()
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -53,8 +66,12 @@ fn main() {
                     Arc::new(UsbIpBackend::new(registry)),
                 ]));
                 let graph = settings.graph.clone();
+                let resample_quality = settings.settings.resample_quality;
+                let edge_buffer_ms = settings.settings.edge_buffer_ms;
                 std::thread::spawn(move || -> Result<_, String> {
                     let engine = Engine::new(backend).map_err(|e| format!("音频引擎初始化失败: {e}"))?;
+                    engine.set_resample_quality(resample_quality);
+                    engine.set_edge_buffer_ms(edge_buffer_ms);
                     if let Err(e) = engine.apply_graph(graph) {
                         // 设备缺失等情况不阻断启动，引擎会跳过不可用项
                         tracing::warn!("应用已保存的混音图时出现问题: {e}");
@@ -89,6 +106,17 @@ fn main() {
             // （实测接入后几秒才发生），这里常驻轻量轮询，一旦发现默认设备变成
             // 虚拟线路就恢复成用户选的物理设备。
             commands::spawn_default_device_guard(handle.clone());
+
+            // 启动时自动恢复线缆附加：vhci 端口还挂着上次的设备就不动（不弹 UAC），
+            // 端口空了（如重启过电脑）才自动提权 attach 一次。放后台线程，不阻塞窗口创建。
+            if usbip_cfg.enabled && !usbip_cfg.cables.is_empty() {
+                let auto_handle = handle.clone();
+                std::thread::spawn(move || {
+                    // 给 USB/IP 服务器一点就绪时间
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    commands::auto_attach_if_needed(&auto_handle);
+                });
+            }
 
             // 主窗口（headless 模式不创建）
             if headless {

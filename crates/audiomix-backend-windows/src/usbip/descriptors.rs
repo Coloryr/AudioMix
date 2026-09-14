@@ -70,16 +70,21 @@ impl CableFormat {
 
     /// 某个 bInterval 下，一个服务间隔必须容纳的字节数。
     ///
-    /// **必须多留 1 个音频帧**：Linux `f_uac2.c` 里写得很明确 ——
-    /// “Win10 requires max packet size + 1 frame”，否则 Windows 的 usbaudio2
-    /// 直接判该端点无法承载这个格式（表现为 `GetMixFormat` →
-    /// `AUDCLNT_E_UNSUPPORTED_FORMAT`，属性页「级别」空白，音频引擎反复重试）。
+    /// 逐字对齐 Linux `f_uac2.c::get_max_bw_for_bint` 的 async/playback 分支：
+    /// 速率按 `fb_max=5`（FBACK_FAST_MAX）膨胀 0.5% 后向上取整 ——
+    /// 注释原文「Win10 requires max packet size + 1 frame；
+    /// updated srate is always bigger, therefore DIV_ROUND_UP always yields +1」。
+    /// 对整数毫秒率（48k/96k/192k）效果恰好等于 +1 帧；44.1k 系比 naive 的
+    /// 「ceil(rate/间隔)+1」少 1 帧（f_uac2 在 Windows 上验证可用，以它为准）。
+    /// 采集端点是 async（bmAttributes=0x05），在 f_uac2 里与 playback 走同一分支。
     pub fn packet_bytes_at(&self, bint: u8) -> u32 {
         let micros = Self::service_interval_micros(bint) as u64;
         // 每毫秒 1000µs → 每秒 1_000_000/micros 个服务间隔
         let per_sec = 1_000_000u64 / micros;
-        let frames = (self.sample_rate as u64 + per_sec - 1) / per_sec; // 每间隔音频帧数，向上取整
-        (frames as u32 + 1) * self.frame_size() // +1 帧余量（Win10 要求）
+        // srate * (1000 + fb_max) / 1000，整数截断与 f_uac2 一致
+        let srate = self.sample_rate as u64 * 1005 / 1000;
+        let frames = (srate + per_sec - 1) / per_sec; // DIV_ROUND_UP，恒 ≥ nominal +1 帧
+        frames as u32 * self.frame_size()
     }
 
     /// 全速（UAC1）iso 端点：bInterval=1 → 每 1ms 一包，包长 = 每毫秒字节数（USB 2.0 全速上限 1023）
@@ -158,8 +163,12 @@ const CS_EP_GENERAL: u8 = 0x01;
 const CS_CLOCK_SOURCE: u8 = 0x0A;
 
 // —— 实体 ID（描述符内部交叉引用）——
-// 编号顺序对齐 Linux f_uac2（Windows usbaudio2 实测可用的那套）
+// 编号顺序对齐 Linux f_uac2（Windows usbaudio2 实测可用的那套）。
+// **播放/采集各一个 Clock Source**：f_uac2 就是这么做的（out_clk_src/in_clk_src）；
+// 微软文档明确「limited support for devices using a shared clock for multiple
+// endpoints」——单时钟被播放+采集两个方向共享正是 usbaudio2 的薄弱路径。
 const ID_CLOCK: u8 = 10; // 播放侧时钟（Clock Source）
+const ID_CLOCK_CAPTURE: u8 = 11; // 采集侧时钟（Clock Source，对应 device.rs 的 ID_CLOCK_CAP_ENTITY）
 const ID_USB_STREAMING_IT: u8 = 1; // 播放路径：USB streaming → Input Terminal
 const ID_FEATURE_PLAY: u8 = 2;
 const ID_SPEAKER_OT: u8 = 3;
@@ -518,19 +527,23 @@ fn uac2_configuration(fmt: &CableFormat) -> Vec<u8> {
         0,
     ]);
 
-    // 单个时钟源：MS 文档明确「The driver supports one single clock source only」，
-    // 多时钟源需要配 Clock Selector，否则端点解析不到时钟 → 整个 pin 没有可用格式
+    // 两个时钟源（对齐 f_uac2 的 out_clk_src/in_clk_src 拓扑）：
+    // 微软文档「limited support for devices using a shared clock for multiple
+    // endpoints」——播放/采集各挂各的时钟，正是参考实现避开共享时钟的写法。
+    // （文档里「The driver supports one single clock source only」指的是 Clock
+    // Selector 链只会选中一个源，不是说整个设备只能声明一个 Clock Source。）
     app(&clock_source(ID_CLOCK));
+    app(&clock_source(ID_CLOCK_CAPTURE));
 
-    // 播放路径：USB streaming IT → Feature Unit → Speaker OT
+    // 播放路径：USB streaming IT → Feature Unit → Speaker OT（时钟 = ID_CLOCK）
     app(&input_terminal(ID_USB_STREAMING_IT, ID_CLOCK));
     app(&feature_unit(ID_FEATURE_PLAY, ID_USB_STREAMING_IT));
     app(&output_terminal(ID_SPEAKER_OT, ID_FEATURE_PLAY, ID_CLOCK, 0x0301));
 
-    // 采集路径：Mic IT → Feature Unit → USB streaming OT
-    app(&input_terminal(ID_MIC_IT, ID_CLOCK));
+    // 采集路径：Mic IT → Feature Unit → USB streaming OT（时钟 = ID_CLOCK_CAPTURE）
+    app(&input_terminal(ID_MIC_IT, ID_CLOCK_CAPTURE));
     app(&feature_unit(ID_FEATURE_CAPTURE, ID_MIC_IT));
-    app(&output_terminal(ID_USB_STREAMING_OT, ID_FEATURE_CAPTURE, ID_CLOCK, 0x0101));
+    app(&output_terminal(ID_USB_STREAMING_OT, ID_FEATURE_CAPTURE, ID_CLOCK_CAPTURE, 0x0101));
 
     // AC 中断端点（属于接口 0；UAC2 用它上报控制变化，Windows 侧会轮询）
     app(&interrupt_endpoint(0x83));
@@ -601,16 +614,18 @@ fn uac2_configuration(fmt: &CableFormat) -> Vec<u8> {
     b
 }
 
-/// AC 接口类描述符块总长（头 + 1 个 Clock Source + 2×(IT+FU+OT)）
+/// AC 接口类描述符块总长（头 + 2 个 Clock Source + 2×(IT+FU+OT)）
 /// 注意：AC 的中断端点**不计入** wTotalLength（与 f_uac2 一致）
 fn ac_block_length() -> u16 {
-    9 + 8 + 2 * (17 + 18 + 12)
+    9 + 2 * 8 + 2 * (17 + 18 + 12)
 }
 
 /// Clock Source：| len | CS_IF | CLOCK_SOURCE | bClockID | bmAttributes | bmControls | bAssocTerminal | iClockSource |
-/// bmAttributes=0x01（内部固定时钟）、bmControls=0x03（采样率可读可写，不宣告有效性）
+/// bmAttributes=0x03（internal fixed clock —— UAC2 §4.7.2.1 的时钟类型编码：
+/// 01=internal programmable、10=external programmable、11=internal fixed；
+/// f_uac2 用 INT_FIXED）、bmControls=0x03（采样率可读可写，不宣告有效性）
 fn clock_source(id: u8) -> Vec<u8> {
-    vec![8, DESC_CS_INTERFACE, CS_CLOCK_SOURCE, id, 0x01, 0x03, 0x00, 0]
+    vec![8, DESC_CS_INTERFACE, CS_CLOCK_SOURCE, id, 0x03, 0x03, 0x00, 0]
 }
 
 /// AC 接口的中断端点（INT IN，1ms 轮询；UAC2 控制变化通知用）
@@ -1027,21 +1042,25 @@ mod tests {
     }
 
     #[test]
-    fn single_clock_source_per_usbaudio2_limit() {
-        // MS 文档：The driver supports one single clock source only
+    fn clock_topology_matches_f_uac2() {
+        // 播放/采集各一个 Clock Source（对齐 f_uac2 的 out/in_clk_src）。
+        // 微软文档明确共享时钟「limited support for devices using a shared clock
+        // for multiple endpoints」，单时钟双方向共享是 usbaudio2 的薄弱路径。
         let d = build(1, "", &fmt(48_000, 16), CableProtocol::Uac2).unwrap();
-        let clocks: Vec<usize> = d
+        let clocks: Vec<&[u8]> = d
             .config
             .windows(8)
-            .enumerate()
-            .filter(|(_, c)| c[1] == DESC_CS_INTERFACE && c[2] == CS_CLOCK_SOURCE)
-            .map(|(i, _)| i)
+            .filter(|c| c[1] == DESC_CS_INTERFACE && c[2] == CS_CLOCK_SOURCE)
             .collect();
-        assert_eq!(clocks.len(), 1, "只能有一个 Clock Source");
-        let cs = &d.config[clocks[0]..clocks[0] + 8];
-        assert_eq!(cs[4], 0x01, "内部固定时钟");
-        assert_eq!(cs[5], 0x03, "bmControls = 采样率可读写");
-        // 四条终端都指向这一个时钟（按描述符链逐条走，避免滑窗误匹配）
+        assert_eq!(clocks.len(), 2, "播放/采集各一个 Clock Source");
+        assert_eq!(clocks[0][3], ID_CLOCK, "播放侧时钟 ID");
+        assert_eq!(clocks[1][3], ID_CLOCK_CAPTURE, "采集侧时钟 ID");
+        for cs in &clocks {
+            assert_eq!(cs[4], 0x03, "internal fixed clock（对齐 f_uac2 INT_FIXED）");
+            assert_eq!(cs[5], 0x03, "bmControls = 采样率可读写");
+        }
+        // 播放路径终端 → 播放时钟；采集路径终端 → 采集时钟
+        // （按描述符链逐条走，避免滑窗误匹配）
         let cfg = &d.config;
         let (mut it, mut ot) = (Vec::new(), Vec::new());
         let mut pos = 0usize;
@@ -1060,8 +1079,8 @@ mod tests {
             }
             pos += len;
         }
-        assert_eq!(it, vec![ID_CLOCK, ID_CLOCK], "两个输入终端的时钟");
-        assert_eq!(ot, vec![ID_CLOCK, ID_CLOCK], "两个输出终端的时钟");
+        assert_eq!(it, vec![ID_CLOCK, ID_CLOCK_CAPTURE], "播放 IT → 播放时钟、采集 IT → 采集时钟");
+        assert_eq!(ot, vec![ID_CLOCK, ID_CLOCK_CAPTURE], "播放 OT → 播放时钟、采集 OT → 采集时钟");
     }
 
     #[test]

@@ -7,6 +7,7 @@ import {
   NSwitch,
   NInputNumber,
   NFormItem,
+  NSelect,
   NTag,
   NText,
   NPopconfirm,
@@ -158,6 +159,48 @@ onUnmounted(() => window.clearInterval(timer));
   <div class="settings-grid">
     <!-- 左：设置 -->
     <div style="display: flex; flex-direction: column; gap: 14px; min-width: 0">
+      <n-card title="音频引擎" size="small">
+        <div class="item-row">
+          <div style="flex: 1">
+            <div class="item-title">重采样质量</div>
+            <n-text depth="3" style="font-size: 12px">
+              高质量与低延迟的权衡，切换立即生效。
+              sinc 通带平坦、抗混叠好；linear 高频失真较大但零延迟（耳返场景选它）。
+            </n-text>
+          </div>
+          <n-select
+            v-model:value="app.settings.resample_quality"
+            :options="[
+              { label: '高质量 sinc（延迟 ~7ms）', value: 'sinc256' },
+              { label: '轻量 sinc（延迟 ~3.5ms）', value: 'sinc128' },
+              { label: 'linear（零延迟，耳返用）', value: 'linear' },
+            ]"
+            style="width: 230px"
+            @update:value="save"
+          />
+        </div>
+        <n-divider />
+        <div class="item-row">
+          <div style="flex: 1">
+            <div class="item-title">边缓冲容量</div>
+            <n-text depth="3" style="font-size: 12px">
+              50–1000ms。加大更抗卡顿（引擎/系统卡住时积缓冲而不丢音频），
+              不影响日常延迟；调小则卡顿上限更低。修改后路由边缓冲立即重建。
+            </n-text>
+          </div>
+          <n-input-number
+            v-model:value="app.settings.edge_buffer_ms"
+            :min="50"
+            :max="1000"
+            :step="50"
+            style="width: 130px"
+            @update:value="save"
+          >
+            <template #suffix>ms</template>
+          </n-input-number>
+        </div>
+      </n-card>
+
       <n-card title="后台运行" size="small">
         <div class="item-row">
           <div style="flex: 1">

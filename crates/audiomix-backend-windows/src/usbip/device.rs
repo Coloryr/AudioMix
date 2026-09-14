@@ -757,8 +757,33 @@ mod tests {
     }
 
     #[test]
+    fn capture_clock_source_entity_is_wired() {
+        // 采集侧时钟（实体 11，对应描述符里 Mic IT / USB streaming OT 的源）
+        // 必须与播放时钟应答一致——两套时钟采样率相同，只是各管各的方向
+        let c = Cable::new(cfg(5, 48_000, 16, CableMode::Mixer)).unwrap();
+        let get = SetupPacket { request_type: 0xA1, request: UAC_GET_CUR, value: 0x0100, index: 0x0B00, length: 4 };
+        let (data, st) = c.handle_control(get, &[]);
+        assert_eq!(st, STATUS_OK, "采集时钟 GET_CUR 不能 STALL");
+        assert_eq!(data, 48_000u32.to_le_bytes());
+        // SET_CUR 同样按描述符速率校验
+        let set = SetupPacket { request_type: 0x21, request: UAC_SET_CUR, value: 0x0100, index: 0x0B00, length: 4 };
+        let mut rate = 48_000u32.to_le_bytes().to_vec();
+        assert_eq!(c.handle_control(set, &rate).1, STATUS_OK);
+        rate.clear();
+        rate.extend_from_slice(&96_000u32.to_le_bytes());
+        assert_eq!(c.handle_control(set, &rate).1, STATUS_PIPE);
+        // GET_RANGE 与播放时钟同构（14 字节）
+        let range = SetupPacket { request_type: 0xA1, request: UAC_GET_RANGE, value: 0x0100, index: 0x0B00, length: 14 };
+        let (data, st) = c.handle_control(range, &[]);
+        assert_eq!(st, STATUS_OK);
+        assert_eq!(data.len(), 14);
+        assert_eq!(&data[2..6], &48_000u32.to_le_bytes());
+    }
+
+    #[test]
     fn clock_source_validity_is_readable() {
-        // 描述符 bmControls=0x07 宣告了时钟有效性（只读），必须应答 GET_CUR
+        // 描述符 bmControls=0x03 只宣告了频率控制，但若主机仍问有效性
+        // （selector 0x02），多答不亏——STALL 反而可能让枚举半途而废
         let c = Cable::new(cfg(7, 48_000, 16, CableMode::Mixer)).unwrap();
         let get = SetupPacket { request_type: 0xA1, request: UAC_GET_CUR, value: 0x0200, index: 0x0A00, length: 1 };
         let (data, st) = c.handle_control(get, &[]);

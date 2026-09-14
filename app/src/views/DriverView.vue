@@ -301,63 +301,80 @@ onMounted(() => {
     <n-list v-if="cables.length" :show-divider="false" style="margin-bottom: 10px">
       <n-list-item v-for="c in cables" :key="c.number">
         <div class="cable-row">
-          <n-tag size="small" type="warning" :bordered="false">{{ String(c.number).padStart(2, "0") }}</n-tag>
-          <n-input
-            v-model:value="c.name"
-            size="small"
-            style="width: 190px"
-            :placeholder="`Virtual Cable ${String(c.number).padStart(2, '0')}`"
-            maxlength="64"
-            clearable
-            @update:value="dirty = true"
-          />
-          <n-select
-            v-model:value="c.sample_rate"
-            :options="RATE_OPTIONS"
-            size="small"
-            style="width: 112px"
-            @update:value="dirty = true"
-          />
-          <n-select
-            v-model:value="c.bits"
-            :options="BIT_OPTIONS"
-            size="small"
-            style="width: 92px"
-            @update:value="dirty = true"
-          />
-          <n-select
-            v-model:value="c.protocol"
-            :options="PROTOCOL_OPTIONS"
-            size="small"
-            style="width: 168px"
-            :title="
-              c.protocol === 'uac2'
-                ? 'UAC2（高速，usbaudio2.sys）：192kHz/32bit 需要它'
-                : 'UAC1（USB 1.1 全速，usbaudio.sys）：兼容性最好，每毫秒上限 1023 字节'
-            "
-            @update:value="dirty = true"
-          />
-          <n-tag
-            v-if="c.protocol === 'uac1' && bytesPerMs(c) > 1023"
-            size="small"
-            type="error"
-            :bordered="false"
-            title="UAC1 是全速设备，每毫秒最多 1023 字节；该采样率/位深需要更多带宽，请改成 UAC2"
-          >
-            UAC1 带宽不足
-          </n-tag>
+          <!-- 第一行：身份与格式（名称/采样率/位深/协议/带宽告警/接入状态/删除） -->
+          <div class="cable-row-line">
+            <n-tag size="small" type="warning" :bordered="false">{{ String(c.number).padStart(2, "0") }}</n-tag>
+            <n-input
+              v-model:value="c.name"
+              size="small"
+              style="width: 190px"
+              :placeholder="`Virtual Cable ${String(c.number).padStart(2, '0')}`"
+              maxlength="64"
+              clearable
+              @update:value="dirty = true"
+            />
+            <n-select
+              v-model:value="c.sample_rate"
+              :options="RATE_OPTIONS"
+              size="small"
+              style="width: 112px"
+              @update:value="dirty = true"
+            />
+            <n-select
+              v-model:value="c.bits"
+              :options="BIT_OPTIONS"
+              size="small"
+              style="width: 92px"
+              @update:value="dirty = true"
+            />
+            <n-select
+              v-model:value="c.protocol"
+              :options="PROTOCOL_OPTIONS"
+              size="small"
+              style="width: 168px"
+              :title="
+                c.protocol === 'uac2'
+                  ? 'UAC2（高速，usbaudio2.sys）：192kHz/32bit 需要它'
+                  : 'UAC1（USB 1.1 全速，usbaudio.sys）：兼容性最好，每毫秒上限 1023 字节'
+              "
+              @update:value="dirty = true"
+            />
+            <n-tag
+              v-if="c.protocol === 'uac1' && bytesPerMs(c) > 1023"
+              size="small"
+              type="error"
+              :bordered="false"
+              title="UAC1 是全速设备，每毫秒最多 1023 字节；该采样率/位深需要更多带宽，请改成 UAC2"
+            >
+              UAC1 带宽不足
+            </n-tag>
+            <n-tag
+              size="small"
+              :type="attachedOf(c.number)?.attached ? 'success' : 'default'"
+              :bordered="false"
+            >
+              {{ attachedOf(c.number)?.attached ? `已接入（端口 ${attachedOf(c.number)?.port}）` : "未接入" }}
+            </n-tag>
+            <n-popconfirm @positive-click="removeCable(c.number)">
+              <template #trigger>
+                <n-button size="tiny" quaternary type="error">删除</n-button>
+              </template>
+              删除该线路后需要重新保存并附加，确定？
+            </n-popconfirm>
+          </div>
 
-          <!-- 线路内部拷贝方向：直接点接线图上的箭头选，不用下拉框 -->
-          <div
-            class="patch"
-            :title="
-              copyMode(c) === 'in2out'
-                ? '线路输入 → 拷贝到 → 线路输出：混音器写进录音端的数据同时回灌到播放端'
-                : copyMode(c) === 'out2in'
-                  ? '线路输出 → 拷贝到 → 线路输入：系统播放进这条线路的声音原样出现在系统录音端（混音图的「线路输出」能读到）'
-                  : '不拷贝：线路输入只输出混音图路由过来的信号'
-            "
-          >
+          <!-- 第二行：线路内部拷贝方向接线图（直接点箭头选，不用下拉框） -->
+          <div class="cable-row-line">
+            <div
+              class="patch"
+              :title="
+                copyMode(c) === 'in2out'
+                  ? '线路输入 → 拷贝到 → 线路输出：混音器写进录音端的数据同时回灌到播放端'
+                  : copyMode(c) === 'out2in'
+                    ? '线路输出 → 拷贝到 → 线路输入：系统播放进这条线路的声音原样出现在系统录音端（混音图的「线路输出」能读到）'
+                    : '不拷贝：线路输入只输出混音图路由过来的信号'
+              "
+            >
             <div class="patch-box">
               <div class="patch-label">线路输入</div>
               <div class="patch-sub">系统录音端（麦克风）</div>
@@ -435,22 +452,10 @@ onMounted(() => {
             </div>
           </div>
 
-          <n-tag size="small" :type="copyMode(c) === 'none' ? 'info' : 'success'" :bordered="false">
-            {{ copyLabel(c) }}
-          </n-tag>
-          <n-tag
-            size="small"
-            :type="attachedOf(c.number)?.attached ? 'success' : 'default'"
-            :bordered="false"
-          >
-            {{ attachedOf(c.number)?.attached ? `已接入（端口 ${attachedOf(c.number)?.port}）` : "未接入" }}
-          </n-tag>
-          <n-popconfirm @positive-click="removeCable(c.number)">
-            <template #trigger>
-              <n-button size="tiny" quaternary type="error">删除</n-button>
-            </template>
-            删除该线路后需要重新保存并附加，确定？
-          </n-popconfirm>
+            <n-tag size="small" :type="copyMode(c) === 'none' ? 'info' : 'success'" :bordered="false">
+              {{ copyLabel(c) }}
+            </n-tag>
+          </div>
         </div>
       </n-list-item>
     </n-list>
@@ -526,12 +531,18 @@ onMounted(() => {
 </template>
 
 <style scoped>
+/* 线路卡片两行布局：上面一行身份/格式/状态，下面一行拷贝方向接线图 */
 .cable-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.cable-row-line {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  width: 100%;
 }
 .patch {
   display: flex;

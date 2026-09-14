@@ -25,6 +25,8 @@ const IEEE_FLOAT_SUBFORMAT: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00a
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
+/// 在指定设备上启动采集流；`loopback=true` 时捕获该**输出**设备正在播放的声音。
+/// 调用线程先查一次设备格式（供引擎配置重采样），流线程内重新打开设备。
 pub fn start_capture(device_id: &str, loopback: bool, on_data: CaptureCallback) -> Result<StartedStream> {
     // 在调用线程查询格式（供引擎配置重采样），流线程内重新打开设备
     let info = mix_format_of_by_id(device_id)?;

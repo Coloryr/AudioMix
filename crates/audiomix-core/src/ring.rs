@@ -8,21 +8,26 @@ use parking_lot::Mutex;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
+/// 环形缓冲的写端（`ringbuf` 类型别名）。
 pub type Prod = HeapProd<f32>;
+/// 环形缓冲的读端（`ringbuf` 类型别名）。
 pub type Cons = HeapCons<f32>;
 
-/// 路由边（source → sink）的共享缓冲。
+/// 路由边（source → sink）的共享缓冲写端。
 /// Producer 端由采集线程持有，Consumer 端由对应 sink 的混音线程持有；
 /// 两侧各自用 Mutex 包装（各自单线程访问，无争用）。
 pub struct EdgeWriter {
     pub producer: Mutex<Prod>,
+    /// 缓冲满时被丢弃的样本累计数（采集回调不能阻塞，只能丢）
     pub dropped: AtomicU64,
 }
 
+/// 路由边的读端，由对应 sink 的渲染线程持有。
 pub struct EdgeReader {
     pub consumer: Mutex<Cons>,
 }
 
+/// 一条路由边的读写两端（共享同一块堆内存）。
 pub struct EdgeRing {
     pub writer: Arc<EdgeWriter>,
     pub reader: Arc<EdgeReader>,
@@ -52,6 +57,7 @@ impl EdgeWriter {
         }
     }
 
+    /// 累计丢弃的样本数。
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }

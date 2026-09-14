@@ -14,6 +14,8 @@ export const useApp = defineStore("app", {
       usbip: { enabled: false, bind: "127.0.0.1:3240", cables: [] },
       autostart_headless: true,
       close_to_tray: true,
+      resample_quality: "sinc256",
+      edge_buffer_ms: 250,
     } as Settings,
     autostart: false,
     apiStatus: { running: false, addr: null } as ApiStatus,
@@ -46,6 +48,10 @@ export const useApp = defineStore("app", {
     },
     async refreshDevices() {
       this.devices = await api.refreshDevices();
+    },
+    /** 轻量轮询：只读引擎缓存的设备列表（后端看门狗负责枚举热插拔） */
+    async pollDevices() {
+      this.devices = await api.listDevices();
     },
     async saveGraph() {
       this.graph = await api.applyGraph(this.graph);

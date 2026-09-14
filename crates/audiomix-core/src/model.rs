@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::resample::ResamplerQuality;
+
+/// 实体 id（source/sink/route 共用，形如 `src-a1b2c3d4` 的字符串）。
 pub type Id = String;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,11 +16,15 @@ pub enum DeviceKind {
     Output,
 }
 
+/// 一个音频端点设备（来自后端枚举）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
+    /// 平台端点 id（Windows 为 MMDevice 端点 id，打开流也用它）
     pub id: String,
+    /// 友好名（系统设置里显示的名字）
     pub name: String,
     pub kind: DeviceKind,
+    /// 是否为系统默认设备（录入/播放各至多一个）
     pub is_default: bool,
     /// 是否为虚拟声卡（驱动虚拟设备或已知第三方虚拟线路）
     pub is_virtual: bool,
@@ -34,6 +41,7 @@ pub enum SourceMode {
     Loopback,
 }
 
+/// 混音图的音频来源（一台设备一种采集模式至多一条 source）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Source {
     pub id: Id,
@@ -41,19 +49,24 @@ pub struct Source {
     /// 后端设备 id
     pub device_id: String,
     pub mode: SourceMode,
+    /// false 时引擎不启动其采集流
     pub enabled: bool,
 }
 
+/// 混音图的输出目标（一台输出设备至多一条 sink）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sink {
     pub id: Id,
     pub name: String,
+    /// 后端设备 id
     pub device_id: String,
     /// 0.0 ..= 1.0
     pub volume: f32,
+    /// false 时引擎不启动其渲染流
     pub enabled: bool,
 }
 
+/// 一条路由边：把某 source 的声音送进某 sink。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
     pub id: Id,
@@ -73,9 +86,11 @@ pub struct GraphConfig {
 }
 
 impl GraphConfig {
+    /// 按 id 查 source。
     pub fn source(&self, id: &str) -> Option<&Source> {
         self.sources.iter().find(|s| s.id == id)
     }
+    /// 按 id 查 sink。
     pub fn sink(&self, id: &str) -> Option<&Sink> {
         self.sinks.iter().find(|s| s.id == id)
     }
@@ -85,9 +100,11 @@ impl GraphConfig {
             .iter()
             .find(|s| s.device_id == device_id && s.mode == mode)
     }
+    /// 按设备 id 找 sink。
     pub fn sink_of_device(&self, device_id: &str) -> Option<&Sink> {
         self.sinks.iter().find(|s| s.device_id == device_id)
     }
+    /// 校验图的一致性：每条 route 的两端必须存在。
     pub fn validate(&self) -> Result<(), crate::Error> {
         for r in &self.routes {
             if self.source(&r.source_id).is_none() {
@@ -107,9 +124,11 @@ impl GraphConfig {
     }
 }
 
+/// 本地控制 API（REST + SSE）开关与监听参数。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlApiSettings {
     pub enabled: bool,
+    /// 监听地址（默认仅本机）
     pub bind: String,
     pub port: u16,
 }
@@ -285,6 +304,7 @@ pub struct UsbIpSettings {
     pub enabled: bool,
     /// 监听地址（仅本机使用：usbip-win2 从本机 attach）
     pub bind: String,
+    /// 虚拟线缆列表（每条是一个独立 USB 设备）
     pub cables: Vec<UsbIpCableSettings>,
 }
 
@@ -301,6 +321,7 @@ impl Default for UsbIpSettings {
 impl UsbIpSettings {
     pub const MAX_CABLES: usize = UsbIpCableSettings::MAX_NUMBER as usize;
 
+    /// 校验全部线缆配置（逐条校验 + 线缆号查重 + 数量上限）。
     pub fn validate(&self) -> Result<(), crate::Error> {
         if self.cables.len() > Self::MAX_CABLES {
             return Err(crate::Error::InvalidSettings(format!(
@@ -319,6 +340,7 @@ impl UsbIpSettings {
         Ok(())
     }
 
+    /// 按线缆号查线缆。
     pub fn cable(&self, number: u8) -> Option<&UsbIpCableSettings> {
         self.cables.iter().find(|c| c.number == number)
     }
@@ -344,6 +366,10 @@ pub struct Settings {
     pub default_output: Option<String>,
     /// 用户选定的系统默认**录音**设备 id
     pub default_input: Option<String>,
+    /// 重采样质量档位（sinc 默认 / linear 低延迟）
+    pub resample_quality: ResamplerQuality,
+    /// 边环形缓冲容量（ms，钳制 50..=1000；加大更抗卡顿，不影响日常延迟）
+    pub edge_buffer_ms: u32,
 }
 
 impl Default for Settings {
@@ -355,6 +381,8 @@ impl Default for Settings {
             close_to_tray: true,
             default_output: None,
             default_input: None,
+            resample_quality: ResamplerQuality::default(),
+            edge_buffer_ms: 250,
         }
     }
 }
