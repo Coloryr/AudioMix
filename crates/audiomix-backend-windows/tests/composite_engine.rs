@@ -30,7 +30,7 @@ fn test_settings() -> UsbIpSettings {
         bind: "127.0.0.1:0".into(),
         cables: vec![
             cable(1, 48_000, 16, UsbIpCableMode::Loopback),
-            cable(3, 96_000, 24, UsbIpCableMode::Mixer),
+            cable(3, 96_000, 16, UsbIpCableMode::Mixer),
         ],
     }
 }

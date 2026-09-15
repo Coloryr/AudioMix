@@ -310,7 +310,7 @@ fn pcm_ramp(bytes: usize) -> Vec<u8> {
 
 #[tokio::test]
 async fn devlist_reports_full_speed_uac1_device() {
-    let (_m, addr) = start_server(vec![cable_config(1, 48_000, 16), cable_config(2, 192_000, 16)]);
+    let (_m, addr) = start_server(vec![cable_config(1, 48_000, 16), cable_config(2, 96_000, 16)]);
 
     let mut c = Client::connect(addr).await;
     c.op_request(OP_REQ_DEVLIST).await;
@@ -598,14 +598,14 @@ async fn save_cables_while_attached_does_not_rebind_port() {
 
     // 改采样率后点「保存」：必须成功，且不能换端口
     manager
-        .start(&rt, vec![cable_config(1, 96_000, 24)])
+        .start(&rt, vec![cable_config(1, 96_000, 16)])
         .expect("保存线缆不应因端口被占用而失败");
     assert!(manager.running(), "保存后服务器仍应在运行");
     assert_eq!(manager.local_addr(), Some(addr), "保存不应更换监听地址");
     let cables = manager.cables();
     assert_eq!(cables.len(), 1);
     assert_eq!(cables[0].cfg.sample_rate, 96_000, "线缆表应换成新配置");
-    assert_eq!(cables[0].cfg.bits, 24);
+    assert_eq!(cables[0].cfg.bits, 16);
 
     // 已接入的会话不会被踢掉（改格式要重新 attach 才生效，UI 会自动重新附加）
     let r = c.control(1, [0x00, 0x09, 1, 0, 0, 0, 0, 0], &[], 0).await;

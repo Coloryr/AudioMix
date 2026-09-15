@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! 用法：
-//!   $env:UAC1BENCH_FORMATS = "48000:16,96000:24,192000:16"
+//!   $env:UAC1BENCH_FORMATS = "48000:16,96000:24"
 //!   $env:UAC1BENCH_SECS    = "120"
 //!   $env:UAC1BENCH_MODE    = "loopback"   # loopback / reverse / mixer
 //!   cargo run -p audiomix-backend-windows --example uac1bench
@@ -23,6 +23,12 @@ fn env(name: &str, default: &str) -> String {
 }
 
 fn main() {
+    // RUST_LOG 可控（如 `audiomix_backend_windows=debug` 看接口切换 / ISO 到达）
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(false)
+        .init();
+
     let formats = env("UAC1BENCH_FORMATS", "48000:16");
     let secs: u64 = env("UAC1BENCH_SECS", "60").parse().unwrap_or(60);
     let mode = match env("UAC1BENCH_MODE", "loopback").as_str() {

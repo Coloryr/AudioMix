@@ -19,7 +19,9 @@ import {
   gainToDb,
   nodeKey,
   type DeviceInfo,
+  type DspNode,
   type NodePos,
+  type Processor,
   type Sink,
   type Source,
   type UsbIpCableStatus,
@@ -124,7 +126,7 @@ function fitCanvas() {
 const canvasStyle = computed(() => ({ height: `${canvasH.value}px` }));
 
 // ---------- 节点模型 ----------
-type NodeKind = "input" | "loopback" | "output" | "cable_play" | "cable_rec";
+type NodeKind = "input" | "loopback" | "output" | "cable_play" | "cable_rec" | "dsp";
 
 interface GNode {
   key: string;
@@ -135,6 +137,8 @@ interface GNode {
   sourceId?: string;
   /** 左端子（信号流入）对应的 Sink */
   sinkId?: string;
+  /** DSP 处理方块（左入右出）对应的 Processor */
+  processorId?: string;
   cableNumber?: number;
   hasIn: boolean;
   hasOut: boolean;
@@ -214,6 +218,7 @@ const KIND_META: Record<NodeKind, { tag: string; type: "default" | "info" | "suc
   output: { tag: "输出设备", type: "success" },
   cable_play: { tag: "线路输出", type: "warning" },
   cable_rec: { tag: "线路输入", type: "warning" },
+  dsp: { tag: "DSP", type: "warning" },
 };
 
 const DEFAULT_COL: Record<NodeKind, number> = {
@@ -221,6 +226,7 @@ const DEFAULT_COL: Record<NodeKind, number> = {
   loopback: 0.03,
   cable_play: 0.36,
   cable_rec: 0.36,
+  dsp: 0.36,
   output: 0.68,
 };
 
@@ -236,7 +242,7 @@ function defaultPos(kind: NodeKind, index: number): NodePos {
 
 const nodes = computed<GNode[]>(() => {
   const list: GNode[] = [];
-  const counters: Record<string, number> = { input: 0, loopback: 0, output: 0, cable_play: 0, cable_rec: 0 };
+  const counters: Record<string, number> = { input: 0, loopback: 0, output: 0, cable_play: 0, cable_rec: 0, dsp: 0 };
   const pos = (key: string, kind: NodeKind): NodePos => {
     const stored = layout.value[key];
     // 坏数据（null/短数组/NaN）当作没有，回落到默认排布
@@ -307,12 +313,64 @@ const nodes = computed<GNode[]>(() => {
       y,
     });
   }
+  // DSP 处理方块：左入右出，标题=类型名，副标题=参数摘要
+  for (const p of app.graph.processors) {
+    const key = `dsp:${p.id}`;
+    const [x, y] = pos(key, "dsp");
+    list.push({
+      key,
+      kind: "dsp",
+      title: DSP_META[p.type].label,
+      subtitle: dspSubtitle(p),
+      processorId: p.id,
+      hasIn: true,
+      hasOut: true,
+      inSide: "left",
+      outSide: "right",
+      x,
+      y,
+    });
+  }
   return list;
 });
+
+/** DSP 方块副标题：关键参数摘要（随参数变化实时刷新） */
+function dspSubtitle(p: DspNode): string {
+  const db = (v: number) => `${v > 0 ? "+" : ""}${v.toFixed(1).replace(/\.0$/, "")}dB`;
+  switch (p.type) {
+    case "gain":
+      return db(p.db);
+    case "delay":
+      return `${p.ms.toFixed(0)} ms`;
+    case "eq3":
+      return `低 ${db(p.low_gain_db)} · 中 ${db(p.mid_gain_db)} · 高 ${db(p.high_gain_db)}`;
+    case "peak_eq":
+      return `${p.freq.toFixed(0)}Hz ${db(p.gain_db)}`;
+    case "graph_eq":
+      return p.gains_db.every((g) => g === 0) ? "10 段平直" : "10 段自定义";
+    case "highpass":
+      return `≥ ${p.freq.toFixed(0)} Hz`;
+    case "lowpass":
+      return `≤ ${p.freq.toFixed(0)} Hz`;
+    case "bandpass":
+      return `${p.freq.toFixed(0)} Hz`;
+  }
+}
 
 const nodeByKey = computed(() => new Map(nodes.value.map((n) => [n.key, n])));
 const nodeBySource = computed(() => new Map(nodes.value.filter((n) => n.sourceId).map((n) => [n.sourceId!, n])));
 const nodeBySink = computed(() => new Map(nodes.value.filter((n) => n.sinkId).map((n) => [n.sinkId!, n])));
+const nodeByProcessor = computed(() => new Map(nodes.value.filter((n) => n.processorId).map((n) => [n.processorId!, n])));
+
+/** 图实体 id（source/sink/processor）→ 画布节点 key */
+function graphIdToKey(id: string): string | null {
+  return nodeBySource.value.get(id)?.key ?? nodeBySink.value.get(id)?.key ?? nodeByProcessor.value.get(id)?.key ?? null;
+}
+
+/** source/sink/processor 三种 id 都能查到画布节点 */
+function nodeByGraphId(id: string): GNode | null {
+  return nodeBySource.value.get(id) ?? nodeBySink.value.get(id) ?? nodeByProcessor.value.get(id) ?? null;
+}
 
 /** 端子所在的边（按设备角色：输入设备在左、输出设备在右） */
 function termSide(node: GNode, which: "in" | "out"): "left" | "right" {
@@ -364,8 +422,8 @@ interface Wire {
 const wires = computed<Wire[]>(() => {
   const list: Wire[] = [];
   for (const r of app.graph.routes) {
-    const a = nodeBySource.value.get(r.source_id);
-    const b = nodeBySink.value.get(r.sink_id);
+    const a = nodeByGraphId(r.source_id);
+    const b = nodeByGraphId(r.sink_id);
     if (!a || !b) continue;
     list.push({
       id: r.id,
@@ -571,7 +629,9 @@ function termState(node: GNode, which: "in" | "out") {
   // 自己那个正在拉线的端子不参与高亮
   if (src.key === node.key && src.side === which) return "";
   // 只能 输出 → 输入：同类型端子一律不可接
-  let ok = src.side !== which && (which === "out" ? !!node.sourceId : !!node.sinkId);
+  let ok =
+    src.side !== which &&
+    (which === "out" ? !!(node.sourceId || node.processorId) : !!(node.sinkId || node.processorId));
   const srcNode = nodeByKey.value.get(src.key);
   if (ok && srcNode) ok = !pairForbidden(srcNode, src.side, node, which);
   return ok ? "compat" : "incompat";
@@ -718,7 +778,10 @@ async function connect(fromKey: string, fromSide: "in" | "out", toKey: string, t
   const inKey = fromSide === "in" ? fromKey : toKey;
   const outNode = nodeByKey.value.get(outKey);
   const inNode = nodeByKey.value.get(inKey);
-  if (!outNode?.sourceId || !inNode?.sinkId) {
+  // 出端必须是 source 或 DSP 方块；入端必须是 sink 或 DSP 方块
+  const sourceId = outNode?.sourceId ?? outNode?.processorId;
+  const sinkId = inNode?.sinkId ?? inNode?.processorId;
+  if (!outNode || !inNode || !sourceId || !sinkId) {
     message.warning("该端子不可连接");
     return;
   }
@@ -731,18 +794,44 @@ async function connect(fromKey: string, fromSide: "in" | "out", toKey: string, t
     );
     return;
   }
-  if (app.graph.routes.some((r) => r.source_id === outNode.sourceId && r.sink_id === inNode.sinkId)) {
+  // 成环直接拦掉：从入端沿信号方向走，能回到出端就是环
+  if (reachesFrom(inKey, outKey)) {
+    message.error("这条线会构成环路 —— DSP 处理链不允许循环，信号会无限累加");
+    return;
+  }
+  if (app.graph.routes.some((r) => r.source_id === sourceId && r.sink_id === sinkId)) {
     message.info("这条线已经接好了");
     return;
   }
   app.graph.routes.push({
     id: genId("route"),
-    source_id: outNode.sourceId,
-    sink_id: inNode.sinkId,
+    source_id: sourceId,
+    sink_id: sinkId,
     gain: 1.0,
     muted: false,
+    nodes: [],
   });
   await save();
+}
+
+/** 从 startKey 沿信号流向（出→入）能否到达 targetKey（防环） */
+function reachesFrom(startKey: string, targetKey: string): boolean {
+  const visited = new Set<string>();
+  const stack = [startKey];
+  while (stack.length) {
+    const k = stack.pop()!;
+    if (k === targetKey) return true;
+    if (visited.has(k)) continue;
+    visited.add(k);
+    for (const r of app.graph.routes) {
+      const from = graphIdToKey(r.source_id);
+      if (from === k) {
+        const to = graphIdToKey(r.sink_id);
+        if (to) stack.push(to);
+      }
+    }
+  }
+  return false;
 }
 
 async function disconnect(routeId: string) {
@@ -752,11 +841,13 @@ async function disconnect(routeId: string) {
 }
 
 // ---------- 设备面板 ----------
-type PaletteKind = "input" | "loopback" | "output" | "cable_play" | "cable_rec";
+type PaletteKind = "input" | "loopback" | "output" | "cable_play" | "cable_rec" | "dsp";
 interface PaletteItem {
   kind: PaletteKind;
   title: string;
   deviceId?: string;
+  /** kind === "dsp" 时的节点类型 */
+  dspType?: DspType;
 }
 
 const palette = computed<PaletteItem[]>(() => {
@@ -779,6 +870,10 @@ const palette = computed<PaletteItem[]>(() => {
       items.push({ kind: "loopback", title: `${d.name}（系统回声）`, deviceId: d.id });
     }
   }
+  // DSP 处理方块：静态清单，不限数量，可重复拖入
+  for (const t of DSP_ADD_OPTIONS) {
+    items.push({ kind: "dsp", title: t.label, dspType: t.value });
+  }
   return items;
 });
 
@@ -792,6 +887,8 @@ function paletteKey(item: PaletteItem): string | null {
 }
 
 function paletteExisting(item: PaletteItem): boolean {
+  // DSP 方块不限数量，永远不标灰
+  if (item.kind === "dsp") return false;
   if (!item.deviceId) return false;
   if (item.kind === "cable_play") {
     return !!app.graph.sources.find((s) => s.device_id === item.deviceId);
@@ -817,6 +914,25 @@ function makeSink(deviceId: string, name: string): Sink {
 }
 
 async function addFromPalette(item: PaletteItem, dropPoint?: { x: number; y: number }) {
+  // DSP 方块：不限数量，拖一次加一个
+  if (item.kind === "dsp") {
+    if (!item.dspType) return;
+    const proc: Processor = { id: genId("dsp"), ...makeDspNode(item.dspType) };
+    const key = `dsp:${proc.id}`;
+    app.graph.processors.push(proc);
+    if (dropPoint) {
+      layout.value = {
+        ...layout.value,
+        [key]: [
+          clamp01((dropPoint.x - NODE_W / 2) / canvasSize.value.w),
+          clamp01((dropPoint.y - NODE_H / 2) / canvasSize.value.h),
+        ],
+      };
+      await persistLayout();
+    }
+    await save();
+    return;
+  }
   const key = paletteKey(item);
   if (!key || !item.deviceId) return;
   if (nodes.value.some((n) => n.key === key)) {
@@ -856,6 +972,12 @@ async function removeNode(node: GNode) {
     app.graph.sinks = app.graph.sinks.filter((s) => s.id !== node.sinkId);
     app.graph.routes = app.graph.routes.filter((r) => r.sink_id !== node.sinkId);
   }
+  if (node.processorId) {
+    app.graph.processors = app.graph.processors.filter((p) => p.id !== node.processorId);
+    app.graph.routes = app.graph.routes.filter(
+      (r) => r.source_id !== node.processorId && r.sink_id !== node.processorId,
+    );
+  }
   const next = { ...layout.value };
   delete next[node.key];
   layout.value = next;
@@ -887,6 +1009,115 @@ function onMute(routeId: string, muted: boolean) {
   if (!r) return;
   r.muted = muted;
   api.setRouteMuted(routeId, muted).catch((e) => message.error(String(e)));
+}
+
+// ---------- 连线 DSP 节点链 ----------
+
+type DspType = DspNode["type"];
+
+const DSP_META: Record<DspType, { label: string }> = {
+  gain: { label: "增益" },
+  delay: { label: "延迟" },
+  eq3: { label: "三段均衡" },
+  peak_eq: { label: "峰式均衡" },
+  graph_eq: { label: "图形均衡 10 段" },
+  highpass: { label: "高通" },
+  lowpass: { label: "低通" },
+  bandpass: { label: "带通" },
+};
+
+const DSP_ADD_OPTIONS = (Object.keys(DSP_META) as DspType[]).map((t) => ({
+  label: DSP_META[t].label,
+  value: t,
+}));
+
+/** 图形均衡中心频率标签（与 Rust GRAPH_EQ_BANDS 一致） */
+const DSP_GEQ_BANDS = ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
+
+/** 各节点类型的参数滑杆定义（graph_eq 走专用 10 段竖向滑杆，不在此列） */
+const DSP_PARAMS: Record<Exclude<DspType, "graph_eq">, { key: string; label: string; min: number; max: number; step: number; unit?: string }[]> = {
+  gain: [{ key: "db", label: "增益", min: -60, max: 12, step: 0.5, unit: " dB" }],
+  delay: [{ key: "ms", label: "延迟", min: 0, max: 1000, step: 1, unit: " ms" }],
+  eq3: [
+    { key: "low_gain_db", label: "低增益", min: -24, max: 24, step: 0.5, unit: " dB" },
+    { key: "low_freq", label: "低频点", min: 20, max: 20000, step: 10, unit: " Hz" },
+    { key: "mid_gain_db", label: "中增益", min: -24, max: 24, step: 0.5, unit: " dB" },
+    { key: "mid_freq", label: "中频点", min: 20, max: 20000, step: 10, unit: " Hz" },
+    { key: "mid_q", label: "中 Q 值", min: 0.3, max: 10, step: 0.1 },
+    { key: "high_gain_db", label: "高增益", min: -24, max: 24, step: 0.5, unit: " dB" },
+    { key: "high_freq", label: "高频点", min: 20, max: 20000, step: 10, unit: " Hz" },
+  ],
+  peak_eq: [
+    { key: "freq", label: "频率", min: 20, max: 20000, step: 10, unit: " Hz" },
+    { key: "gain_db", label: "增益", min: -24, max: 24, step: 0.5, unit: " dB" },
+    { key: "q", label: "Q 值", min: 0.3, max: 10, step: 0.1 },
+  ],
+  highpass: [
+    { key: "freq", label: "频率", min: 20, max: 20000, step: 10, unit: " Hz" },
+    { key: "q", label: "Q 值", min: 0.3, max: 10, step: 0.1 },
+  ],
+  lowpass: [
+    { key: "freq", label: "频率", min: 20, max: 20000, step: 10, unit: " Hz" },
+    { key: "q", label: "Q 值", min: 0.3, max: 10, step: 0.1 },
+  ],
+  bandpass: [
+    { key: "freq", label: "频率", min: 20, max: 20000, step: 10, unit: " Hz" },
+    { key: "q", label: "Q 值", min: 0.3, max: 10, step: 0.1 },
+  ],
+};
+
+function makeDspNode(t: DspType): DspNode {
+  switch (t) {
+    case "gain":
+      return { type: "gain", enabled: true, db: 0 };
+    case "delay":
+      return { type: "delay", enabled: true, ms: 50 };
+    case "eq3":
+      return { type: "eq3", enabled: true, low_gain_db: 0, low_freq: 200, mid_gain_db: 0, mid_freq: 1000, mid_q: 1.0, high_gain_db: 0, high_freq: 4000 };
+    case "peak_eq":
+      return { type: "peak_eq", enabled: true, freq: 1000, gain_db: 0, q: 1.0 };
+    case "graph_eq":
+      return { type: "graph_eq", enabled: true, gains_db: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] };
+    case "highpass":
+      return { type: "highpass", enabled: true, freq: 100, q: 0.707 };
+    case "lowpass":
+      return { type: "lowpass", enabled: true, freq: 10000, q: 0.707 };
+    case "bandpass":
+      return { type: "bandpass", enabled: true, freq: 1000, q: 1.0 };
+  }
+}
+
+/** 选中画布上的 DSP 方块时，对应的 Processor */
+const selectedProcessor = computed(() =>
+  selectedNodeData.value?.processorId
+    ? app.graph.processors.find((p) => p.id === selectedNodeData.value!.processorId) ?? null
+    : null,
+);
+
+/** 方块参数有任何变化后下发引擎（后端命令内部持久化，无需再 save） */
+function touchProcessor(procId: string) {
+  const p = app.graph.processors.find((x) => x.id === procId);
+  if (!p) return;
+  api.setProcessorParams(procId, { ...p }).catch((e) => message.error(String(e)));
+}
+
+function onProcEnable(procId: string, enabled: boolean) {
+  const p = app.graph.processors.find((x) => x.id === procId);
+  if (!p) return;
+  p.enabled = enabled;
+  touchProcessor(procId);
+}
+
+/** key 为数字时表示 graph_eq 的第几段增益 */
+function onProcParam(procId: string, key: string | number, value: number) {
+  const p = app.graph.processors.find((x) => x.id === procId);
+  if (!p) return;
+  if (typeof key === "number") {
+    p.gains_db[key] = value;
+  } else {
+    (p as Record<string, unknown>)[key] = value;
+  }
+  touchProcessor(procId);
 }
 
 function onSinkVolume(sinkId: string, volume: number) {
@@ -1466,6 +1697,48 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
           </template>
           <n-button size="tiny" quaternary type="error" @click="removeNode(selectedNodeData)">移除节点</n-button>
         </div>
+
+        <!-- DSP 方块参数编辑 -->
+        <div v-if="selectedProcessor" class="dsp-section">
+          <div class="dsp-head">
+            <n-text depth="3" style="font-size: 12px">
+              {{ selectedProcessor.enabled ? "处理中（接在信号路径上）" : "已旁路（信号直通）" }}
+            </n-text>
+            <n-switch
+              :value="selectedProcessor.enabled"
+              size="small"
+              @update:value="(v: boolean) => onProcEnable(selectedProcessor!.id, v)"
+            />
+          </div>
+          <div v-if="selectedProcessor.type !== 'graph_eq'" class="dsp-params">
+            <div v-for="p in DSP_PARAMS[selectedProcessor.type]" :key="p.key" class="dsp-param">
+              <span class="item-sub" style="width: 48px">{{ p.label }}</span>
+              <n-slider
+                :value="(selectedProcessor as Record<string, number>)[p.key]"
+                :min="p.min"
+                :max="p.max"
+                :step="p.step"
+                :format-tooltip="(v: number) => v.toFixed(p.step < 1 ? 1 : 0) + (p.unit ?? '')"
+                style="flex: 1"
+                @update:value="(v: number) => onProcParam(selectedProcessor!.id, p.key, v)"
+              />
+            </div>
+          </div>
+          <div v-else class="dsp-geq">
+            <div v-for="(band, b) in DSP_GEQ_BANDS" :key="b" class="dsp-geq-band">
+              <n-slider
+                vertical
+                :value="selectedProcessor.gains_db[b]"
+                :min="-24"
+                :max="24"
+                :step="1"
+                height="80px"
+                @update:value="(v: number) => onProcParam(selectedProcessor!.id, b, v)"
+              />
+              <span class="item-sub">{{ band }}</span>
+            </div>
+          </div>
+        </div>
       </div>
       <n-text v-else depth="3" style="font-size: 12px">
         连线：按住节点两侧的圆点（整条边都行）拖到目标节点，或点一下圆点再点目标节点；Esc 取消。
@@ -1513,6 +1786,54 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
 .mixer-page {
   min-height: 0;
   padding-bottom: 16px;
+}
+/* 连线 DSP 节点链 */
+.dsp-section {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.dsp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.dsp-node {
+  border: 1px solid rgba(128, 128, 128, 0.25);
+  border-radius: 6px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.dsp-node-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dsp-params {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.dsp-param {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dsp-geq {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+}
+.dsp-geq-band {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
 }
 /* 设备卡片与画布等高：网格行高由画布卡（固定 px 高）决定，左卡默认 stretch 拉满；
    卡片内部变成纵向 flex，设备列表吃掉剩余高度、超出自己滚动 */

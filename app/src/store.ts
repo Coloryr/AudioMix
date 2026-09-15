@@ -7,7 +7,7 @@ export const genId = (prefix: string) => `${prefix}-${Math.random().toString(36)
 export const useApp = defineStore("app", {
   state: () => ({
     devices: [] as DeviceInfo[],
-    graph: { sources: [], sinks: [], routes: [] } as GraphConfig,
+    graph: { sources: [], sinks: [], routes: [], processors: [] } as GraphConfig,
     levels: {} as Record<string, number>,
     settings: {
       control_api: { enabled: false, bind: "127.0.0.1", port: 17643 },

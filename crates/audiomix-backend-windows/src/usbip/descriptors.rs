@@ -35,11 +35,17 @@ pub struct CableFormat {
 }
 
 pub const MIN_RATE: u32 = 44_100;
-pub const MAX_RATE: u32 = 192_000;
+/// 实测上限：96 kHz 以上主机侧 ISO OUT 无法稳定承载（见 TASK.md P1 格式矩阵）
+pub const MAX_RATE: u32 = 96_000;
+/// 多位深（24/32bit）的采样率上限：88.2k 以上只支持 16bit。
+///
+/// 依据（2026-09-15 实测）：loopback/reverse 模式 OUT+IN 两个 iso 端点**共享同一全速帧的
+/// ~1023 B/ms 预算**，96k/24 双向 = 1152 B/ms、96k/32 = 1536，都会像 192k 一样
+/// 主机侧 ISO OUT 慢性欠载、播放断流；96k/16 = 768 安全。与核侧
+/// `UsbIpCableSettings::MULTIBIT_MAX_RATE` 保持一致。
+pub const MULTIBIT_MAX_RATE: u32 = 88_200;
 /// 内置线路（UAC1 全速）每毫秒字节上限：USB 1.1 全速等时端点单包 1023 字节
 pub const MAX_BYTES_PER_MS: u32 = 1023;
-/// 超过这个采样率时内置线路只提供 16-bit
-pub const MULTIBIT_MAX_RATE: u32 = 96_000;
 
 impl CableFormat {
     pub fn validate(&self) -> Result<(), String> {
@@ -52,15 +58,14 @@ impl CableFormat {
         if !matches!(self.bits, 16 | 24 | 32) {
             return Err(format!("位深 {} 不受支持（16/24/32）", self.bits));
         }
-        if self.channels != 2 {
-            return Err(format!("通道数 {} 不受支持（当前固定 2）", self.channels));
-        }
         if self.sample_rate > MULTIBIT_MAX_RATE && self.bits != 16 {
             return Err(format!(
-                "内置线路在 {} Hz 以上只提供 16-bit（当前 {} Hz/{}-bit）—— \
-                 更高规格请自装第三方虚拟声卡（如 VB-CABLE）",
-                MULTIBIT_MAX_RATE, self.sample_rate, self.bits
+                "{} Hz 只支持 16bit（全速 USB 双向带宽限制）",
+                self.sample_rate
             ));
+        }
+        if self.channels != 2 {
+            return Err(format!("通道数 {} 不受支持（当前固定 2）", self.channels));
         }
         if self.frame_bytes() > MAX_BYTES_PER_MS as u16 {
             return Err(format!(
@@ -295,9 +300,13 @@ pub fn build(number: u8, product: &str, fmt: &CableFormat) -> Result<Descriptors
         return Err(format!("线缆 {number} 名称过长（上限 64 字）"));
     }
     let pid = 0xCA00 + number as u16;
-    // 序列号决定 Windows 的设备实例 ID：保持稳定，用户改采样率/位深不该变成"新设备"，
-    // 否则会丢默认设备设置、重新枚举驱动。
-    let serial = format!("AUDIOMIX-VCABLE-{number:03}");
+    // 序列号决定 Windows 的设备实例 ID（USB\VID_FFFF&PID_CAxx\<serial>）。
+    // **把格式编进 serial**：usbaudio.sys 会按设备实例缓存上次格式（共享模式 GetMixFormat
+    // 返回旧格式 → Initialize 全挂 0x88890008），换格式若实例不变就会全部不可用。
+    // 格式变了 → serial 变 → 全新实例 → 缓存从零开始，改格式后重新 attach 即恢复。
+    // 代价：换格式会丢该端点的默认设备/音量记忆，注册表留下不可见 phantom（WASAPI 不显示）。
+    // 名称（product）不编进去：改显示名不应变成新设备。
+    let serial = format!("AUDIOMIX-VCABLE-{number:03}-{}-{}", fmt.sample_rate, fmt.bits);
 
     let mut strings = BTreeMap::new();
     strings.insert(0u8, vec![4, DESC_STRING, 0x09, 0x04]); // en-US
@@ -539,7 +548,7 @@ mod tests {
         CableFormat { sample_rate: rate, bits, channels: 2 }
     }
 
-    /// 内置支持矩阵：44.1–96 kHz 的 16/24/32bit + 176.4/192 kHz 只 16bit
+    /// 内置支持矩阵：88.2k 及以下 16/24/32bit；88.2k 以上（96k 档）只 16bit
     const SUPPORTED: &[(u32, u16)] = &[
         (44_100, 16),
         (44_100, 24),
@@ -551,10 +560,6 @@ mod tests {
         (88_200, 24),
         (88_200, 32),
         (96_000, 16),
-        (96_000, 24),
-        (96_000, 32),
-        (176_400, 16),
-        (192_000, 16),
     ];
 
     #[test]
@@ -581,13 +586,14 @@ mod tests {
 
     #[test]
     fn rejects_formats_beyond_builtin_capability() {
-        // 96 kHz 以上只给 16bit
-        assert!(build(1, "", &fmt(192_000, 24)).is_err(), "192k/24bit 应被拒绝");
+        // 96 kHz 以上一律拒绝（实测主机侧 ISO OUT 无法稳定承载）
+        assert!(build(1, "", &fmt(192_000, 16)).is_err(), "192k/16bit 应被拒绝");
+        assert!(build(1, "", &fmt(176_400, 16)).is_err(), "176.4k/16bit 应被拒绝");
         assert!(build(1, "", &fmt(176_400, 24)).is_err(), "176.4k/24bit 应被拒绝");
-        assert!(build(1, "", &fmt(192_000, 32)).is_err(), "192k/32bit 应被拒绝");
-        assert!(build(1, "", &fmt(100_000, 24)).is_err(), "100k/24bit 应被拒绝（>96kHz）");
-        // 超出全速单包上限
-        assert!(fmt(192_000, 24).frame_bytes() > FS_MAX_PACKET, "1152 > 1023");
+        assert!(build(1, "", &fmt(100_000, 16)).is_err(), "100k/16bit 应被拒绝（>96kHz）");
+        // 88.2k 以上只支持 16bit：双向（OUT+IN 同帧）96k/24 = 1152 B/ms 超全速帧预算
+        assert!(build(1, "", &fmt(96_000, 24)).is_err(), "96k/24bit 应被拒绝（双向带宽）");
+        assert!(build(1, "", &fmt(96_000, 32)).is_err(), "96k/32bit 应被拒绝（双向带宽）");
     }
 
     #[test]
@@ -635,7 +641,7 @@ mod tests {
 
     #[test]
     fn all_interface_headers_are_uac1() {
-        let d = build(1, "", &fmt(96_000, 24)).unwrap();
+        let d = build(1, "", &fmt(88_200, 24)).unwrap();
         let ifaces: Vec<&[u8]> =
             d.config.windows(9).filter(|c| c[0] == 9 && c[1] == DESC_INTERFACE).collect();
         assert_eq!(ifaces.len(), 5, "AC(alt0) + 播放 AS(alt0/alt1) + 录音 AS(alt0/alt1)");
@@ -655,7 +661,7 @@ mod tests {
         assert_eq!(fmt(44_100, 24).frame_bytes(), 265); // 264.6
         assert_eq!(fmt(88_200, 32).frame_bytes(), 706); // 705.6
         assert_eq!(fmt(48_000, 16).frame_bytes(), 192); // 整数保持
-        assert_eq!(fmt(192_000, 16).frame_bytes(), 768);
+        assert_eq!(fmt(96_000, 16).frame_bytes(), 384);
     }
 
     /// 端点包长必须是**整数个采样帧**：44.1k 系每毫秒是小数帧，
@@ -666,12 +672,11 @@ mod tests {
         assert_eq!(fmt(44_100, 24).fs_wmax_packet(), 270);
         assert_eq!(fmt(44_100, 16).fs_wmax_packet(), 180); // 45 × 4
         assert_eq!(fmt(44_100, 32).fs_wmax_packet(), 360); // 45 × 8
-        assert_eq!(fmt(176_400, 16).fs_wmax_packet(), 708); // 177 × 4（标称 705.6）
         assert_eq!(fmt(88_200, 24).fs_wmax_packet(), 534); // 89 × 6
         // 48k 系本来就是整帧，不能变
         assert_eq!(fmt(48_000, 16).fs_wmax_packet(), 192);
         assert_eq!(fmt(96_000, 24).fs_wmax_packet(), 576);
-        assert_eq!(fmt(192_000, 16).fs_wmax_packet(), 768);
+        assert_eq!(fmt(96_000, 16).fs_wmax_packet(), 384);
         for &(rate, bits) in SUPPORTED {
             let f = fmt(rate, bits);
             let frame = (f.channels * f.subslot()) as u16;
@@ -692,12 +697,20 @@ mod tests {
         assert!(d.get(DESC_STRING, 9).is_none());
     }
 
+    /// serial 编码格式：格式变 → serial 变（新设备实例，绕开 usbaudio.sys 的实例格式缓存）；
+    /// 名称变 → serial 不变（改显示名不应变成新设备）。
     #[test]
-    fn serial_is_stable_per_cable() {
+    fn serial_encodes_format_but_not_name() {
         let a = build(7, "x", &fmt(48_000, 16)).unwrap();
-        let b = build(7, "y", &fmt(96_000, 24)).unwrap();
-        assert_eq!(a.serial, "AUDIOMIX-VCABLE-007");
-        assert_eq!(a.serial, b.serial, "改格式/名称不应换设备实例（否则会丢默认设备设置）");
+        assert_eq!(a.serial, "AUDIOMIX-VCABLE-007-48000-16");
+        // 同格式不同名称：实例保持（不丢默认设备设置）
+        let renamed = build(7, "y", &fmt(48_000, 16)).unwrap();
+        assert_eq!(a.serial, renamed.serial, "改名称不应换设备实例");
+        // 格式变化：serial 必须变（新实例 → 缓存干净）
+        let other = build(7, "x", &fmt(48_000, 24)).unwrap();
+        assert_ne!(a.serial, other.serial, "改格式必须换设备实例（usbaudio.sys 实例格式缓存）");
+        let b = build(7, "y", &fmt(48_000, 24)).unwrap();
+        assert_eq!(other.serial, b.serial);
     }
 
     #[test]

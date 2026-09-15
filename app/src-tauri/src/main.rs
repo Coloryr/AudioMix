@@ -151,6 +151,7 @@ fn main() {
             commands::set_mixer_layout,
             commands::set_route_gain,
             commands::set_route_muted,
+            commands::set_processor_params,
             commands::set_sink_volume,
             commands::get_levels,
             commands::get_stats,

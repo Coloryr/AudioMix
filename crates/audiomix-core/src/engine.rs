@@ -21,9 +21,12 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::backend::{AudioBackend, CaptureCallback, RenderCallback, StartedStream};
+use crate::dsp::DspChain;
 use crate::error::{Error, Result};
 use crate::mixer::{convert_channels, mix_into, peak_of, soft_clip};
-use crate::model::{DeviceInfo, DeviceKind, GraphConfig, Id, SourceMode, Route, Sink, Source};
+use crate::model::{
+    DeviceInfo, DeviceKind, DspNode, GraphConfig, Id, Processor, SourceMode, Route, Sink, Source,
+};
 use crate::resample::{PullResampler, ResamplerQuality};
 use crate::ring::{new_edge_ring, EdgeReader, EdgeRing, EdgeWriter};
 
@@ -72,7 +75,8 @@ struct Inner {
     config: GraphConfig,
     sources: HashMap<Id, SourceHandle>,
     sinks: HashMap<Id, SinkHandle>,
-    edges: HashMap<(Id, Id), EdgeHandle>,
+    /// 有效路径的边缓冲（key = 路径 id，见 [`resolve_paths`]）
+    edges: HashMap<String, EdgeHandle>,
     device_cache: Vec<DeviceInfo>,
     /// 重采样质量档位（Settings 可切换）
     resample_quality: ResamplerQuality,
@@ -101,6 +105,8 @@ pub struct EdgeRef {
     pub src_rate: u32,
     /// source 侧通道数
     pub src_ch: u16,
+    /// DSP 节点链（渲染线程按值变化重建 DSP 状态）
+    pub nodes: Arc<[DspNode]>,
     /// 该边的环形缓冲读端
     pub reader: Arc<EdgeReader>,
 }
@@ -257,6 +263,23 @@ impl Engine {
             .ok_or_else(|| Error::InvalidGraph(format!("route {route_id} 不存在")))?;
         route.muted = muted;
         self.sync_streams_locked(&mut inner)
+    }
+
+    /// 更新某个 DSP 处理方块（类型 + 参数 + 旁路开关）。
+    ///
+    /// 只重发运行时快照，不重启任何流；受影响路径的 DSP 链签名变化后由音频
+    /// 线程就地重建（重建瞬间滤波器状态清零）。方块必须已存在（画布上先添加）。
+    pub fn set_processor_params(&self, processor_id: &str, node: DspNode) -> Result<()> {
+        let mut inner = self.inner.lock();
+        let proc = inner
+            .config
+            .processors
+            .iter_mut()
+            .find(|p| p.id == processor_id)
+            .ok_or_else(|| Error::InvalidGraph(format!("processor {processor_id} 不存在")))?;
+        proc.node = node;
+        self.publish_runtime(&inner);
+        Ok(())
     }
 
     /// 设置 sink 音量（0.0..=1.0，超范围被钳制）。
@@ -487,25 +510,26 @@ impl Engine {
         }
         inner.sinks = keep_sinks;
 
-        // ---- edges：仅保留两端流都在运行的路由，未变的复用缓冲 ----
-        let mut new_edges: HashMap<(Id, Id), EdgeHandle> = HashMap::new();
-        for route in &inner.config.routes {
-            let key = (route.source_id.clone(), route.sink_id.clone());
-            if !inner.sources.contains_key(&route.source_id)
-                || !inner.sinks.contains_key(&route.sink_id)
+        // ---- edges：解析有效路径（源 → …processor… → 汇），两端流都在运行的
+        //        路径按 key 复用缓冲，其余重建 ----
+        let paths = resolve_paths(&inner.config);
+        let mut new_edges: HashMap<String, EdgeHandle> = HashMap::new();
+        for path in &paths {
+            if !inner.sources.contains_key(&path.source_id)
+                || !inner.sinks.contains_key(&path.sink_id)
             {
                 continue;
             }
-            let ring = match inner.edges.remove(&key) {
+            let ring = match inner.edges.remove(&path.key) {
                 Some(h) => h.ring,
                 None => {
-                    let src = &inner.sources[&route.source_id];
+                    let src = &inner.sources[&path.source_id];
                     let cap_frames =
                         src.info.sample_rate as usize * inner.edge_capacity_ms / 1000;
                     new_edge_ring(cap_frames, src.info.channels as usize)
                 }
             };
-            new_edges.insert(key, EdgeHandle { ring });
+            new_edges.insert(path.key.clone(), EdgeHandle { ring });
         }
         inner.edges = new_edges;
 
@@ -520,26 +544,25 @@ impl Engine {
     fn publish_runtime(&self, inner: &Inner) {
         let mut sink_edges: HashMap<Id, Vec<EdgeRef>> = HashMap::new();
         let mut source_writers: HashMap<Id, Vec<Arc<EdgeWriter>>> = HashMap::new();
-        for (key, eh) in &inner.edges {
-            let Some(route) = inner.config.routes.iter().find(|r| {
-                r.source_id == key.0 && r.sink_id == key.1
-            }) else {
+        for path in resolve_paths(&inner.config) {
+            let Some(eh) = inner.edges.get(&path.key) else {
                 continue;
             };
-            let src = &inner.sources[&key.0];
+            let src = &inner.sources[&path.source_id];
             source_writers
-                .entry(key.0.clone())
+                .entry(path.source_id.clone())
                 .or_default()
                 .push(eh.ring.writer.clone());
             sink_edges
-                .entry(key.1.clone())
+                .entry(path.sink_id.clone())
                 .or_default()
                 .push(EdgeRef {
-                    route_id: route.id.clone(),
-                    gain: route.gain,
-                    muted: route.muted,
+                    route_id: path.key,
+                    gain: path.gain,
+                    muted: path.muted,
                     src_rate: src.info.sample_rate,
                     src_ch: src.info.channels,
+                    nodes: path.nodes.into(),
                     reader: eh.ring.reader.clone(),
                 });
         }
@@ -592,6 +615,90 @@ fn find_device(devices: &[DeviceInfo], id: &str) -> Option<DeviceInfo> {
     devices.iter().find(|d| d.id == id).cloned()
 }
 
+/// 一条解析完成的有效路径：source →（途经 0..n 个 processor）→ sink。
+struct ResolvedPath {
+    /// 唯一键（= 终点连线 id + 分支序号），边缓冲按它复用
+    key: String,
+    source_id: Id,
+    sink_id: Id,
+    /// 沿途各段连线增益相乘
+    gain: f32,
+    /// 任一段静音即整条静音
+    muted: bool,
+    /// 途经的 DSP 节点链（源 → 汇顺序；旁路的 processor 不进链）
+    nodes: Vec<DspNode>,
+}
+
+/// 把图里的连线解析成有效路径。
+///
+/// 连线两端可以是 source/processor（出）与 sink/processor（入）的任意组合；
+/// 对每个 sink 从它的每条入线向上游回溯，途经 processor 时把其节点（旁路则跳过）
+/// 压入链、增益相乘、静音取或。一个 processor 有多条入线 = 扇入混合（每条分支
+/// 独立成路径，在 sink 处相加）；成环或悬空的分支丢弃并 warn。
+fn resolve_paths(config: &GraphConfig) -> Vec<ResolvedPath> {
+    fn walk(
+        config: &GraphConfig,
+        cur: &Id,
+        chain: &mut Vec<DspNode>,
+        gain: f32,
+        muted: bool,
+        visiting: &std::collections::HashSet<&str>,
+        out: &mut Vec<(Id, Vec<DspNode>, f32, bool)>,
+    ) {
+        if visiting.contains(cur.as_str()) {
+            tracing::warn!("混音图在 {} 处成环，忽略该分支", cur);
+            return;
+        }
+        if let Some(src) = config.source(cur) {
+            out.push((src.id.clone(), chain.clone(), gain, muted));
+            return;
+        }
+        if let Some(proc) = config.processor(cur) {
+            let mut visiting = visiting.clone();
+            visiting.insert(cur.as_str());
+            let pushed = proc.node.enabled;
+            if pushed {
+                chain.push(proc.node.clone());
+            }
+            let mut branches = 0;
+            for up in config.routes.iter().filter(|w| &w.sink_id == cur) {
+                branches += 1;
+                walk(config, &up.source_id, chain, gain * up.gain, muted || up.muted, &visiting, out);
+            }
+            if pushed {
+                chain.pop();
+            }
+            if branches == 0 {
+                tracing::warn!("processor {} 没有上游输入，忽略该路径", cur);
+            }
+            return;
+        }
+        tracing::warn!("路径上游 {} 不存在（悬空连线），忽略该分支", cur);
+    }
+
+    let mut out = Vec::new();
+    for sink in &config.sinks {
+        for r in config.routes.iter().filter(|r| &r.sink_id == &sink.id) {
+            let mut paths: Vec<(Id, Vec<DspNode>, f32, bool)> = Vec::new();
+            let visiting: std::collections::HashSet<&str> = [sink.id.as_str()].into_iter().collect();
+            walk(config, &r.source_id, &mut Vec::new(), r.gain, r.muted, &visiting, &mut paths);
+            // walk 是从 sink 往上游走的，链序反了 → 翻回「源 → 汇」
+            for (idx, (source_id, mut nodes, gain, muted)) in paths.into_iter().enumerate() {
+                nodes.reverse();
+                out.push(ResolvedPath {
+                    key: format!("{}#{}", r.id, idx),
+                    source_id,
+                    sink_id: sink.id.clone(),
+                    gain,
+                    muted,
+                    nodes,
+                });
+            }
+        }
+    }
+    out
+}
+
 fn make_capture_callback(
     peak: Arc<AtomicU32>,
     writers: Arc<ArcSwap<Vec<Arc<EdgeWriter>>>>,
@@ -612,6 +719,11 @@ struct SinkEdgeState {
     scratch: Vec<f32>,
     gen: Vec<f32>,
     converted: Vec<f32>,
+    /// DSP 节点签名（与快照不一致时重建处理链）
+    dsp_sig: Arc<[DspNode]>,
+    /// 构建链时使用的声道数（sink 声道数变化时重建）
+    dsp_ch: usize,
+    dsp: DspChain,
 }
 
 impl SinkEdgeState {
@@ -622,6 +734,9 @@ impl SinkEdgeState {
             scratch: Vec::new(),
             gen: Vec::new(),
             converted: Vec::new(),
+            dsp_sig: Vec::new().into(),
+            dsp_ch: 0,
+            dsp: DspChain::new(&[], dst_rate, 0),
         }
     }
 }
@@ -689,14 +804,27 @@ fn make_render_callback(
             gen.clear();
             st.resampler.generate(frames, &mut gen);
             let gain = if e.muted { 0.0 } else { e.gain } * volume;
-            // 3. 通道变换 + 增益累加
+            // 3. DSP 节点链（在 sink 采样率/声道数上处理；节点签名变了 → 重建）
+            if st.dsp_sig != e.nodes || st.dsp_ch != ch_out {
+                st.dsp = DspChain::new(&e.nodes, out_rate, ch_out);
+                st.dsp_sig = e.nodes.clone();
+                st.dsp_ch = ch_out;
+                tracing::info!("路由 {} DSP 链已重建（{} 节点）", e.route_id, e.nodes.len());
+            }
+            // 4. 通道变换 + 增益累加
             if e.src_ch as usize == ch_out {
+                if !st.dsp.is_empty() {
+                    st.dsp.process(&mut gen);
+                }
                 mix_into(out, &gen[..gen.len().min(out.len())], gain);
             } else {
                 let mut converted = std::mem::take(&mut st.converted);
                 converted.clear();
                 converted.resize(frames * ch_out, 0.0);
                 convert_channels(&gen, e.src_ch as usize, &mut converted, ch_out, frames);
+                if !st.dsp.is_empty() {
+                    st.dsp.process(&mut converted);
+                }
                 mix_into(out, &converted, gain);
                 st.converted = converted;
             }
@@ -744,6 +872,11 @@ pub fn make_sink(device_id: &str, name: &str) -> Sink {
     }
 }
 
+/// 便捷构造（供控制层使用）：画布上的 DSP 处理方块
+pub fn make_processor(node: DspNode) -> Processor {
+    Processor { id: new_id("dsp"), node }
+}
+
 /// 便捷构造（供控制层使用）
 pub fn make_route(source_id: &str, sink_id: &str) -> Route {
     Route {
@@ -752,5 +885,6 @@ pub fn make_route(source_id: &str, sink_id: &str) -> Route {
         sink_id: sink_id.to_string(),
         gain: 1.0,
         muted: false,
+        nodes: Vec::new(),
     }
 }

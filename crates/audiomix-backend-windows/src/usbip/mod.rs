@@ -260,7 +260,7 @@ mod tests {
             cables: vec![UsbIpCableSettings {
                 number: 2,
                 name: "直播线".into(),
-                sample_rate: 96_000,
+                sample_rate: 88_200,
                 bits: 24,
                 mode: UsbIpCableMode::Mixer,
                 buffer_ms: 120,
@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(cfgs.len(), 1);
         assert_eq!(cfgs[0].number, 2);
         assert_eq!(cfgs[0].name, "直播线", "自定义名要带到后端配置");
-        assert_eq!(cfgs[0].sample_rate, 96_000);
+        assert_eq!(cfgs[0].sample_rate, 88_200);
         assert_eq!(cfgs[0].bits, 24);
         assert_eq!(cfgs[0].mode, CableMode::Mixer);
         assert_eq!(cfgs[0].buffer_ms, 120);

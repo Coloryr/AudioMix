@@ -195,15 +195,20 @@ impl Cable {
     /// 混音引擎写入录音端（线路输出 → 系统录音）。
     /// `reverse` 模式下同时把同一份数据回灌到 play_ring（输出 → 拷贝到 → 输入），
     /// 这样混音图的「线路输入」源就能读到它。
+    ///
+    /// 回灌必须在 `capture_active` 门控之外：play_ring 的读取方是混音图的
+    /// 线路输出源（一直在线），不能被「主机是否在录」卡住 —— 否则图里
+    /// 「线路输入 → 线路输出」的 reverse 链路在没人录麦克风时整条失效。
+    /// cap_ring 仍保留门控（没人读 ISO IN 时灌环只会积压溢出）。
     pub fn write_capture(&self, samples: &[f32]) {
-        // 同样只在主机真的在读麦克风时才写（没人读就没必要积累）
+        if self.cfg.mode == CableMode::Reverse {
+            self.play_ring.push(samples);
+        }
+        // 只在主机真的在读麦克风时才写（没人读就没必要积累）
         if !self.capture_active() {
             return;
         }
         self.cap_ring.push(samples);
-        if self.cfg.mode == CableMode::Reverse {
-            self.play_ring.push(samples);
-        }
     }
 
     /// ISO IN（线路输出 → 系统录音）：从 cap_ring 取数据填充录音请求（小端 PCM）；空时数字静音。
@@ -518,7 +523,7 @@ mod tests {
     #[test]
     fn self_test_loopback_24_and_32bit() {
         for bits in [24u16, 32] {
-            let c = Cable::new(cfg(2, 96_000, bits, CableMode::Loopback)).unwrap();
+            let c = Cable::new(cfg(2, 48_000, bits, CableMode::Loopback)).unwrap();
             let set_cfg = SetupPacket { request_type: 0x00, request: REQ_SET_CONFIGURATION, value: 1, index: 0, length: 0 };
             c.handle_control(set_cfg, &[]);
             for iface in 1..=2u16 {
@@ -621,12 +626,12 @@ mod tests {
     /// 范围查询用分开的 GET_MIN/GET_MAX/GET_RES。
     #[test]
     fn endpoint_sampling_frequency_control() {
-        let c = Cable::new(cfg(4, 192_000, 16, CableMode::Mixer)).unwrap();
+        let c = Cable::new(cfg(4, 96_000, 16, CableMode::Mixer)).unwrap();
         // GET_CUR（真实驱动发的 0xA2：class IN + endpoint recipient，wIndex 低字节 = 端点 0x01）
         let get = SetupPacket { request_type: 0xA2, request: UAC_GET_CUR, value: 0x0100, index: 0x0001, length: 3 };
         let (data, st) = c.handle_control(get, &[]);
         assert_eq!(st, STATUS_OK);
-        assert_eq!(data, vec![0x00, 0xEE, 0x02], "192000 = 0x02EE00 小端 3 字节");
+        assert_eq!(data, vec![0x00, 0x77, 0x01], "96000 = 0x017700 小端 3 字节");
         // GET_MIN / GET_MAX 返回同一个离散值，GET_RES 返回 1
         for (req, want) in [(UAC_GET_MIN, data.clone()), (UAC_GET_MAX, data.clone()), (UAC_GET_RES, vec![1, 0, 0])] {
             let q = SetupPacket { request_type: 0xA2, request: req, value: 0x0100, index: 0x0001, length: 3 };

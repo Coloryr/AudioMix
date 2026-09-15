@@ -504,6 +504,24 @@ pub fn set_route_muted(
 }
 
 #[tauri::command]
+pub fn set_processor_params(
+    app: AppHandle,
+    state: State<AppState>,
+    processor_id: String,
+    node: audiomix_core::DspNode,
+) -> Result<(), String> {
+    state
+        .engine
+        .set_processor_params(&processor_id, node)
+        .map_err(|e| e.to_string())?;
+    {
+        let mut cfg = state.config.lock();
+        cfg.graph = state.engine.get_graph();
+    }
+    persist(&app, &state)
+}
+
+#[tauri::command]
 pub fn set_sink_volume(
     app: AppHandle,
     state: State<AppState>,

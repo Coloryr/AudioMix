@@ -30,18 +30,46 @@ export interface Sink {
   enabled: boolean;
 }
 
+/** DSP 节点参数（type 字段区分节点类型，与 Rust serde tag="type" 对应） */
+export type DspNode =
+  | { type: "gain"; enabled: boolean; db: number }
+  | { type: "delay"; enabled: boolean; ms: number }
+  | {
+      type: "eq3";
+      enabled: boolean;
+      low_gain_db: number;
+      low_freq: number;
+      mid_gain_db: number;
+      mid_freq: number;
+      mid_q: number;
+      high_gain_db: number;
+      high_freq: number;
+    }
+  | { type: "peak_eq"; enabled: boolean; freq: number; gain_db: number; q: number }
+  | { type: "graph_eq"; enabled: boolean; gains_db: number[] }
+  | { type: "highpass"; enabled: boolean; freq: number; q: number }
+  | { type: "lowpass"; enabled: boolean; freq: number; q: number }
+  | { type: "bandpass"; enabled: boolean; freq: number; q: number };
+
+/** 画布上的 DSP 处理方块：id + 节点类型/参数（与 Rust serde flatten 对应） */
+export type Processor = { id: string } & DspNode;
+
 export interface Route {
   id: string;
   source_id: string;
   sink_id: string;
   gain: number;
   muted: boolean;
+  /** 已废弃：被画布 DSP 方块取代，保留字段只为旧配置兼容 */
+  nodes: DspNode[];
 }
 
 export interface GraphConfig {
   sources: Source[];
   sinks: Sink[];
   routes: Route[];
+  /** 画布上的 DSP 处理方块（源 → 方块… → 汇，按路径串联） */
+  processors: Processor[];
 }
 
 export interface Settings {
@@ -67,8 +95,8 @@ export type UsbIpCableMode = "loopback" | "mixer" | "reverse";
 /**
  * 内置虚拟线路只有 **UAC1**（USB Audio 1.0 / USB 1.1 全速 → Windows 自带 usbaudio.sys）。
  *
- * 每 1ms 一个包、单包上限 1023 字节，所以支持矩阵是：
- * 44.1–96 kHz 的 16/24/32bit，176.4/192 kHz 只 16bit。
+ * 每 1ms 一个包、单包上限 1023 字节，且 OUT+IN 两个方向共享全速帧预算，所以支持矩阵是：
+ * 88.2kHz 及以下 16/24/32bit，96kHz 只 16bit（双向带宽限制）。
  * 需要更高规格（192k/24bit 等）的线路请自行安装第三方虚拟声卡（VB-CABLE 等），
  * 它们会作为普通 Windows 端点出现在混音画布里。
  */
@@ -79,9 +107,9 @@ export interface UsbIpCable {
   number: number;
   /** 显示名（USB 产品字符串）；空则显示 Virtual Cable NN */
   name: string;
-  /** 44100 / 48000 / 88200 / 96000 / 176400 / 192000 */
+  /** 44100 / 48000 / 88200 / 96000（内置线路 UAC1 全速实测上限） */
   sample_rate: number;
-  /** 16 / 24 / 32（>96 kHz 时只允许 16） */
+  /** 16 / 24 / 32（88.2k 以上只支持 16bit：全速 USB 双向带宽限制） */
   bits: number;
   mode: UsbIpCableMode;
   buffer_ms: number;
@@ -185,6 +213,8 @@ export const api = {
     invoke<void>("set_route_gain", { routeId, gain }),
   setRouteMuted: (routeId: string, muted: boolean) =>
     invoke<void>("set_route_muted", { routeId, muted }),
+  setProcessorParams: (processorId: string, node: DspNode) =>
+    invoke<void>("set_processor_params", { processorId, node }),
   setSinkVolume: (sinkId: string, volume: number) =>
     invoke<void>("set_sink_volume", { sinkId, volume }),
   getLevels: () => invoke<Record<string, number>>("get_levels"),

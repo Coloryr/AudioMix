@@ -9,8 +9,9 @@
 用 **usbip-win2**（微软签名、HVCI 兼容）把它接进 Windows，系统自带 **UAC1** 驱动
 `usbaudio.sys` 暴露成标准播放/录音端点。
 
-- **内置线路只做 UAC1（USB 1.1 全速）**：44.1–96kHz 的 16/24/32bit，176.4/192kHz 只 16bit；
-  超出规格的线路由用户自装第三方虚拟声卡（VB-CABLE 等），见 P0。
+- **内置线路只做 UAC1（USB 1.1 全速）**：44.1–96kHz 的 16/24/32bit；176.4/192kHz 已从产品删除
+  （192k/16 单向可行，但 loopback/reverse 双向同时开流 = 1536 B/ms，超出全速帧 ~1023 B/ms 预算，
+  实测播放大面积断流）。超出规格的线路由用户自装第三方虚拟声卡（VB-CABLE 等），见 P0。
 - HVCI 开启，MTT 内核驱动报错 52 → 弃用自研内核驱动，改走 USB/IP。
 - usbip 模块放在 `audiomix-backend-windows`，**不新建 crate**；安装包随应用捆绑。
 - 参考实现：`tarekwasfy01/Virtual-Cables`（Go，BSD-2；本地 `H:\Temp\vc-src`）的 UAC1 描述符与
@@ -65,13 +66,47 @@ Windows 应用播放 → 扬声器 (Virtual Cable NN)  [usbaudio.sys]
   在 Windows 上同样依赖 usbip-win2。任何 UDE 客户端共享同一条上限。
   （若将来必须更高规格，唯一出路是离开 USB/IP 走内核音频驱动，见 P3 备选方案。）
 
-#### 内置规格（唯一支持矩阵）
+#### 内置规格（唯一支持矩阵，2026-09-15 定稿）
 
-| 位深 | 44.1 / 48 / 88.2 / 96 kHz | 176.4 / 192 kHz |
-|---|---|---|
-| 16 bit | ✓ | ✓ |
-| 24 bit | ✓ | ✗ |
-| 32 bit | ✓ | ✗ |
+| 位深 | 44.1 / 48 / 88.2 / 96 kHz |
+|---|---|
+| 16 / 24 / 32 bit | ✓ |
+
+- **96kHz 是硬上限**（2026-09-15 定）：`MAX_RATE=96_000`（`audiomix-core/src/model.rs` +
+  `usbip/descriptors.rs` 两处一致），UI 选项只留 44.1/48/88.2/96。原因不是 176.4/192k 拿不到
+  设备格式（单向实测可行），而是**双向场景物理不可行**：loopback/reverse 模式 OUT+IN 同时开流，
+  192k/16 = 768+768 = 1536 B/ms > 全速帧 ~1023 B/ms 预算 ⇒ 主机侧 ISO OUT 慢性欠载，
+  实测「保持」322ms/s、数秒级断流、alt1↔alt0 横跳；88.2k/24（1058）、96k/24（1152）、
+  96k/32（1536）双向同样超标（**预测，未逐项实测**；16bit 系最大 96k/16=768 安全）。
+- **12 种格式组合逐一实测（fmtmatrix，全新线缆号 3–14 规避实例缓存）**：
+  44.1/48/88.2/96 kHz × 16/24/32bit **全部四项 OK**——附加、端点出现（~1s）、
+  共享播放（GetMixFormat+Initialize）、共享录音、独占播放/录音（>16bit 需
+  WAVE_FORMAT_EXTENSIBLE 声明，非描述符问题）。格式层面无一被拒。
+- **usbaudio.sys 按设备实例缓存上次格式（2026-09-15 关键发现）**：设备实例身份
+  （VID/PID/serial）跨 attach 稳定，换格式重新 attach 后描述符已变，但共享模式
+  `GetMixFormat` 仍返回**上次的格式**（实测线缆已 48k/16 却返回 192000Hz float32）
+  ⇒ 共享 Initialize 全部 `0x88890008`，表现即用户看到的
+  「96k Unrecoverable playback error: Unsupported audio stream format」。
+  干净实例（该线缆号从未以其它格式 attach 过）共享/独占全部正常；独占模式不受缓存影响。
+  **待修**（见下方 P0 待办）。
+
+#### 改格式后缓存毒化 —— **已修（2026-09-15，serial 编码格式）**
+
+修法：设备 serial 从 `AUDIOMIX-VCABLE-001` 改为 **`AUDIOMIX-VCABLE-001-<rate>-<bits>`**
+（`descriptors.rs::build`）。Windows 设备实例 ID = `USB\VID_FFFF&PID_CAxx\<serial>`，
+格式变 ⇒ serial 变 ⇒ 全新实例 ⇒ 缓存从零开始，改格式后重新 attach 即恢复，无需手动删设备。
+代价（已接受）：换格式丢该端点的默认设备/音量记忆；每试一种格式在注册表留一条
+不可见 phantom（WASAPI 不显示）。改显示名（product）不换实例。
+实测曾被迫手动清实例的场景：配置 48k/16 但实例缓存 192k/16（注册表
+`PKEY_AudioEngine_DeviceFormat` 铁证）→ 线路完全不可用；`pnputil /remove-device`
+删除实例后恢复。
+
+#### 88.2k 以上只支持 16bit（2026-09-15 定稿）
+
+loopback/reverse 的 OUT+IN 两个 iso 端点**共享同一全速帧的 ~1023 B/ms 预算**：
+96k/24 双向 = 1152、96k/32 = 1536，都超限（与 192k/16 断流同因，预测+用户拍板限制）。
+`MULTIBIT_MAX_RATE = 88_200`（`audiomix-core/src/model.rs` + `usbip/descriptors.rs`），
+UI 位深选项联动、96k 档只有 16bit，超规格配置载入时自动降级（bits→16）。
 
 - 端点由系统自带 `usbaudio.sys` 驱动；描述符 = UAC1 全速（`bcdUSB=0x0110`、类字段全 0、无 IAD、
   无 device qualifier、iso `bInterval=1`、包长 = 每毫秒 PCM 字节数 ≤1023）。
@@ -107,7 +142,12 @@ Windows 应用播放 → 扬声器 (Virtual Cable NN)  [usbaudio.sys]
 - 描述符实验（UAC2 的一整套变体、逐字段对齐参考实现）的记录保留在 git 历史与
   `H:\Temp\AudioMix\` 下的日志/脚本里，不再留在代码中。
 
-### P1 · 虚拟麦克风（capture 方向）出不了声 —— **回环端到端尚未通过**
+### P1 · 虚拟麦克风（capture 方向）—— **App 内 reverse 模式已打通（2026-09-15）**
+
+> **2026-09-15 更新**：`write_capture` 门控修复后（回灌 play_ring 必须在 `capture_active()`
+> 门控之外，见 `usbip/device.rs`），**用户实测 reverse 模式端到端正常**——
+> 「线路输入 2 进信号 → 线路 2 输出有数据」。下列回环 bench 的失败记录是修复前的历史，
+> 保留作排查方法论参考；bench 侧（vcmic）未用修复后的代码复测。
 
 > **验证状态（2026-09-15，UAC1-only 重构后逐格式实测）**
 >
@@ -166,16 +206,31 @@ undefined×数=NaN，整条 path 画不出来**；dir 缺省按 0 处理即修�
 
 1. **降低端到端延迟**：已把 WASAPI 共享缓冲 200ms→50ms、引擎喂数余量 50ms→20ms（≈ −180ms）；
    若仍偏高，下一档是线缆缓冲占用与 ISO 完成提前量，实测口径用「播测试音看回环起点」。
-2. **新增功能节点（DSP 节点链）**：开关 / 延迟 / 强度 / 均衡器 / 高通 / 低通 / 带通。
-   用户已拍板的决策：
-   - **均衡器三种形式都做**：3 段架式（低架/峰值/高架）、单段峰式、图形 EQ；高通/低通/带通作为独立节点。
-   - **参数在「连线选中面板」编辑**：点选一条连线，面板里显示该路由的 DSP 节点链
-     （列表 + 添加/删除/排序 + 各节点参数），不做画布上的独立 DSP 节点。
-   实现路径（探索结论）：`Route` 增 `nodes: Vec<DspNode>`（`#[serde(default)]` 向后兼容）；
-   Biquad/延迟线在 `audiomix-core/src/mixer.rs` 做纯函数 + 单测；处理点在 `engine.rs` render 回调的
-   per-edge 循环（重采样 + 声道转换之后、`mix_into` 之前），DSP 状态放 `SinkEdgeState`，
-   参数经 `GraphRuntime`/`EdgeRef` 的 ArcSwap 快照下发（沿用 gain/muted 的免锁模式）；
-   Tauri 侧沿用 `apply_graph` 全量下发或加 `set_route_nodes` 命令。**本轮最大功能项，单独排期。**
+2. **✅ 新增功能节点（DSP 节点链）——已完成（2026-09-15，同日升级为画布方块）**：
+   开关（旁路）/ 延迟 / 强度（增益）/ 均衡器（3 段架式 + 单段峰式 + 图形 EQ 10 段）/
+   高通 / 低通 / 带通。先做成「连线附属链」，**当天应用户要求升级为画布独立节点方块**
+   （连线面板入口已移除，`Route.nodes` 字段保留仅为旧配置兼容，引擎不再处理）：
+   - **滤波用现成库 `biquad` 0.6.0**（用户明确要求不自研 DSP 库）：RBJ 公式成熟实现，
+     Direct Form 1（在线改参数伪影最小），每声道独立滤波器；延迟线/增益为纯胶水代码。
+     `audiomix-core/src/dsp.rs`：`DspChain::new(nodes, rate, ch)` 构建时绑定采样率/声道数，
+     `process(&mut io)` 交错样本原地处理、音频线程无锁无分配；参数先 `clamp_params()` 再构建。
+   - **模型**：`GraphConfig.processors: Vec<Processor>`（`Processor { id, #[serde(flatten)] node: DspNode }`，
+     `#[serde(default)]` 向后兼容）；连线两端可以是 source/processor 与 sink/processor 的
+     任意「出 → 入」组合；`DspKind` serde `tag="type"` snake_case。
+   - **引擎路径解析 `resolve_paths`**：对每个 sink 沿连线向上游回溯（途经 processor 时
+     把节点压入 DSP 链、旁路则跳过、增益相乘、静音取或），产出有效路径。
+     扇入 = 多条入线各自成路径（在 sink 相加）；**边 key 从 (source,sink) 改为路径 id**
+     （终点连线 id + 分支序号）——否则同一源经不同 DSP 到同一汇会撞 key；
+     成环分支丢弃并 warn、悬空连线忽略。`Engine::set_processor_params` 热更新
+     （只重发快照，链签名变化由音频线程就地重建，流不重启）。
+   - **画布/前端**：设备面板新增「DSP」组（8 种类型静态清单，可重复拖入）；
+     DSP 方块左入右出、副标题实时显示参数摘要；`connect()` 放行 processor 端点并做
+     **前向可达性环检测**（成环连线直接拒绝）；选中方块 → 面板编辑参数
+     （滑杆 / GraphEq 10 竖向滑杆）+ 旁路开关 + 移除（连带清线）；
+     `set_processor_params` 命令热更新，增删方块走全量 apply_graph（diff 不重启流）。
+   - **测试**：dsp.rs 单测 9 个 + 引擎集成 3 个新增（`processor_chain_hot_update_without_stream_restart`、
+     扇入混合 `processor_fan_in_mixes_upstream_sources`、环丢弃 `processor_cycle_branch_is_dropped`）
+     + model 校验测试；全工作区测试全绿，前端构建通过。
 3. **接线图自动排布**（按信号流向分层整理节点）。
 4. **FFT 频谱展示（foobar2000 风格柱状），可开关**：对每条 source/sink 的最近 1024 点做 Hann 窗 FFT，
    聚合成 ~32 段对数频段（dB）随 `EngineStats` 上报；前端画柱状，开关放混音页标题栏/设置，

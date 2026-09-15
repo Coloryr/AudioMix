@@ -66,23 +66,138 @@ pub struct Sink {
     pub enabled: bool,
 }
 
-/// 一条路由边：把某 source 的声音送进某 sink。
+/// DSP 节点：类型 + 启用开关（旁路时不进处理链）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DspNode {
+    pub kind: DspKind,
+    /// false = 旁路（重建链时直接跳过该节点）
+    #[serde(default = "crate::model::default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// DSP 节点类型与参数。链式按顺序处理，处理点在重采样 + 声道转换之后、混入输出之前
+/// （采样率/声道数为 sink 流的实际格式）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DspKind {
+    /// 强度（增益）
+    Gain {
+        /// -60 ..= 12 dB
+        db: f32,
+    },
+    /// 延迟（每声道独立延迟线）
+    Delay {
+        /// 0 ..= 1000 ms
+        ms: f32,
+    },
+    /// 3 段架式均衡：低架 / 峰值 / 高架
+    Eq3 {
+        low_gain_db: f32,
+        low_freq: f32,
+        mid_gain_db: f32,
+        mid_freq: f32,
+        mid_q: f32,
+        high_gain_db: f32,
+        high_freq: f32,
+    },
+    /// 单段峰式均衡
+    PeakEq { freq: f32, gain_db: f32, q: f32 },
+    /// 图形 EQ：10 段固定中心频率（31.25Hz..16kHz，1/3 倍频程）各自增益
+    GraphEq {
+        /// 长度 10（低 → 高），-24 ..= 24 dB
+        gains_db: [f32; 10],
+    },
+    Highpass { freq: f32, q: f32 },
+    Lowpass { freq: f32, q: f32 },
+    Bandpass { freq: f32, q: f32 },
+}
+
+impl DspKind {
+    /// 图形 EQ 的 10 段中心频率（1/3 倍频程）
+    pub const GRAPH_EQ_BANDS: [f32; 10] =
+        [31.25, 62.5, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+
+    /// UI/加载共用的参数钳制：超范围值拉回边界（防 NaN/极端值进滤波器）。
+    pub fn clamp_params(&mut self) {
+        let cl = |v: f32, lo: f32, hi: f32| v.clamp(lo, hi);
+        match self {
+            DspKind::Gain { db } => *db = cl(*db, -60.0, 12.0),
+            DspKind::Delay { ms } => *ms = cl(*ms, 0.0, 1000.0),
+            DspKind::Eq3 {
+                low_gain_db,
+                low_freq,
+                mid_gain_db,
+                mid_freq,
+                mid_q,
+                high_gain_db,
+                high_freq,
+            } => {
+                *low_gain_db = cl(*low_gain_db, -24.0, 12.0);
+                *low_freq = cl(*low_freq, 40.0, 500.0);
+                *mid_gain_db = cl(*mid_gain_db, -24.0, 12.0);
+                *mid_freq = cl(*mid_freq, 200.0, 8000.0);
+                *mid_q = cl(*mid_q, 0.3, 10.0);
+                *high_gain_db = cl(*high_gain_db, -24.0, 12.0);
+                *high_freq = cl(*high_freq, 2000.0, 16000.0);
+            }
+            DspKind::PeakEq { freq, gain_db, q } => {
+                *freq = cl(*freq, 20.0, 20000.0);
+                *gain_db = cl(*gain_db, -24.0, 24.0);
+                *q = cl(*q, 0.3, 10.0);
+            }
+            DspKind::GraphEq { gains_db } => {
+                for g in gains_db.iter_mut() {
+                    *g = cl(*g, -24.0, 24.0);
+                }
+            }
+            DspKind::Highpass { freq, q } | DspKind::Lowpass { freq, q } | DspKind::Bandpass { freq, q } => {
+                *freq = cl(*freq, 20.0, 20000.0);
+                *q = cl(*q, 0.3, 10.0);
+            }
+        }
+    }
+}
+
+/// 一条路由边：把某 source（或 processor）的声音送进某 sink（或 processor）。
+///
+/// 画布上 DSP 处理方块是一等节点（`GraphConfig::processors`），连线两端可以是
+/// source/processor 与 sink/processor 的任意「出 → 入」组合；引擎按**路径**
+/// （源 → … → 汇，途经的 processor 按序串联成 DSP 链）解析信号流。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
     pub id: Id,
     pub source_id: Id,
     pub sink_id: Id,
-    /// 线性增益 0.0 ..= 2.0（1.0 = 0dB）
+    /// 线性增益 0.0 ..= 2.0（1.0 = 0dB）；路径总增益 = 沿途各段相乘
     pub gain: f32,
     pub muted: bool,
+    /// （已废弃）早期挂在连线上的 DSP 链；被画布 DSP 方块取代，字段仅为
+    /// 旧配置兼容保留，引擎忽略。
+    #[serde(default)]
+    pub nodes: Vec<DspNode>,
 }
 
-/// 混音图：多 source 经 route 混音进 sink。
+/// 画布上的 DSP 处理方块：一个 id + 一个 DSP 节点（类型 + 参数 + 旁路开关）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Processor {
+    pub id: Id,
+    #[serde(flatten)]
+    pub node: DspNode,
+}
+
+/// 混音图：多 source 经 route（可穿过 processor）混音进 sink。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GraphConfig {
     pub sources: Vec<Source>,
     pub sinks: Vec<Sink>,
     pub routes: Vec<Route>,
+    /// DSP 处理方块（画布节点；`#[serde(default)]` 向后兼容）
+    #[serde(default)]
+    pub processors: Vec<Processor>,
 }
 
 impl GraphConfig {
@@ -94,6 +209,10 @@ impl GraphConfig {
     pub fn sink(&self, id: &str) -> Option<&Sink> {
         self.sinks.iter().find(|s| s.id == id)
     }
+    /// 按 id 查 DSP 处理方块。
+    pub fn processor(&self, id: &str) -> Option<&Processor> {
+        self.processors.iter().find(|p| p.id == id)
+    }
     /// 按 (device_id, mode) 找源（画布节点键 ↔ 源 的唯一映射依据）
     pub fn source_of_device(&self, device_id: &str, mode: SourceMode) -> Option<&Source> {
         self.sources
@@ -104,18 +223,28 @@ impl GraphConfig {
     pub fn sink_of_device(&self, device_id: &str) -> Option<&Sink> {
         self.sinks.iter().find(|s| s.device_id == device_id)
     }
-    /// 校验图的一致性：每条 route 的两端必须存在。
+    /// 校验图的一致性：每条 route 的两端必须存在（source **或** processor 出、
+    /// sink **或** processor 入）；processor id 不得重复。
     pub fn validate(&self) -> Result<(), crate::Error> {
-        for r in &self.routes {
-            if self.source(&r.source_id).is_none() {
+        let mut seen = std::collections::HashSet::new();
+        for p in &self.processors {
+            if !seen.insert(p.id.as_str()) {
                 return Err(crate::Error::InvalidGraph(format!(
-                    "route {} 引用了不存在的 source {}",
+                    "processor id {} 重复",
+                    p.id
+                )));
+            }
+        }
+        for r in &self.routes {
+            if self.source(&r.source_id).is_none() && self.processor(&r.source_id).is_none() {
+                return Err(crate::Error::InvalidGraph(format!(
+                    "route {} 引用了不存在的 source/processor {}",
                     r.id, r.source_id
                 )));
             }
-            if self.sink(&r.sink_id).is_none() {
+            if self.sink(&r.sink_id).is_none() && self.processor(&r.sink_id).is_none() {
                 return Err(crate::Error::InvalidGraph(format!(
-                    "route {} 引用了不存在的 sink {}",
+                    "route {} 引用了不存在的 sink/processor {}",
                     r.id, r.sink_id
                 )));
             }
@@ -177,7 +306,7 @@ pub struct UsbIpCableSettings {
     /// 显示名（USB 产品字符串）；为空时用 "Virtual Cable NN"。
     /// 会作为 USB 产品字符串，Windows 里看到的就是这个名字。
     pub name: String,
-    /// 44_100 ..= 192_000
+    /// 44_100 ..= 96_000
     pub sample_rate: u32,
     /// 16 / 24 / 32
     pub bits: u16,
@@ -201,14 +330,20 @@ impl Default for UsbIpCableSettings {
 
 impl UsbIpCableSettings {
     pub const MIN_RATE: u32 = 44_100;
-    pub const MAX_RATE: u32 = 192_000;
+    /// 实测上限：UAC1 全速等时流在 usbip-win2/UDE 上 96 kHz 以上无法稳定承载
+    /// （192k 时主机侧 ISO OUT 大面积保持/断流，见 TASK.md P1 格式矩阵）。
+    pub const MAX_RATE: u32 = 96_000;
+    /// 多位深（24/32bit）的采样率上限：88.2k 以上只支持 16bit。
+    ///
+    /// 依据（2026-09-15 实测）：loopback/reverse 模式 OUT+IN 两个 iso 端点**共享同一全速帧的
+    /// ~1023 B/ms 预算**，96k/24 双向 = 1152 B/ms、96k/32 = 1536，都会像 192k 一样
+    /// 主机侧 ISO OUT 慢性欠载、播放断流；96k/16 = 768 安全。
+    pub const MULTIBIT_MAX_RATE: u32 = 88_200;
     pub const MAX_NUMBER: u8 = 32;
     /// 自定义名长度上限（USB 字符串描述符上限较宽，这里取一个稳妥值）
     pub const MAX_NAME_CHARS: usize = 64;
     /// 内置线路（UAC1 全速）每毫秒的字节上限：USB 1.1 全速等时端点单包 1023 字节
     pub const MAX_BYTES_PER_MS: u64 = 1023;
-    /// 超过这个采样率时内置线路只提供 16-bit（176.4k/192k 的 24/32bit 需要 >1023 B/ms）
-    pub const MULTIBIT_MAX_RATE: u32 = 96_000;
 
     /// 最终显示名：自定义名去空白，空则 `Virtual Cable NN`
     pub fn display_name(&self) -> String {
@@ -256,24 +391,20 @@ impl UsbIpCableSettings {
                 self.number, self.bits
             )));
         }
+        if self.sample_rate > Self::MULTIBIT_MAX_RATE && self.bits != 16 {
+            return Err(crate::Error::InvalidSettings(format!(
+                "线缆 {} 的 {} Hz 只支持 16bit（全速 USB 双向带宽限制）",
+                self.number, self.sample_rate
+            )));
+        }
         if !(20..=5000).contains(&self.buffer_ms) {
             return Err(crate::Error::InvalidSettings(format!(
                 "线缆 {} 缓冲 {}ms 超出 20–5000ms",
                 self.number, self.buffer_ms
             )));
         }
-        // 内置线路只有 UAC1（USB 1.1 全速）：每 1ms 一个包，单包上限 1023 字节；
-        // 且 96 kHz 以上只提供 16-bit。更高规格请用户自装第三方虚拟声卡。
-        if self.sample_rate > Self::MULTIBIT_MAX_RATE && self.bits != 16 {
-            return Err(crate::Error::InvalidSettings(format!(
-                "线缆 {} 的 {} Hz / {}-bit 不受支持：内置线路在 {} Hz 以上只提供 16-bit \
-                 （更高规格请自装第三方虚拟声卡，如 VB-CABLE）",
-                self.number,
-                self.sample_rate,
-                self.bits,
-                Self::MULTIBIT_MAX_RATE
-            )));
-        }
+        // 内置线路只有 UAC1（USB 1.1 全速）：每 1ms 一个包，单包上限 1023 字节，
+        // 且采样率上限 96 kHz。更高规格请用户自装第三方虚拟声卡。
         let bytes_per_ms = Self::packet_bytes_per_ms(self.sample_rate, self.bits);
         if bytes_per_ms > Self::MAX_BYTES_PER_MS {
             return Err(crate::Error::InvalidSettings(format!(
@@ -307,15 +438,18 @@ impl UsbIpCableSettings {
         if !matches!(self.bits, 16 | 24 | 32) {
             self.bits = 16;
         }
-        if !(Self::MIN_RATE..=Self::MAX_RATE).contains(&self.sample_rate) {
+        // 超上限降到 96k（保住能保的最高规格），低于下限回默认 48k
+        if self.sample_rate > Self::MAX_RATE {
+            self.sample_rate = Self::MAX_RATE;
+        } else if self.sample_rate < Self::MIN_RATE {
             self.sample_rate = 48_000;
         }
-        // 高位深降 16-bit 优先（保住采样率），再不行退回 96k/24
+        // 88.2k 以上只支持 16bit（双向带宽限制，见 MULTIBIT_MAX_RATE 注释）
         if self.sample_rate > Self::MULTIBIT_MAX_RATE && self.bits != 16 {
             self.bits = 16;
-        } else if Self::packet_bytes_per_ms(self.sample_rate, self.bits) > Self::MAX_BYTES_PER_MS {
-            self.sample_rate = Self::MULTIBIT_MAX_RATE;
-            self.bits = 24;
+        }
+        if Self::packet_bytes_per_ms(self.sample_rate, self.bits) > Self::MAX_BYTES_PER_MS {
+            self.bits = 16;
         }
         if !Self::is_supported(self.sample_rate, self.bits) {
             self.sample_rate = 48_000;
@@ -501,6 +635,11 @@ mod tests {
                 sink_id: "k1".into(),
                 gain: 1.0,
                 muted: false,
+                nodes: Vec::new(),
+            }],
+            processors: vec![Processor {
+                id: "p1".into(),
+                node: DspNode { kind: DspKind::Gain { db: 0.0 }, enabled: true },
             }],
         }
     }
@@ -529,7 +668,34 @@ mod tests {
         let g = valid_graph();
         assert!(g.source("s1").is_some());
         assert!(g.sink("k1").is_some());
+        assert!(g.processor("p1").is_some());
         assert!(g.source("nope").is_none());
+        assert!(g.processor("nope").is_none());
+    }
+
+    #[test]
+    fn validate_accepts_processor_endpoints_and_rejects_duplicates() {
+        // 连线两端是 processor 也合法
+        let mut g = valid_graph();
+        g.routes[0].source_id = "p1".into();
+        g.routes[0].sink_id = "p1".into(); // 引擎层环检测兜底；模型只查引用
+        assert!(g.validate().is_ok());
+
+        // processor id 重复
+        let mut g = valid_graph();
+        g.processors.push(Processor {
+            id: "p1".into(),
+            node: DspNode { kind: DspKind::Gain { db: 0.0 }, enabled: true },
+        });
+        assert!(matches!(g.validate(), Err(crate::Error::InvalidGraph(_))));
+    }
+
+    #[test]
+    fn legacy_graph_without_processors_still_parses() {
+        // 旧配置没有 processors 字段：补默认空列表而不是解析失败
+        let json = r#"{"sources":[],"sinks":[],"routes":[]}"#;
+        let g: GraphConfig = serde_json::from_str(json).unwrap();
+        assert!(g.processors.is_empty());
     }
 
     #[test]
@@ -695,23 +861,22 @@ mod tests {
 
     #[test]
     fn usbip_validate_accepts_range_boundaries() {
-        // 内置线路 = UAC1 全速：96 kHz 及以下 16/24/32bit 都行
+        // 内置线路 = UAC1 全速：88.2k 及以下 16/24/32bit 都行，96k 只 16bit
         for (rate, bits) in [
             (44_100u32, 16u16),
             (48_000, 16),
             (48_000, 24),
             (48_000, 32),
-            (96_000, 24),
-            (96_000, 32),
+            (88_200, 24),
+            (88_200, 32),
+            (96_000, 16),
         ] {
             let cfg = UsbIpCableSettings { number: 1, sample_rate: rate, bits, ..Default::default() };
             assert!(cfg.validate().is_ok(), "{rate}/{bits} 应合法");
         }
-        // 96 kHz 以上只给 16-bit（176.4k/192k）
+        // 96 kHz 以上一律拒绝（实测主机侧 ISO OUT 无法稳定承载，见 TASK.md P1）
         for rate in [176_400u32, 192_000] {
-            let cfg = UsbIpCableSettings { number: 1, sample_rate: rate, bits: 16, ..Default::default() };
-            assert!(cfg.validate().is_ok(), "{rate}/16 应合法");
-            for bits in [24u16, 32] {
+            for bits in [16u16, 24, 32] {
                 let cfg =
                     UsbIpCableSettings { number: 1, sample_rate: rate, bits, ..Default::default() };
                 assert!(
@@ -720,6 +885,15 @@ mod tests {
                 );
                 assert!(!UsbIpCableSettings::is_supported(rate, bits));
             }
+        }
+        // 88.2k 以上只支持 16bit：双向（OUT+IN 同帧）96k/24 = 1152 B/ms 超全速帧预算
+        for bits in [24u16, 32] {
+            let cfg = UsbIpCableSettings { number: 1, sample_rate: 96_000, bits, ..Default::default() };
+            assert!(
+                matches!(cfg.validate(), Err(crate::Error::InvalidSettings(_))),
+                "96k/{bits} 必须被拒绝（双向带宽超限）"
+            );
+            assert!(!UsbIpCableSettings::is_supported(96_000, bits));
         }
     }
 
@@ -730,12 +904,16 @@ mod tests {
             UsbIpCableSettings { number: 2, sample_rate: 192_000, bits: 24, ..Default::default() };
         let note = c.clamp_supported().expect("应给出降级说明");
         assert!(note.contains("192000/24bit"), "{note}");
-        assert_eq!((c.sample_rate, c.bits), (192_000, 16));
+        assert_eq!((c.sample_rate, c.bits), (96_000, 16), "96k 只支持 16bit，位深一并降级");
         assert!(c.validate().is_ok());
+        // 96k/24 同样要降到 96k/16
+        let mut hi = UsbIpCableSettings { number: 1, sample_rate: 96_000, bits: 24, ..Default::default() };
+        assert!(hi.clamp_supported().is_some());
+        assert_eq!((hi.sample_rate, hi.bits), (96_000, 16));
         // 合法组合不该被改动
-        let mut ok = UsbIpCableSettings { number: 1, sample_rate: 96_000, bits: 24, ..Default::default() };
+        let mut ok = UsbIpCableSettings { number: 1, sample_rate: 96_000, bits: 16, ..Default::default() };
         assert!(ok.clamp_supported().is_none());
-        assert_eq!((ok.sample_rate, ok.bits), (96_000, 24));
+        assert_eq!((ok.sample_rate, ok.bits), (96_000, 16));
         // 垃圾值兜底
         let mut bad = UsbIpCableSettings { number: 1, sample_rate: 1, bits: 9, ..Default::default() };
         assert!(bad.clamp_supported().is_some());

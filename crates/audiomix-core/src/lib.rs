@@ -4,6 +4,7 @@
 //! Windows / Linux / macOS 通过各自的后端 crate 提供实现。
 
 pub mod backend;
+pub mod dsp;
 pub mod engine;
 pub mod error;
 pub mod mixer;
@@ -16,9 +17,10 @@ pub mod testing;
 pub use backend::{
     AudioBackend, CaptureCallback, CompositeBackend, RenderCallback, StartedStream, StreamHandle, StreamInfo,
 };
-pub use engine::{Engine, EngineEvent};
+pub use engine::{Engine, EngineEvent, make_processor};
 pub use error::{Error, Result};
 pub use model::{
-    ControlApiSettings, DeviceInfo, DeviceKind, GraphConfig, GraphSettings, Route, Settings, Sink, Source, SourceMode,
-    UsbIpCableMode, UsbIpCableSettings, UsbIpSettings,
+    ControlApiSettings, DeviceInfo, DeviceKind, DspKind, DspNode, GraphConfig, GraphSettings,
+    Processor, Route, Settings, Sink, Source, SourceMode, UsbIpCableMode, UsbIpCableSettings,
+    UsbIpSettings,
 };

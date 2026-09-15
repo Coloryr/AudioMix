@@ -15,3 +15,4 @@ uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 rubato = "5.0.0"
+biquad = "0.6"

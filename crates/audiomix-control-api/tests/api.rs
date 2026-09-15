@@ -71,7 +71,9 @@ fn graph_one_route(gain: f32) -> GraphConfig {
             sink_id: "out".into(),
             gain,
             muted: false,
+            nodes: Vec::new(),
         }],
+        processors: Vec::new(),
     }
 }
 

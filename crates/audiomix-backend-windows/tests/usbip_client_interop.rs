@@ -38,7 +38,7 @@ fn official_usbip_client_lists_our_devices() {
         .unwrap();
     // 用固定端口：官方 CLI 的默认 TCP 端口就是 3240
     let manager = UsbIpManager::new("127.0.0.1:3240");
-    if let Err(e) = manager.start(rt.handle(), vec![cable(1, 48_000, 16), cable(2, 192_000, 16)]) {
+    if let Err(e) = manager.start(rt.handle(), vec![cable(1, 48_000, 16), cable(2, 96_000, 16)]) {
         eprintln!("跳过：3240 不可用（{e}）——可能有应用实例正在跑虚拟声卡服务器");
         return;
     }

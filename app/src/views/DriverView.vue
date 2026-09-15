@@ -38,48 +38,51 @@ const needsReattach = ref(false);
 const report = ref<AttachReport | null>(null);
 const lastLog = ref("");
 
-const RATE_OPTIONS = [44100, 48000, 88200, 96000, 176400, 192000].map((v) => ({
+const RATE_OPTIONS = [44100, 48000, 88200, 96000].map((v) => ({
   label: `${v / 1000} kHz`,
   value: v,
 }));
 const BIT_OPTIONS = [16, 24, 32].map((v) => ({ label: `${v} bit`, value: v }));
 
-/** 内置线路（UAC1 全速）的规格上限：每毫秒 ≤1023 字节，且 >96kHz 只给 16bit */
+/** 内置线路（UAC1 全速）的规格上限：每毫秒 ≤1023 字节；采样率 ≤96kHz（实测更高时主机侧 ISO OUT 无法稳定承载） */
 const MAX_BYTES_PER_MS = 1023;
-const MULTIBIT_MAX_RATE = 96000;
+const MAX_RATE = 96000;
+/** 88.2k 以上只支持 16bit：loopback/reverse 的 OUT+IN 共享全速帧预算，96k/24 双向 = 1152 B/ms 会断流 */
+const MULTIBIT_MAX_RATE = 88200;
 
 /** 每毫秒 PCM 字节数：按整数个采样帧向上取整（与后端端点包长同规则；UAC1 全速上限 1023） */
 function bytesPerMs(c: UsbIpCable): number {
   return Math.ceil(c.sample_rate / 1000) * 2 * (c.bits / 8);
 }
 
+/** 位深选项：88.2k 以上（96k 档）只有 16bit（与后端 MULTIBIT_MAX_RATE 同规则） */
+function bitOptionsOf(c: UsbIpCable) {
+  return c.sample_rate > MULTIBIT_MAX_RATE ? BIT_OPTIONS.filter((o) => o.value === 16) : BIT_OPTIONS;
+}
+
+/** 切采样率：跳到 96k 档时位深自动降为 16bit */
+function onRateChange(c: UsbIpCable, rate: number) {
+  c.sample_rate = rate;
+  if (rate > MULTIBIT_MAX_RATE) c.bits = 16;
+  dirty.value = true;
+}
+
 /** 该格式内置线路是否支持（与后端 UsbIpCableSettings::is_supported 同规则） */
 function formatSupported(c: UsbIpCable): boolean {
-  return !(c.sample_rate > MULTIBIT_MAX_RATE && c.bits !== 16) && bytesPerMs(c) <= MAX_BYTES_PER_MS;
-}
-
-/** 采样率下拉：当前位深为 24/32bit 时，>96kHz 的档位不可选 */
-function rateOptionsFor(c: UsbIpCable) {
-  return RATE_OPTIONS.map((o) => ({
-    ...o,
-    disabled: c.bits !== 16 && o.value > MULTIBIT_MAX_RATE,
-    title: c.bits !== 16 && o.value > MULTIBIT_MAX_RATE ? "内置线路在 96kHz 以上只提供 16bit" : undefined,
-  }));
-}
-
-/** 位深下拉：当前采样率 >96kHz 时，24/32bit 不可选 */
-function bitOptionsFor(c: UsbIpCable) {
-  return BIT_OPTIONS.map((o) => ({
-    ...o,
-    disabled: c.sample_rate > MULTIBIT_MAX_RATE && o.value !== 16,
-    title: c.sample_rate > MULTIBIT_MAX_RATE && o.value !== 16 ? "内置线路在 96kHz 以上只提供 16bit" : undefined,
-  }));
+  return (
+    c.sample_rate <= MAX_RATE &&
+    (c.sample_rate <= MULTIBIT_MAX_RATE || c.bits === 16) &&
+    bytesPerMs(c) <= MAX_BYTES_PER_MS
+  );
 }
 
 /** 格式不支持时的提示 */
 function formatHint(c: UsbIpCable): string {
+  if (c.sample_rate > MAX_RATE) {
+    return `内置线路最高 ${MAX_RATE / 1000}kHz；需要 ${c.sample_rate / 1000}kHz 请自装第三方虚拟声卡（如 VB-CABLE）`;
+  }
   if (c.sample_rate > MULTIBIT_MAX_RATE && c.bits !== 16) {
-    return `内置线路在 ${MULTIBIT_MAX_RATE / 1000}kHz 以上只提供 16bit；需要 ${c.sample_rate / 1000}kHz/${c.bits}bit 请自装第三方虚拟声卡（如 VB-CABLE）`;
+    return `${c.sample_rate / 1000}kHz 只支持 16bit（全速 USB 双向带宽限制）`;
   }
   return `内置线路（UAC1 全速）每毫秒上限 ${MAX_BYTES_PER_MS} 字节，该格式需要 ${bytesPerMs(c)} 字节`;
 }
@@ -355,14 +358,14 @@ onMounted(() => {
             />
             <n-select
               v-model:value="c.sample_rate"
-              :options="rateOptionsFor(c)"
+              :options="RATE_OPTIONS"
               size="small"
               style="width: 112px"
-              @update:value="dirty = true"
+              @update:value="(v: number) => onRateChange(c, v)"
             />
             <n-select
               v-model:value="c.bits"
-              :options="bitOptionsFor(c)"
+              :options="bitOptionsOf(c)"
               size="small"
               style="width: 92px"
               @update:value="dirty = true"
