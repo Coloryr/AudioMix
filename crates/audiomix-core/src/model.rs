@@ -67,8 +67,13 @@ pub struct Sink {
 }
 
 /// DSP 节点：类型 + 启用开关（旁路时不进处理链）。
+///
+/// serde 上 `kind` 被 flatten、`DspKind` 又是内部 tag（`type`）枚举，
+/// 因此 JSON 形状是**扁平**的 `{ "type": "gain", "db": -6, "enabled": true }`，
+/// 与前端 TS 联合类型一一对应。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DspNode {
+    #[serde(flatten)]
     pub kind: DspKind,
     /// false = 旁路（重建链时直接跳过该节点）
     #[serde(default = "crate::model::default_true")]
@@ -113,7 +118,24 @@ pub enum DspKind {
     },
     Highpass { freq: f32, q: f32 },
     Lowpass { freq: f32, q: f32 },
-    Bandpass { freq: f32, q: f32 },
+    /// 带通：用「起始/终止频率」定义（中心 = 几何平均，Q = 中心/带宽）。
+    /// 旧字段 freq/q（单频点+Q）不再使用；缺字段时按默认值补齐以兼容旧配置。
+    Bandpass {
+        #[serde(default = "default_band_low")]
+        low_freq: f32,
+        #[serde(default = "default_band_high")]
+        high_freq: f32,
+    },
+    /// 开关节点：开 = 直通，关 = 静音（与其它节点的旁路不同，关掉是切信号不是跳过）
+    Switch,
+}
+
+fn default_band_low() -> f32 {
+    300.0
+}
+
+fn default_band_high() -> f32 {
+    3000.0
 }
 
 impl DspKind {
@@ -154,10 +176,19 @@ impl DspKind {
                     *g = cl(*g, -24.0, 24.0);
                 }
             }
-            DspKind::Highpass { freq, q } | DspKind::Lowpass { freq, q } | DspKind::Bandpass { freq, q } => {
+            DspKind::Highpass { freq, q } | DspKind::Lowpass { freq, q } => {
                 *freq = cl(*freq, 20.0, 20000.0);
                 *q = cl(*q, 0.3, 10.0);
             }
+            DspKind::Bandpass { low_freq, high_freq } => {
+                *low_freq = cl(*low_freq, 20.0, 19_000.0);
+                *high_freq = cl(*high_freq, 30.0, 20_000.0);
+                // 终止频率至少比起始高 10Hz（几何平均/带宽计算需要 high > low）
+                if *high_freq < *low_freq + 10.0 {
+                    *high_freq = (*low_freq + 10.0).min(20_000.0);
+                }
+            }
+            DspKind::Switch => {}
         }
     }
 }
@@ -688,6 +719,28 @@ mod tests {
             node: DspNode { kind: DspKind::Gain { db: 0.0 }, enabled: true },
         });
         assert!(matches!(g.validate(), Err(crate::Error::InvalidGraph(_))));
+    }
+
+    #[test]
+    fn dsp_node_json_is_flat_for_frontend() {
+        // 前端 TS 联合类型的形状：扁平 { type, enabled, ...参数 }
+        let n: DspNode = serde_json::from_str(r#"{"type":"gain","enabled":true,"db":-6}"#).unwrap();
+        assert_eq!(n.kind, DspKind::Gain { db: -6.0 });
+        assert!(n.enabled);
+        let json = serde_json::to_string(&n).unwrap();
+        assert!(json.contains(r#""type":"gain""#), "应为扁平形状：{json}");
+
+        // Processor 整体（id + flatten 节点）也要能从前端形状解析
+        let p: Processor = serde_json::from_str(
+            r#"{"id":"dsp-x","type":"peak_eq","enabled":true,"freq":1000,"gain_db":3,"q":1}"#,
+        )
+        .unwrap();
+        assert_eq!(p.id, "dsp-x");
+        assert_eq!(p.node.kind, DspKind::PeakEq { freq: 1000.0, gain_db: 3.0, q: 1.0 });
+
+        // enabled 缺省 = true
+        let n: DspNode = serde_json::from_str(r#"{"type":"delay","ms":50}"#).unwrap();
+        assert!(n.enabled);
     }
 
     #[test]

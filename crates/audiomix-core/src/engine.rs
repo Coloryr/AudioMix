@@ -69,6 +69,8 @@ struct SinkHandle {
 
 struct EdgeHandle {
     ring: EdgeRing,
+    /// 该边（DSP 处理后、混合前）的信号峰值，供 DSP 节点电平显示
+    peak: Arc<AtomicU32>,
 }
 
 struct Inner {
@@ -77,6 +79,8 @@ struct Inner {
     sinks: HashMap<Id, SinkHandle>,
     /// 有效路径的边缓冲（key = 路径 id，见 [`resolve_paths`]）
     edges: HashMap<String, EdgeHandle>,
+    /// processor id → 途经它的所有边的 peak（DSP 节点电平 = 各边取最大）
+    processor_peaks: HashMap<Id, Vec<Arc<AtomicU32>>>,
     device_cache: Vec<DeviceInfo>,
     /// 重采样质量档位（Settings 可切换）
     resample_quality: ResamplerQuality,
@@ -107,6 +111,8 @@ pub struct EdgeRef {
     pub src_ch: u16,
     /// DSP 节点链（渲染线程按值变化重建 DSP 状态）
     pub nodes: Arc<[DspNode]>,
+    /// 该边（DSP 处理后）的信号峰值（渲染回调每周期写入）
+    pub peak: Arc<AtomicU32>,
     /// 该边的环形缓冲读端
     pub reader: Arc<EdgeReader>,
 }
@@ -140,6 +146,7 @@ impl Engine {
                 sources: HashMap::new(),
                 sinks: HashMap::new(),
                 edges: HashMap::new(),
+                processor_peaks: HashMap::new(),
                 device_cache: devices,
                 resample_quality: ResamplerQuality::default(),
                 edge_capacity_ms: EDGE_CAPACITY_MS,
@@ -333,6 +340,14 @@ impl Engine {
         for (id, h) in &inner.sinks {
             out.insert(id.clone(), f32::from_bits(h.peak.load(Ordering::Relaxed)));
         }
+        // DSP 节点电平：取途经该节点的所有边峰值的最大值
+        for (id, peaks) in &inner.processor_peaks {
+            let m = peaks
+                .iter()
+                .map(|p| f32::from_bits(p.load(Ordering::Relaxed)))
+                .fold(0.0f32, f32::max);
+            out.insert(id.clone(), m);
+        }
         out
     }
 
@@ -514,24 +529,35 @@ impl Engine {
         //        路径按 key 复用缓冲，其余重建 ----
         let paths = resolve_paths(&inner.config);
         let mut new_edges: HashMap<String, EdgeHandle> = HashMap::new();
+        let mut proc_peaks: HashMap<Id, Vec<Arc<AtomicU32>>> = HashMap::new();
         for path in &paths {
             if !inner.sources.contains_key(&path.source_id)
                 || !inner.sinks.contains_key(&path.sink_id)
             {
                 continue;
             }
+            let peak;
             let ring = match inner.edges.remove(&path.key) {
-                Some(h) => h.ring,
+                Some(h) => {
+                    peak = h.peak.clone();
+                    h.ring
+                }
                 None => {
                     let src = &inner.sources[&path.source_id];
                     let cap_frames =
                         src.info.sample_rate as usize * inner.edge_capacity_ms / 1000;
+                    peak = Arc::new(AtomicU32::new(0));
                     new_edge_ring(cap_frames, src.info.channels as usize)
                 }
             };
-            new_edges.insert(path.key.clone(), EdgeHandle { ring });
+            for pid in &path.proc_ids {
+                proc_peaks.entry(pid.clone()).or_default().push(peak.clone());
+            }
+            new_edges.insert(path.key.clone(), EdgeHandle { ring, peak });
         }
         inner.edges = new_edges;
+        // 电平映射按当前图全量重建（换图后旧 processor 不再出现在 levels 里）
+        inner.processor_peaks = proc_peaks;
 
         // ---- 构建并发布运行时快照 ----
         self.publish_runtime(inner);
@@ -563,6 +589,7 @@ impl Engine {
                     src_rate: src.info.sample_rate,
                     src_ch: src.info.channels,
                     nodes: path.nodes.into(),
+                    peak: eh.peak.clone(),
                     reader: eh.ring.reader.clone(),
                 });
         }
@@ -627,6 +654,8 @@ struct ResolvedPath {
     muted: bool,
     /// 途经的 DSP 节点链（源 → 汇顺序；旁路的 processor 不进链）
     nodes: Vec<DspNode>,
+    /// 途经的 processor id（与 nodes 一一对应；电平上报按 id 归属）
+    proc_ids: Vec<Id>,
 }
 
 /// 把图里的连线解析成有效路径。
@@ -640,17 +669,18 @@ fn resolve_paths(config: &GraphConfig) -> Vec<ResolvedPath> {
         config: &GraphConfig,
         cur: &Id,
         chain: &mut Vec<DspNode>,
+        ids: &mut Vec<Id>,
         gain: f32,
         muted: bool,
         visiting: &std::collections::HashSet<&str>,
-        out: &mut Vec<(Id, Vec<DspNode>, f32, bool)>,
+        out: &mut Vec<(Id, Vec<DspNode>, Vec<Id>, f32, bool)>,
     ) {
         if visiting.contains(cur.as_str()) {
             tracing::warn!("混音图在 {} 处成环，忽略该分支", cur);
             return;
         }
         if let Some(src) = config.source(cur) {
-            out.push((src.id.clone(), chain.clone(), gain, muted));
+            out.push((src.id.clone(), chain.clone(), ids.clone(), gain, muted));
             return;
         }
         if let Some(proc) = config.processor(cur) {
@@ -659,14 +689,16 @@ fn resolve_paths(config: &GraphConfig) -> Vec<ResolvedPath> {
             let pushed = proc.node.enabled;
             if pushed {
                 chain.push(proc.node.clone());
+                ids.push(proc.id.clone());
             }
             let mut branches = 0;
             for up in config.routes.iter().filter(|w| &w.sink_id == cur) {
                 branches += 1;
-                walk(config, &up.source_id, chain, gain * up.gain, muted || up.muted, &visiting, out);
+                walk(config, &up.source_id, chain, ids, gain * up.gain, muted || up.muted, &visiting, out);
             }
             if pushed {
                 chain.pop();
+                ids.pop();
             }
             if branches == 0 {
                 tracing::warn!("processor {} 没有上游输入，忽略该路径", cur);
@@ -679,12 +711,13 @@ fn resolve_paths(config: &GraphConfig) -> Vec<ResolvedPath> {
     let mut out = Vec::new();
     for sink in &config.sinks {
         for r in config.routes.iter().filter(|r| &r.sink_id == &sink.id) {
-            let mut paths: Vec<(Id, Vec<DspNode>, f32, bool)> = Vec::new();
+            let mut paths: Vec<(Id, Vec<DspNode>, Vec<Id>, f32, bool)> = Vec::new();
             let visiting: std::collections::HashSet<&str> = [sink.id.as_str()].into_iter().collect();
-            walk(config, &r.source_id, &mut Vec::new(), r.gain, r.muted, &visiting, &mut paths);
+            walk(config, &r.source_id, &mut Vec::new(), &mut Vec::new(), r.gain, r.muted, &visiting, &mut paths);
             // walk 是从 sink 往上游走的，链序反了 → 翻回「源 → 汇」
-            for (idx, (source_id, mut nodes, gain, muted)) in paths.into_iter().enumerate() {
+            for (idx, (source_id, mut nodes, mut ids, gain, muted)) in paths.into_iter().enumerate() {
                 nodes.reverse();
+                ids.reverse();
                 out.push(ResolvedPath {
                     key: format!("{}#{}", r.id, idx),
                     source_id,
@@ -692,6 +725,7 @@ fn resolve_paths(config: &GraphConfig) -> Vec<ResolvedPath> {
                     gain,
                     muted,
                     nodes,
+                    proc_ids: ids,
                 });
             }
         }
@@ -816,7 +850,9 @@ fn make_render_callback(
                 if !st.dsp.is_empty() {
                     st.dsp.process(&mut gen);
                 }
-                mix_into(out, &gen[..gen.len().min(out.len())], gain);
+                let slice = &gen[..gen.len().min(out.len())];
+                e.peak.store(peak_of(slice).to_bits(), Ordering::Relaxed);
+                mix_into(out, slice, gain);
             } else {
                 let mut converted = std::mem::take(&mut st.converted);
                 converted.clear();
@@ -825,6 +861,7 @@ fn make_render_callback(
                 if !st.dsp.is_empty() {
                     st.dsp.process(&mut converted);
                 }
+                e.peak.store(peak_of(&converted).to_bits(), Ordering::Relaxed);
                 mix_into(out, &converted, gain);
                 st.converted = converted;
             }

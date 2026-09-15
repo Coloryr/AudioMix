@@ -49,7 +49,10 @@ export type DspNode =
   | { type: "graph_eq"; enabled: boolean; gains_db: number[] }
   | { type: "highpass"; enabled: boolean; freq: number; q: number }
   | { type: "lowpass"; enabled: boolean; freq: number; q: number }
-  | { type: "bandpass"; enabled: boolean; freq: number; q: number };
+  /** 带通：起始/终止频率（中心 = 几何平均，Q = 中心/带宽） */
+  | { type: "bandpass"; enabled: boolean; low_freq: number; high_freq: number }
+  /** 开关节点：开 = 直通，关 = 静音 */
+  | { type: "switch"; enabled: boolean };
 
 /** 画布上的 DSP 处理方块：id + 节点类型/参数（与 Rust serde flatten 对应） */
 export type Processor = { id: string } & DspNode;

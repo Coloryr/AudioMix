@@ -52,6 +52,8 @@ enum Stage {
     Delay { lines: Vec<DelayLine> },
     /// 级联的滤波器：外层 = 级数，内层 = 每声道一个
     Filters(Vec<BiquadBank>),
+    /// 全部置零（开关节点的「关」）
+    Mute,
 }
 
 /// 一条路由的 DSP 处理链（构建时绑定采样率与声道数）。
@@ -68,6 +70,14 @@ impl DspChain {
             return Self { stages, ch };
         }
         for node in nodes {
+            // 开关节点例外：其它节点 enabled=false 是「旁路跳过」，
+            // 开关节点关掉必须是「静音切信号」（这是它存在的意义）
+            if let DspKind::Switch = node.kind {
+                if !node.enabled {
+                    stages.push(Stage::Mute);
+                }
+                continue;
+            }
             if !node.enabled {
                 continue;
             }
@@ -118,9 +128,15 @@ impl DspChain {
                 DspKind::Lowpass { freq, q } => {
                     stages.push(Stage::Filters(vec![bank(Type::LowPass, freq, q, ch, rate)]))
                 }
-                DspKind::Bandpass { freq, q } => {
-                    stages.push(Stage::Filters(vec![bank(Type::BandPass, freq, q, ch, rate)]))
+                DspKind::Bandpass { low_freq, high_freq } => {
+                    // 中心 = 几何平均，Q = 中心 / 带宽（clamp_params 保证 high > low）。
+                    // biquad 的 BandPass 是恒裙增益变体（中心增益 = Q），补 1/Q 恢复 0dB 峰值
+                    let center = (low_freq * high_freq).sqrt();
+                    let q = (center / (high_freq - low_freq)).max(0.05);
+                    stages.push(Stage::Filters(vec![bank(Type::BandPass, center, q, ch, rate)]));
+                    stages.push(Stage::Gain { linear: 1.0 / q });
                 }
+                DspKind::Switch => {} // 在 match 前特判：开 = 无级直通，关 = Mute 级
             }
         }
         Self { stages, ch }
@@ -155,6 +171,11 @@ impl DspChain {
                         }
                     }
                 }
+                Stage::Mute => {
+                    for s in io.iter_mut() {
+                        *s = 0.0;
+                    }
+                }
             }
         }
     }
@@ -167,6 +188,11 @@ mod tests {
 
     fn node(kind: DspKind) -> DspNode {
         DspNode { kind, enabled: true }
+    }
+
+    /// 构建单个节点的链（控制 enabled，用于开关节点等需要区分开/关的用例）
+    fn build_for_test(kind: DspKind, enabled: bool) -> DspChain {
+        DspChain::new(&[DspNode { kind, enabled }], 48_000, 1)
     }
 
     /// 用 biquad crate 的系数算归一化频率处的复频响幅度（测试专用）
@@ -305,6 +331,39 @@ mod tests {
         chain.process(&mut io);
         let tail_peak = io[n / 2..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(tail_peak < 0.2, "50Hz 通过 200Hz 高通后峰值应 <0.2，实际 {tail_peak}");
+    }
+
+    #[test]
+    fn switch_node_mutes_when_off() {
+        // 开关节点：开 = 直通，关 = 静音（区别于其它节点的旁路跳过）
+        let mut chain_on = build_for_test(DspKind::Switch, true);
+        let mut io = vec![0.7f32; 8];
+        chain_on.process(&mut io);
+        assert!(io.iter().all(|&v| (v - 0.7).abs() < 1e-6), "开关打开应直通");
+
+        let mut chain_off = build_for_test(DspKind::Switch, false);
+        let mut io = vec![0.7f32; 8];
+        chain_off.process(&mut io);
+        assert!(io.iter().all(|&v| v == 0.0), "开关关闭应静音");
+    }
+
+    #[test]
+    fn bandpass_low_high_params() {
+        // 300–3000Hz 带通：带内 1000Hz 基本保留，带外 50Hz / 10kHz 显著衰减
+        let mut chain = DspChain::new(&[node(DspKind::Bandpass { low_freq: 300.0, high_freq: 3000.0 })], 48_000, 1);
+        for (f, expect_keep) in [(1000.0, true), (50.0, false), (10_000.0, false)] {
+            let n = 9600; // 200ms
+            let mut io: Vec<f32> =
+                (0..n).map(|i| (2.0 * std::f32::consts::PI * f * i as f32 / 48_000.0).sin()).collect();
+            chain.process(&mut io);
+            let tail_peak = io[n / 2..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            if expect_keep {
+                assert!(tail_peak > 0.5, "{f}Hz 带内应保留，峰值 {tail_peak}");
+            } else {
+                // 宽带（Q≈0.35）的 2 阶带通裙摆很缓：10kHz 处约 -13dB
+                assert!(tail_peak < 0.3, "{f}Hz 带外应衰减，峰值 {tail_peak}");
+            }
+        }
     }
 
     #[test]
