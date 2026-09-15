@@ -14,8 +14,6 @@ import {
 } from "naive-ui";
 import {
   api,
-  dbToGain,
-  gainToDb,
   nodeKey,
   type DeviceInfo,
   type DspNode,
@@ -60,9 +58,6 @@ function measure() {
     schedulePersistLayout();
   }
   canvasSize.value = { w, h };
-  // 尺寸真变了（含首次量到、窗口拖矮）才可能产生新的矩形重叠，这时重新疏散；
-  // 没变化时 early-return，不会反复扰动用户摆好的布局
-  tryRepairLayout();
 }
 
 /** 画布是否已经量到可用尺寸（没量到就不做坐标换算） */
@@ -112,7 +107,14 @@ function fitCanvas() {
     el = el.parentElement;
   }
   below += parseFloat(getComputedStyle(page).paddingBottom) || 0;
-  const noticeH = noticeEl.value?.offsetHeight ?? 0;
+  // 提示条占位 = 自身高度 + 外边距：只算 offsetHeight 会漏掉 margin-top 14px，
+  // 页面正好高出这一截，页签面板右边出现滚动条
+  let noticeH = 0;
+  if (noticeEl.value) {
+    const ncs = getComputedStyle(noticeEl.value);
+    noticeH =
+      noticeEl.value.offsetHeight + (parseFloat(ncs.marginTop) || 0) + (parseFloat(ncs.marginBottom) || 0);
+  }
   const next = clampCanvas(scroller.clientHeight - offset - below - noticeH);
   if (next !== canvasH.value) canvasH.value = next;
 }
@@ -458,7 +460,7 @@ function wirePath(from: { x: number; y: number; dir: number }, to: { x: number; 
   const c2 = to.x + (td || fd) * d;
   // 两端都收在端子环外缘（沿各自朝向回退半径距离）：线不穿过环内部，箭头尖正好贴着环
   const sx = from.x + fd * TERM_R;
-  const ex = to.x + (td || fd) * TERM_R;
+  const ex = (to.x + (td || fd) * TERM_R) - 10;
   return `M ${sx} ${from.y} C ${c1} ${from.y}, ${c2} ${to.y}, ${ex} ${to.y}`;
 }
 
@@ -476,7 +478,7 @@ function previewWirePath(from: { x: number; y: number; dir: number }, to: { x: n
 
 // ---------- 指针拖拽（不依赖 HTML5 DnD：Tauri 在 Windows 上会拦截它） ----------
 type DragState =
-  | { kind: "node"; key: string; dx: number; dy: number }
+  | { kind: "node"; key: string; dx: number; dy: number; moved: boolean }
   | { kind: "wire"; key: string; side: "in" | "out"; x: number; y: number; sx: number; sy: number; moved: boolean }
   | { kind: "palette"; item: PaletteItem; sx: number; sy: number; cx: number; cy: number; moved: boolean }
   | { kind: "pan"; sx: number; sy: number; ox: number; oy: number; moved: boolean };
@@ -551,7 +553,10 @@ function autoArrange() {
     cols.get(l)!.push(n.key);
   }
   const next = { ...layout.value };
-  const colGap = NODE_W + 96;
+  // 列距按最深层数均分整幅画布宽：固定列距在窄画布上会被 clamp 到同一条右边线，
+  // 第 3 层以后的节点全部叠在一列，看起来就像「没按信号关系排」
+  const maxLayer = Math.max(0, ...cols.keys());
+  const colGap = maxLayer > 0 ? (w - 32 - NODE_W) / maxLayer : 0;
   for (const [l, keys] of cols) {
     keys.sort((a, b) => (layout.value[a]?.[1] ?? 0) - (layout.value[b]?.[1] ?? 0));
     const gapY = NODE_H + 36;
@@ -640,6 +645,7 @@ function onWindowMove(e: PointerEvent) {
       ...layout.value,
       [d.key]: [clamp01((p.x - d.dx) / canvasSize.value.w), clamp01((p.y - d.dy) / canvasSize.value.h)],
     };
+    drag.value = { ...d, moved: true };
   } else if (d.kind === "wire") {
     const p = canvasPoint(e);
     const moved = d.moved || Math.hypot(e.clientX - d.sx, e.clientY - d.sy) > 4;
@@ -672,12 +678,15 @@ async function onWindowUp(e: PointerEvent) {
     return;
   }
   if (d.kind === "node") {
+    // 松手后浏览器还会补发一次 click（落在同一个节点上）——标记这次拖动，
+    // 让 onNodeClick 把它吞掉，否则拖完节点总会弹出设置浮窗
+    nodeDragMoved = d.moved;
     await persistLayout();
     return;
   }
   if (d.kind === "wire") {
     // 先精确命中端子；不然放宽为「落在某个节点上」→ 自动用它对侧的那个端子
-    const term = terminalAt(e.clientX, e.clientY) ?? inferredTerminal(e.clientX, e.clientY, d.side);
+    const term = terminalAt(e.clientX, e.clientY) ?? inferredTerminal(e.clientX, e.clientY, d.side, d.key);
     const same = term && term.key === d.key && term.side === d.side;
 
     // 没移动 = 单击端子：进入「再点一个端子就连线」模式（并让虚线跟着鼠标）
@@ -766,14 +775,15 @@ function inferredTerminal(
   clientX: number,
   clientY: number,
   fromSide: "in" | "out",
+  dragKey: string,
 ): { key: string; side: "in" | "out" } | null {
   const el = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
   const key = el?.closest("[data-node-key]")?.getAttribute("data-node-key");
   if (!key) return null;
   const node = nodeByKey.value.get(key);
-  if (!node || key === drag.value?.key) return null;
+  if (!node || key === dragKey) return null;
   const want: "in" | "out" = fromSide === "out" ? "in" : "out";
-  const src = drag.value?.key ? nodeByKey.value.get(drag.value.key) : undefined;
+  const src = nodeByKey.value.get(dragKey);
   if (want === "in" && !node.hasIn) {
     message.warning(`「${node.title}」没有可接的输入端（输出不能接到输出）`);
     return null;
@@ -796,14 +806,29 @@ function inferredTerminal(
 function startNodeDrag(e: PointerEvent, node: GNode) {
   if (e.button !== 0) return;
   e.preventDefault();
+  nodeDragMoved = false; // 上次拖动若松手在节点外，click 不会补发，残留标记要在下次按下时清掉
   const p = canvasPoint(e);
   drag.value = {
     kind: "node",
     key: node.key,
     dx: p.x - node.x * canvasSize.value.w,
     dy: p.y - node.y * canvasSize.value.h,
+    moved: false,
   };
   attachWindowDrag();
+}
+
+/** 上一次节点拖动是否真的挪动了位置：pointerup 之后紧跟着的 click 要据此吞掉 */
+let nodeDragMoved = false;
+
+/** 点击节点 = 选中并弹出设置浮窗；但拖拽松手补发的 click 不算点击 */
+function onNodeClick(node: GNode) {
+  if (nodeDragMoved) {
+    nodeDragMoved = false;
+    return;
+  }
+  selectedNode.value = node.key;
+  selectedRoute.value = null;
 }
 
 function startWireDrag(e: PointerEvent, node: GNode, side: "in" | "out") {
@@ -1192,66 +1217,32 @@ function closePop() {
   selectedRoute.value = null;
 }
 
-/**
- * 启动修复：旧版 fitCanvas 卡死 bug 曾把「挤成一团」的坐标写进配置文件，
- * 布局加载后按像素做一次反重叠疏散（碰撞的节点沿当前列往下挪、挤出行尾换列），
- * 有修正就立刻写回，之后每次打开都是散开的。
- *
- * 碰撞按**矩形**算（节点 236×108）：布局存的是归一化坐标，画布越矮像素间距越小
- * （保存时 0.2 的 y 间距在 620px 高时是 132px、在 400px 高时只有 80px < 108px），
- * 旧版的 24px 点距阈值对这种「挨着但没叠死」的矩形重叠完全检测不到。
- */
-function declumpLayout(pos: Record<string, NodePos>, size: { w: number; h: number }): boolean {
-  const { w, h } = size;
-  if (w < 100 || h < 100) return false;
-  // 画布按节点尺寸划成槽位网格（放不下整节点的边角不留槽）
-  const cols: number[] = [];
-  for (let x = 12; x + NODE_W <= w; x += NODE_W + 28) cols.push(x);
-  const rows: number[] = [];
-  for (let y = 12; y + NODE_H <= h; y += NODE_H + 24) rows.push(y);
-  if (!cols.length) cols.push(12);
-  if (!rows.length) rows.push(12);
-  const placed: { x: number; y: number }[] = [];
-  const collides = (x: number, y: number) =>
-    placed.some((q) => Math.abs(q.x - x) < NODE_W - 8 && Math.abs(q.y - y) < NODE_H - 8);
-  let changed = false;
-  for (const k of Object.keys(pos)) {
-    const px = pos[k][0] * w;
-    const py = pos[k][1] * h;
-    if (collides(px, py)) {
-      // 系统化扫槽位（行优先），绝不空转：全占满了才保留原位（极端小画布，宁可重叠也别乱跳）
-      let found = false;
-      for (const ry of rows) {
-        for (const cx of cols) {
-          if (!collides(cx, ry)) {
-            placed.push({ x: cx, y: ry });
-            pos[k] = [clamp01(cx / w), clamp01(ry / h)];
-            found = true;
-            changed = true;
-            break;
-          }
-        }
-        if (found) break;
-      }
-      if (!found) {
-        placed.push({ x: px, y: py });
-      }
-    } else {
-      placed.push({ x: px, y: py });
-      // 原位不动就不算修改，也不会触发写盘
-    }
-  }
-  return changed;
+/** 浮窗打开期间，点击浮窗以外任意位置（左栏、画布空白、页头……）即关闭 */
+function closePopOnOutside(e: PointerEvent) {
+  const t = e.target as HTMLElement | null;
+  if (t?.closest(".canvas-pop")) return;
+  closePop();
 }
 
-/** 反重叠疏散（有重叠才动手、动了才写盘）；布局没加载或画布尺寸没量到时跳过 */
-function tryRepairLayout() {
-  if (!layoutLoaded || !canvasReady()) return;
-  if (declumpLayout(layout.value, canvasSize.value)) schedulePersistLayout();
-}
+let popOutsideOn = false;
+watch(
+  () => !!(selectedNode.value || selectedRoute.value),
+  (open) => {
+    if (open === popOutsideOn) return;
+    popOutsideOn = open;
+    if (open) window.addEventListener("pointerdown", closePopOnOutside);
+    else window.removeEventListener("pointerdown", closePopOnOutside);
+  },
+);
+
+/**
+ * 节点位置完全由用户掌控：只在拖动/拖入/移除/点击「自动排序」时改变并写盘，
+ * 不做任何自动疏散 —— 画布缩放时 measure() 只按「像素位置不变」重新归一化，
+ * 也不会挪动节点的相对位置。
+ */
 
 // 图形数据（画布节点清单）比布局更晚到达 / 增删节点时：
-// 先剪掉已删除节点的遗留坐标（幽灵坐标会占疏散格子），再疏散一次
+// 剪掉已删除节点的遗留坐标，避免幽灵坐标永远留在配置文件里
 watch(
   () =>
     nodes.value
@@ -1264,23 +1255,8 @@ watch(
       layout.value = pruned;
       schedulePersistLayout();
     }
-    tryRepairLayout();
   },
 );
-
-function onGain(routeId: string, db: number) {
-  const r = app.graph.routes.find((x) => x.id === routeId);
-  if (!r) return;
-  r.gain = dbToGain(db);
-  api.setRouteGain(routeId, r.gain).catch((e) => message.error(String(e)));
-}
-
-function onMute(routeId: string, muted: boolean) {
-  const r = app.graph.routes.find((x) => x.id === routeId);
-  if (!r) return;
-  r.muted = muted;
-  api.setRouteMuted(routeId, muted).catch((e) => message.error(String(e)));
-}
 
 // ---------- 连线 DSP 节点链 ----------
 
@@ -1640,14 +1616,6 @@ async function menuDisconnect() {
   if (m?.kind === "wire") await disconnect(m.id);
 }
 
-async function menuToggleMute() {
-  const m = ctxMenu.value;
-  closeMenu();
-  if (m?.kind !== "wire") return;
-  const r = app.graph.routes.find((x) => x.id === m.id);
-  if (r) onMute(r.id, !r.muted);
-}
-
 async function menuRemoveNode() {
   const m = ctxMenu.value;
   closeMenu();
@@ -1711,10 +1679,6 @@ onMounted(async () => {
     const loaded = sanitizeLayout(await api.getMixerLayout());
     layout.value = loaded;
     layoutLoaded = true;
-    // 画布高度此刻可能还没定（fitCanvas 在 rAF 里跑、ResizeObserver 未必已触发），
-    // 用占位尺寸算出的像素间距没有意义 —— 立即试一次，剩下的交给 measure()：
-    // 等高度真定下来、尺寸变化时会再疏散一次
-    tryRepairLayout();
   } catch {
     layout.value = {};
     layoutLoaded = true;
@@ -1754,6 +1718,7 @@ onUnmounted(() => {
   pageObserver?.disconnect();
   pageObserver = null;
   detachWindowDrag();
+  window.removeEventListener("pointerdown", closePopOnOutside);
   if (persistTimer !== null) clearTimeout(persistTimer);
   unlistenUsbip?.();
   flushPendingVolumes();
@@ -1872,14 +1837,20 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
         :style="canvasStyle"
         @pointerdown.self="startCanvasPan"
       >
-        <!-- 世界层：节点/连线都在这个世界坐标系里，拖空白处平移整个世界 -->
-        <div class="canvas-world" :style="{ transform: `translate(${pan.x}px, ${pan.y}px)` }">
+        <!-- 世界层：节点/连线都在这个世界坐标系里，拖空白处平移整个世界。
+             它 inset:0 铺满画布，空白处的 pointerdown 落在这层而不是 .canvas 上，
+             平移入口必须挂在这里（挂 .canvas 上的 .self 永远不命中，画布就拖不动） -->
+        <div
+          class="canvas-world"
+          :style="{ transform: `translate(${pan.x}px, ${pan.y}px)` }"
+          @pointerdown.self="startCanvasPan"
+        >
         <svg class="wire-layer" :width="canvasSize.w" :height="canvasSize.h">
           <defs>
             <marker
               id="wire-arrow"
               viewBox="0 0 10 10"
-              refX="10"
+              refX="0"
               refY="5"
               markerWidth="6"
               markerHeight="6"
@@ -1890,7 +1861,7 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
             <marker
               id="wire-arrow-muted"
               viewBox="0 0 10 10"
-              refX="10"
+              refX="0"
               refY="5"
               markerWidth="6"
               markerHeight="6"
@@ -1901,7 +1872,7 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
             <marker
               id="wire-arrow-sel"
               viewBox="0 0 10 10"
-              refX="10"
+              refX="0"
               refY="5"
               markerWidth="6"
               markerHeight="6"
@@ -1967,7 +1938,7 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
             height: NODE_H + 'px',
           }"
           @pointerdown="startNodeDrag($event, node)"
-          @click.stop="selectedNode = node.key; selectedRoute = null"
+          @click.stop="onNodeClick(node)"
           @contextmenu.prevent.stop="openNodeMenuDeferred($event, node)"
         >
           <div class="node-head">
@@ -2065,28 +2036,9 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
             <span class="node-close" @pointerdown.stop @click.stop="closePop">×</span>
           </div>
 
-          <!-- 连线：增益 / 静音 / 断开 -->
+          <!-- 连线：只代表链接关系，唯一操作是断开 -->
           <template v-if="selectedRouteData">
             <div class="canvas-pop-row">
-              <span class="item-sub" style="width: 48px">增益</span>
-              <n-slider
-                :value="gainToDb(selectedRouteData.gain)"
-                :min="-60"
-                :max="6"
-                :step="1"
-                :format-tooltip="(v: number) => v.toFixed(0) + ' dB'"
-                style="flex: 1"
-                @update:value="(v: number) => onGain(selectedRouteData!.id, v)"
-              />
-              <n-tag size="small" :bordered="false">{{ gainToDb(selectedRouteData.gain).toFixed(0) }} dB</n-tag>
-            </div>
-            <div class="canvas-pop-row">
-              <span class="item-sub" style="width: 48px">静音</span>
-              <n-switch
-                :value="!selectedRouteData.muted"
-                size="small"
-                @update:value="(v: boolean) => onMute(selectedRouteData!.id, !v)"
-              />
               <n-button size="tiny" quaternary type="error" style="margin-left: auto" @click="disconnect(selectedRouteData.id)">
                 断开
               </n-button>
@@ -2230,7 +2182,6 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
   >
     <div class="ctx-title">{{ ctxMenu.title }}</div>
     <template v-if="ctxMenu.kind === 'wire'">
-      <div class="ctx-item" @click="menuToggleMute">静音 / 取消静音</div>
       <div class="ctx-item danger" @click="menuDisconnect">断开这条连线（Delete）</div>
     </template>
     <template v-else>
@@ -2359,7 +2310,9 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
 .dsp-card :deep(.n-card-header__main) {
   color: #cfa9f9;
 }
-.dev-card :deep(.n-card__content) {
+/* naive-ui 卡片内容层的类名是 n-card-content（单下划线）——写成 n-card__content 匹配不到，
+   min-height:0 失效后列表会把卡片内容层撑高、溢出卡片盖到画布上 */
+.dev-card :deep(.n-card-content) {
   flex: 1;
   min-height: 0;
   display: flex;
@@ -2668,8 +2621,8 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
   height: 16px;
   border-radius: 50%;
   border: 2px solid #4b9cd3;
-  /* 空心环：连线箭头尖捅到圆心、从环里穿出来，视觉上和节点严丝合缝 */
-  background: transparent;
+  /* 实心：空心环会把从环下经过的连线和箭头尖「漏」出来，看起来像线穿过了圆环 */
+  background: #4b9cd3;
   pointer-events: none; /* 命中交给 .term-zone */
   z-index: 2;
 }
@@ -2693,17 +2646,13 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
 .term-zone.zone-out {
   right: -11px;
 }
-/* 两种颜色区分输入/输出端子 */
+/* 两种颜色区分输入/输出端子（实心：边框和填充同色） */
 .terminal.t-out {
   border-color: #4b9cd3; /* 输出＝蓝 */
+  background: #4b9cd3;
 }
 .terminal.t-in {
   border-color: #18a058; /* 输入＝绿 */
-}
-.terminal.t-out:hover {
-  background: #4b9cd3;
-}
-.terminal.t-in:hover {
   background: #18a058;
 }
 /* 透明命中环：视觉上还是个 16px 的小点，实际点按范围约 32px */
@@ -2739,9 +2688,11 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
 }
 .legend-dot.t-in {
   border-color: #18a058;
+  background: #18a058; /* 端子已改实心，图例跟着实心 */
 }
 .legend-dot.t-out {
   border-color: #4b9cd3;
+  background: #4b9cd3;
 }
 .legend-dot.compat {
   border-color: transparent;
