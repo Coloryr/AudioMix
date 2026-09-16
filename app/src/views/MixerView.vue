@@ -44,19 +44,11 @@ function measure() {
   // 至少为 1：尺寸为 0 时（页签隐藏/尚未布局）算坐标会出现 0/0 = NaN
   const w = Math.max(1, el.clientWidth);
   const h = Math.max(1, el.clientHeight);
-  const old = canvasSize.value;
-  if (w === old.w && h === old.h) return;
-  // 布局存的是归一化坐标，直接套新尺寸会让节点在像素上跟着画布缩放；
-  // 这里按「像素位置不变」重新归一化（初始 900×520 是占位值、布局还没加载，不能算）
-  if (layoutLoaded && old.w > 2 && old.h > 2) {
-    const mapped: Record<string, NodePos> = {};
-    for (const [key, p] of Object.entries(layout.value)) {
-      if (!Array.isArray(p) || p.length < 2) continue;
-      mapped[key] = [clamp01((p[0] * old.w) / w), clamp01((p[1] * old.h) / h)];
-    }
-    layout.value = mapped;
-    schedulePersistLayout();
-  }
+  if (w === canvasSize.value.w && h === canvasSize.value.h) return;
+  // 布局存的是归一化坐标，尺寸变化时**不做**重归一化：启动期画布会先量到
+  // 兜底高度、再被 fitCanvas 定到真实高度，旧逻辑按「像素位置不变」换算并写回，
+  // 每次开软件坐标都被缩一截、往左上漂（越开越漂）。归一化坐标直接按当前画布
+  // 解释：同样窗口每次打开位置一致，窗口大小变化时布局等比跟随。
   canvasSize.value = { w, h };
 }
 
@@ -1595,8 +1587,7 @@ function openWireMenu(e: MouseEvent, w: Wire) {
 }
 
 function openNodeMenu(e: MouseEvent, node: GNode) {
-  selectedNode.value = node.key;
-  selectedRoute.value = null;
+  // 右键只弹右键菜单，不选中节点 —— 否则会连带弹出设置浮窗
   ctxMenu.value = {
     x: Math.min(e.clientX, window.innerWidth - 220),
     y: Math.min(e.clientY, window.innerHeight - 130),
