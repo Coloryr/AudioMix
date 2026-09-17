@@ -44,8 +44,10 @@ const processor = computed(() =>
     ? (app.graph.processors.find((p) => p.id === props.node!.processorId) ?? null)
     : null,
 );
-/** 输出节点对应的 Windows 设备 id（系统音量行） */
+/** 输出节点对应的 Windows 设备 id（系统音量行）。线路端点（usbip://）的端点音量
+ *  不经过虚拟线路的数据通路（调了没效果），不显示系统音量行，用「混音」调 */
 const deviceId = computed(() => (props.node ? (sinkDeviceIdOf(props.node, app.graph.sinks) ?? null) : null));
+const showDeviceVolume = computed(() => !!deviceId.value && !deviceId.value.startsWith("usbip://"));
 
 async function save() {
   try {
@@ -109,7 +111,7 @@ function onSinkEnabled(sinkId: string, enabled: boolean) {
             @update:value="(v: number) => onSinkVolume(node!.sinkId!, v)" />
           <n-switch :value="sinkEnabled" size="small" @update:value="(v: boolean) => onSinkEnabled(node!.sinkId!, v)" />
         </div>
-        <div class="canvas-pop-row">
+        <div v-if="showDeviceVolume" class="canvas-pop-row">
           <span class="item-sub" style="width: 48px">系统音量</span>
           <n-slider :value="deviceVolume" :min="0" :max="1" :step="0.01"
             :format-tooltip="(v: number) => Math.round(v * 100) + '%'" style="flex: 1"

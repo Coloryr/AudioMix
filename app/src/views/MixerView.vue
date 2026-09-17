@@ -6,6 +6,7 @@ import {
   api,
   DeviceInfo,
   nodeKey,
+  type DspNode,
   type NodePos,
   type Processor,
   type Sink,
@@ -68,7 +69,10 @@ function canvasReady() {
 // 连带把节点行距挤塌、看起来全叠在一起，所以整个换掉。
 const pageEl = ref<HTMLElement | null>(null);
 const noticeEl = ref<HTMLElement | null>(null);
-const clampCanvas = (h: number) => Math.max(240, Math.min(Math.round(h), 1600));
+// floor 而不是 round：offset/below 都是实测小数，四舍五入会让「画布 + 上下留白」
+// 比页签容器高出最多半像素，scrollHeight 向上取整后就有了 1px 滚动量 ——
+// 右边于是常驻一条滚动条。向下取整保证内容总高永不超出可视区。
+const clampCanvas = (h: number) => Math.max(240, Math.min(Math.floor(h), 1600));
 /** 画布高度（px） */
 const canvasH = ref(clampCanvas(window.innerHeight - 392));
 
@@ -243,7 +247,7 @@ const nodes = computed<GNode[]>(() => {
       kind,
       title: isCable ? `${lineName(s.device_id)} · 线路输出` : app.deviceName(s.device_id),
       subtitle: isCable
-        ? `系统播放端（扬声器）<br>${lineCopyOf(cs)} · ${lineStateOf(cs)}`
+        ? `系统播放端（扬声器）\n${lineCopyOf(cs)} · ${lineStateOf(cs)}`
         : s.enabled
           ? kind === "loopback"
             ? "该系统输出正在播放的声音"
@@ -274,7 +278,7 @@ const nodes = computed<GNode[]>(() => {
       kind,
       title: isCable ? `${lineName(k.device_id)} · 线路输入` : app.deviceName(k.device_id),
       subtitle: isCable
-        ? `系统录音端（麦克风）<br>${lineCopyOf(cs)} · ${lineStateOf(cs)}`
+        ? `系统录音端（麦克风）\n${lineCopyOf(cs)} · ${lineStateOf(cs)}`
         : "输出设备",
       sinkId: k.id,
       deviceId: kind === "output" ? k.device_id : undefined,
@@ -709,14 +713,50 @@ function startNodeDrag(e: PointerEvent, node: GNode) {
 /** 上一次节点拖动是否真的挪动了位置：pointerup 之后紧跟着的 click 要据此吞掉 */
 let nodeDragMoved = false;
 
-/** 点击节点 = 选中并弹出设置浮窗；但拖拽松手补发的 click 不算点击 */
+/** 点击节点 = 选中并弹出设置浮窗；但拖拽松手补发的 click 不算点击。
+ *  增益/开关/延迟三种方块的控制直接在方块上，不弹浮窗 */
 function onNodeClick(node: GNode) {
   if (nodeDragMoved) {
     nodeDragMoved = false;
     return;
   }
+  if (hasInlineDspControl(node)) return;
   selectedNode.value = node.key;
   selectedRoute.value = null;
+}
+
+/** 该节点的 DSP 控件是否已内联到方块上（悬浮窗不再弹出） */
+function hasInlineDspControl(node: GNode): boolean {
+  if (!node.processorId) return false;
+  const p = app.graph.processors.find((x) => x.id === node.processorId);
+  return !!p && (p.type === "gain" || p.type === "switch" || p.type === "delay");
+}
+
+/** 方块内联 DSP 控件对应的处理器 */
+function dspOf(node: GNode): DspNode | null {
+  if (!node.processorId) return null;
+  return app.graph.processors.find((x) => x.id === node.processorId) ?? null;
+}
+
+/** 方块滑杆/开关改动后下发引擎（后端 set_processor_params 内部持久化，无需再 save） */
+function touchProcessor(procId: string) {
+  const p = app.graph.processors.find((x) => x.id === procId);
+  if (!p) return;
+  api.setProcessorParams(p.id, { ...p }).catch((e) => message.error(String(e)));
+}
+
+function onDspParam(node: GNode, key: string, v: number) {
+  const p = dspOf(node);
+  if (!p) return;
+  (p as unknown as Record<string, unknown>)[key] = v;
+  touchProcessor(p.id);
+}
+
+function onDspToggle(node: GNode, enabled: boolean) {
+  const p = dspOf(node);
+  if (!p) return;
+  p.enabled = enabled;
+  touchProcessor(p.id);
 }
 
 function startWireDrag(e: PointerEvent, node: GNode, side: "in" | "out") {
@@ -1164,12 +1204,20 @@ function sinkDeviceId(node: GNode): string | undefined {
   return app.graph.sinks.find((s) => s.id === node.sinkId)?.device_id;
 }
 
+/** 系统音量条对应的设备 id。线路端点（usbip://）的端点音量不经过虚拟线路的
+ *  数据通路（调了没效果，调「混音」才有效），所以线路节点不显示系统音量条 */
+function volumeIdOf(node: GNode): string | undefined {
+  const id = sinkDeviceId(node);
+  if (!id || id.startsWith("usbip://")) return undefined;
+  return id;
+}
+
 const volumeOf = (deviceId?: string) => (deviceId ? (deviceVolumes.value[deviceId] ?? 1) : 1);
 
 async function refreshDeviceVolumes() {
   const ids = new Set<string>();
   for (const node of nodes.value) {
-    const id = sinkDeviceId(node);
+    const id = volumeIdOf(node);
     if (id) ids.add(id);
   }
   for (const id of ids) {
@@ -1426,12 +1474,14 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
               :wiring="!!wireSource"
               :meter="Math.max(level(node.sourceId), level(node.sinkId), level(node.processorId))"
               :spectrum="spectrumOf(node.sourceId ?? node.sinkId)"
-              :badge="node.processorId ? procStateBadge(node.processorId) : null" :device-id="sinkDeviceId(node)"
-              :volume="volumeOf(sinkDeviceId(node))" :term-state-of="(side) => termState(node, side)"
+              :badge="node.processorId ? procStateBadge(node.processorId) : null" :dsp="dspOf(node)"
+              :volume-id="volumeIdOf(node)" :volume="volumeOf(volumeIdOf(node))"
+              :term-state-of="(side) => termState(node, side)"
               @drag-start="(e) => startNodeDrag(e, node)" @activate="onNodeClick(node)"
               @menu="(e) => openNodeMenuDeferred(e, node)" @remove="removeNode(node)"
               @wire-start="(e, side) => startWireDrag(e, node, side)"
-              @volume-change="(v) => { const id = sinkDeviceId(node); if (id) void onDeviceVolume(id, v); }" />
+              @volume-change="(v) => { const id = volumeIdOf(node); if (id) void onDeviceVolume(id, v); }"
+              @dsp-param="(key, v) => onDspParam(node, key, v)" @dsp-toggle="(v) => onDspToggle(node, v)" />
           </div><!-- /canvas-world -->
 
           <n-text v-if="!nodes.length" depth="3"

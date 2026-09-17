@@ -59,6 +59,60 @@ async function saveFftBands() {
   await save();
 }
 
+// ---------- 虚拟声卡服务器端口 ----------
+const usbipPort = ref<number | null>(extractUsbipPort());
+/** null = 未知/检测中；true = 被占用；false = 空闲 */
+const portOccupied = ref<boolean | null>(null);
+let portCheckTimer: number | undefined;
+
+function extractUsbipPort(): number {
+  const p = Number(app.settings.usbip.bind.split(":").pop());
+  return Number.isFinite(p) && p > 0 ? p : 3240;
+}
+
+// 设置整体加载/保存回滚后同步端口输入框，并重新检测占用
+watch(
+  () => app.settings.usbip.bind,
+  () => {
+    usbipPort.value = extractUsbipPort();
+  },
+);
+
+// 防抖检测端口占用（后端试绑定一次）
+watch(usbipPort, () => {
+  window.clearTimeout(portCheckTimer);
+  portCheckTimer = window.setTimeout(checkPort, 400);
+});
+
+async function checkPort() {
+  const p = usbipPort.value;
+  if (!p || app.settings.usbip.enabled) {
+    portOccupied.value = null;
+    return;
+  }
+  portOccupied.value = null;
+  try {
+    const free = await api.usbipPortAvailable(p);
+    // 输入框已变就不回写，避免旧结果覆盖新检测
+    if (usbipPort.value === p) portOccupied.value = !free;
+  } catch {
+    // 检测失败不打扰用户，保存时后端还会再验
+  }
+}
+
+async function savePort() {
+  const p = usbipPort.value;
+  if (!p || p === extractUsbipPort()) return;
+  try {
+    const st = await api.usbipSetPort(p);
+    app.settings.usbip.bind = st.bind;
+    message.success(`端口已改为 ${p}`);
+  } catch (e) {
+    message.error(String(e));
+    usbipPort.value = extractUsbipPort();
+  }
+}
+
 async function toggleAutostart(enabled: boolean) {
   try {
     await api.setAutostart(enabled);
@@ -178,7 +232,10 @@ onMounted(() => {
   pollLogs();
   timer = window.setInterval(pollLogs, 700);
 });
-onUnmounted(() => window.clearInterval(timer));
+onUnmounted(() => {
+  window.clearInterval(timer);
+  window.clearTimeout(portCheckTimer);
+});
 </script>
 
 <template>
@@ -251,6 +308,32 @@ onUnmounted(() => window.clearInterval(timer));
             </n-text>
             <n-input v-model:value="fftBandText" size="small" style="margin-top: 8px" placeholder="50, 69, 94, …, 20000"
               @blur="saveFftBands" @keydown.enter="($event.target as HTMLInputElement)?.blur()" />
+          </div>
+        </div>
+      </n-card>
+
+      <n-card title="虚拟声卡服务器" size="small">
+        <div class="item-row">
+          <div style="flex: 1">
+            <div class="item-title">监听端口</div>
+            <n-text depth="3" style="font-size: 12px">
+              usbip-win2 附加线缆时连接的 TCP 端口（默认 3240，仅本机回环）。
+              服务器运行中不可修改——请先在「虚拟声卡」页停用，保存后下次启用生效。
+            </n-text>
+          </div>
+          <div class="item-row" style="gap: 8px">
+            <n-tag v-if="app.settings.usbip.enabled" size="small" type="warning" :bordered="false">
+              服务器运行中
+            </n-tag>
+            <n-tag v-else-if="portOccupied === true" size="small" type="error" :bordered="false">
+              端口被占用
+            </n-tag>
+            <n-tag v-else-if="portOccupied === false" size="small" type="success" :bordered="false">
+              端口空闲
+            </n-tag>
+            <n-input-number v-model:value="usbipPort" :min="1024" :max="65535"
+              :disabled="app.settings.usbip.enabled" style="width: 120px" @update:value="savePort"
+              @blur="checkPort" />
           </div>
         </div>
       </n-card>

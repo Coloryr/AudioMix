@@ -1,9 +1,10 @@
 <script setup lang="ts">
 // 画布节点卡片：标签 + 标题/副标题 + 电平条 + （DSP）状态小字 + （输出）系统音量条 + 两端端子。
 // 拖动/拉线/右键/移除等交互全部上抛给 MixerView（它持有拖拽引擎与画布几何）。
-import { NTag, NSlider } from "naive-ui";
+import { NTag, NSlider, NSwitch } from "naive-ui";
 import MeterBar from "../MeterBar.vue";
 import { NODE_W, NODE_H, KIND_META, termStyle, termTitle, type GNode } from "./types";
+import type { DspNode } from "../../api";
 
 defineProps<{
   node: GNode;
@@ -16,8 +17,10 @@ defineProps<{
   spectrum?: number[];
   /** DSP 方块的状态小字（非 DSP 传 null 不显示） */
   badge: { text: string; cls: string } | null;
-  /** sink 节点对应的设备 id（渲染 Windows 系统音量条；非输出节点为 undefined） */
-  deviceId?: string;
+  /** 方块对应的 DSP 处理器（增益/开关/延迟直接在方块上控制，其余走悬浮窗） */
+  dsp?: DspNode | null;
+  /** 系统音量条对应的设备 id（Windows 端点音量；线路端点/无 sink 为 undefined 不显示） */
+  volumeId?: string;
   /** 该设备的系统音量（0..1） */
   volume: number;
   /** 拉线时该端子是否可接："" | "compat" | "incompat"（父组件的 termState） */
@@ -31,6 +34,8 @@ const emit = defineEmits<{
   (e: "remove"): void;
   (e: "wire-start", ev: PointerEvent, side: "in" | "out"): void;
   (e: "volume-change", v: number): void;
+  (e: "dsp-param", key: string, v: number): void;
+  (e: "dsp-toggle", v: boolean): void;
 }>();
 
 // ---------- 频谱条高度 ----------
@@ -64,14 +69,38 @@ function specPx(db: number): number {
       <i v-for="(db, i) in spectrum" :key="i" class="spec-bar" :style="{ height: specPx(db) + 'px' }" />
     </div>
     <MeterBar v-else class="node-meter" :level="meter" />
-    <!-- DSP 方块：只显示启用状态（开关在悬浮弹窗里），开关节点关 = 静音、其它 = 旁路 -->
-    <div v-if="badge" class="node-state" @pointerdown.stop @click.stop>
+    <!-- DSP 方块状态行：开关＝滑块开关直接放方块上；增益/延迟＝状态小字可点切换旁路；
+         其余 DSP 维持原样（控制仍在悬浮弹窗） -->
+    <div v-if="dsp && dsp.type === 'switch'" class="node-state" @pointerdown.stop @click.stop>
+      <n-switch :value="dsp.enabled" size="small" @update:value="(v: boolean) => emit('dsp-toggle', v)" />
+      <span>{{ dsp.enabled ? "开 · 直通" : "关 · 静音" }}</span>
+    </div>
+    <div v-else-if="badge" class="node-state" @pointerdown.stop @click.stop>
       <i class="state-dot" :class="badge.cls" />
-      {{ badge.text }}
+      <!-- 增益/延迟：点状态小字切换 旁路/启用（悬浮窗已去掉） -->
+      <span v-if="dsp && (dsp.type === 'gain' || dsp.type === 'delay')" class="node-state-btn"
+        :title="dsp.enabled ? '点击旁路' : '点击启用'" @click="emit('dsp-toggle', !dsp.enabled)">
+        {{ badge.text }}
+      </span>
+      <template v-else>{{ badge.text }}</template>
     </div>
 
-    <!-- 输出/线路输入节点：调的是该设备的 **Windows 系统音量** -->
-    <div v-if="node.sinkId" class="node-vol" @pointerdown.stop @click.stop>
+    <!-- 增益 / 延迟：参数滑杆直接在方块上（改动即下发引擎） -->
+    <div v-if="dsp && dsp.type === 'gain'" class="node-ctl" @pointerdown.stop @click.stop>
+      <n-slider :value="dsp.db" :min="-60" :max="12" :step="0.5"
+        :format-tooltip="(v: number) => v.toFixed(1) + ' dB'"
+        @update:value="(v: number) => emit('dsp-param', 'db', v)" />
+      <span class="node-ctl-val">{{ dsp.db > 0 ? "+" : "" }}{{ dsp.db }}dB</span>
+    </div>
+    <div v-if="dsp && dsp.type === 'delay'" class="node-ctl" @pointerdown.stop @click.stop>
+      <n-slider :value="dsp.ms" :min="0" :max="1000" :step="1"
+        :format-tooltip="(v: number) => Math.round(v) + ' ms'"
+        @update:value="(v: number) => emit('dsp-param', 'ms', Math.round(v))" />
+      <span class="node-ctl-val">{{ Math.round(dsp.ms) }}ms</span>
+    </div>
+
+    <!-- 输出/线路输入节点：调的是该设备的 **Windows 系统音量**（线路端点没有音量条） -->
+    <div v-if="volumeId" class="node-vol" @pointerdown.stop @click.stop>
       <span class="node-vol-icon">🔊</span>
       <n-slider :value="volume" :min="0" :max="1" :step="0.01" :tooltip="false" size="small"
         @update:value="(v: number) => emit('volume-change', v)" />
@@ -149,12 +178,13 @@ function specPx(db: number): number {
   opacity: 0.62;
   font-size: 11px;
   line-height: 1.3;
-  /* 最多两行：副标题常是「系统播放端（扬声器） · 拷贝：… · 状态」长句，一行省略号看不全 */
+  /* 最多两行：副标题常是「系统播放端（扬声器）\n拷贝：… · 状态」两行文本，一行省略号看不全 */
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   overflow: hidden;
-  white-space: normal;
+  /* pre-line：保留副标题里的 \n 分行，其余照常折行 */
+  white-space: pre-line;
   word-break: break-all;
 }
 
@@ -208,6 +238,36 @@ function specPx(db: number): number {
 
 .state-dot.off {
   background: #8a8a8a;
+}
+
+/* 增益/延迟的状态小字可点击切换旁路 */
+.node-state-btn {
+  cursor: pointer;
+}
+
+.node-state-btn:hover {
+  text-decoration: underline;
+  opacity: 1;
+}
+
+/* 增益/延迟的方块内参数滑杆（值右对齐，滑杆吃剩余宽度） */
+.node-ctl {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.node-ctl :deep(.n-slider) {
+  flex: 1;
+}
+
+.node-ctl-val {
+  font-size: 11px;
+  opacity: 0.75;
+  min-width: 44px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 /* DSP 的标签统一紫色（n-tag 的 warning 橙和方块配色不搭） */

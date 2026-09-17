@@ -111,6 +111,7 @@ fn refresh_and_guard_defaults(
                     saved = true;
                 }
                 if virtual_flag(&cfg, kind) {
+                    // 线路不在线、偏好仍是虚拟线路：物理默认只是临时落点，不采纳
                     continue;
                 }
                 if saved_id.as_deref() != Some(current.id.as_str()) {
@@ -179,8 +180,9 @@ fn refresh_and_guard_defaults(
     }
 }
 
-/// 用户偏好是虚拟线路、但当前默认不是：把默认恢复成该 flow 的虚拟线路
-/// （线缆接入时调用 —— 启动时线缆未接入，默认必然落在物理设备上，接入后要设回去）。
+/// 用户偏好（意图）是虚拟线路、但当前默认不是：把默认设回该 flow 的虚拟线路的
+/// **Windows 侧真实端点**（线缆接入时调用 —— 启动时线缆未接入，默认必然落在物理
+/// 设备上，接入后要设回去；端点 id 每次重连都会变，所以按 is_virtual 匹配而不是 id）。
 /// 返回是否做了更改（需要落盘）。
 fn restore_virtual_defaults(state: &AppState) -> bool {
     let devices = state.engine.list_devices();
@@ -189,15 +191,11 @@ fn restore_virtual_defaults(state: &AppState) -> bool {
     {
         let cfg = state.config.lock();
         for kind in [DeviceKind::Output, DeviceKind::Input] {
-            let saved = match kind {
-                DeviceKind::Output => cfg.settings.default_output.as_deref(),
-                DeviceKind::Input => cfg.settings.default_input.as_deref(),
-            };
-            if !prefers_virtual(saved) {
+            if !virtual_flag(&cfg, kind) {
                 continue;
             }
-            // 目标：该 flow 的第一个虚拟设备（合成 id；线缆重连后编号可能变，跟随现实）
-            let Some(target) = devices.iter().find(|d| d.kind == kind && d.is_virtual) else {
+            // 目标：线缆的真实端点（合成 usbip:// id 不是 MMDevice id，系统不认）
+            let Some(target) = real_virtual_endpoint(&devices, kind) else {
                 continue;
             };
             let current = devices
@@ -496,9 +494,24 @@ pub fn set_default_device(
     state: State<AppState>,
     device_id: String,
 ) -> Result<Vec<DeviceInfo>, String> {
-    audiomix_backend_windows::policy::set_default_endpoint(&device_id)?;
+    // 虚拟线路的合成 id（usbip://N/playback|capture）不是 MMDevice 端点 id，
+    // IPolicyConfig 不认：映射到线缆在 Windows 侧的真实端点再设默认
+    let mut target_id = device_id.clone();
+    if let Some(side) = device_id.strip_prefix("usbip://") {
+        // playback 侧是录入端（Input），capture 侧是输出端（Output），与枚举口径一致
+        let kind = if side.ends_with("/playback") {
+            DeviceKind::Input
+        } else {
+            DeviceKind::Output
+        };
+        let devices = state.engine.list_devices();
+        let real = real_virtual_endpoint(&devices, kind)
+            .ok_or_else(|| "虚拟线路未接入系统，无法设为默认设备".to_string())?;
+        target_id = real.id.clone();
+    }
+    audiomix_backend_windows::policy::set_default_endpoint(&target_id)?;
     let devices = state.engine.refresh_devices().map_err(|e| e.to_string())?;
-    let picked = devices.iter().find(|d| d.id == device_id).cloned();
+    let picked = devices.iter().find(|d| d.id == target_id).cloned();
     if picked.is_none() {
         return Ok(devices); // 设备刚拔掉：Windows 那边已尽力，列表照原样返回
     }
@@ -509,16 +522,58 @@ pub fn set_default_device(
     Ok(devices)
 }
 
+/// 合成 `usbip://N/playback|capture` 线路 id → 接入后 Windows 创建的真实端点 id。
+///
+/// 线路端点本身不是 MMDevice 设备（没有 `{0.0.0.0...}.{guid}` 形式的端点 id），
+/// `IMMDeviceEnumerator::GetDevice` 直接报「找不到设备」，音量接口无从打开；
+/// 音量控制器在 usbaudio.sys 为线缆创建的**真实**扬声器/麦克风端点上
+/// （UAC1 描述符两条路径都带 Feature Unit，所以两个真实端点都有音量）。
+/// 普通设备 id 原样透传。
+fn real_cable_endpoint_id(state: &AppState, device_id: &str) -> Result<String, String> {
+    let Some(rest) = device_id.strip_prefix("usbip://") else {
+        return Ok(device_id.to_string());
+    };
+    let Some((num, side)) = rest.split_once('/') else {
+        return Err(format!("无效的线路设备 id: {device_id}"));
+    };
+    let Ok(number) = num.parse::<u8>() else {
+        return Err(format!("无效的线路设备 id: {device_id}"));
+    };
+    let display = state
+        .usbip
+        .cables()
+        .iter()
+        .find(|c| c.cfg.number == number)
+        .map(|c| c.cfg.display_name())
+        .ok_or_else(|| format!("线路 {number} 不存在（已删除或服务器未启用）"))?;
+    // 线路的播放端 = Windows 扬声器（Output），采集端 = 麦克风（Input）；
+    // 真实端点名里含线缆显示名（与前端 realCableDevice 同一判据）
+    let want_kind = if side == "playback" {
+        DeviceKind::Output
+    } else {
+        DeviceKind::Input
+    };
+    state
+        .engine
+        .list_devices()
+        .into_iter()
+        .find(|d| d.kind == want_kind && !d.id.starts_with("usbip://") && d.name.contains(&display))
+        .map(|d| d.id)
+        .ok_or_else(|| "该线路未接入系统（请先附加线缆），暂无音量控制器".to_string())
+}
+
 /// 读取某输出/输入端点的 **Windows 系统音量**（0.0..=1.0）
 #[tauri::command]
-pub fn get_device_volume(device_id: String) -> Result<f32, String> {
-    audiomix_backend_windows::policy::get_endpoint_volume(&device_id)
+pub fn get_device_volume(state: State<'_, AppState>, device_id: String) -> Result<f32, String> {
+    let id = real_cable_endpoint_id(&state, &device_id)?;
+    audiomix_backend_windows::policy::get_endpoint_volume(&id)
 }
 
 /// 设置端点的 **Windows 系统音量**（影响该设备上所有声音，不只是混音器输出）
 #[tauri::command]
-pub fn set_device_volume(device_id: String, level: f32) -> Result<(), String> {
-    audiomix_backend_windows::policy::set_endpoint_volume(&device_id, level)
+pub fn set_device_volume(state: State<'_, AppState>, device_id: String, level: f32) -> Result<(), String> {
+    let id = real_cable_endpoint_id(&state, &device_id)?;
+    audiomix_backend_windows::policy::set_endpoint_volume(&id, level)
 }
 
 /// 端点是否静音
@@ -1051,6 +1106,71 @@ pub async fn usbip_status(state: State<'_, AppState>) -> Result<UsbIpStatus, Str
     let local_addr = state.usbip.local_addr().map(|a| a.to_string());
     tauri::async_runtime::spawn_blocking(move || {
         build_usbip_status(enabled, bind, running, local_addr, &cables)
+    })
+    .await
+    .map_err(|e| format!("状态查询失败: {e}"))
+}
+
+/// 检测本机端口是否空闲（可绑定）。false = 已被其它程序占用。
+#[tauri::command]
+pub async fn usbip_port_available(port: u16) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+    })
+    .await
+    .map_err(|e| format!("端口检测失败: {e}"))
+}
+
+/// 修改虚拟声卡服务器监听端口（主机地址不变）。返回新状态。
+///
+/// 服务器运行中不允许改——监听套接字已绑定旧端口，必须先停用；
+/// 保存前会试绑定目标端口，被占用则拒绝。
+#[tauri::command]
+pub async fn usbip_set_port(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    port: u16,
+) -> Result<UsbIpStatus, String> {
+    if !(1024..=65535).contains(&port) {
+        return Err("端口需在 1024 – 65535 之间".into());
+    }
+    if state.usbip.running() {
+        return Err("虚拟声卡服务器正在运行，请先停用再修改端口".into());
+    }
+    // 保留主机地址，只换端口（bind 形如 host:port）
+    let old_bind = state.config.lock().settings.usbip.bind.clone();
+    let host = old_bind.rsplit_once(':').map_or(old_bind.as_str(), |(h, _)| h);
+    let new_bind = format!("{host}:{port}");
+
+    // 目标端口被占用（可能是别的程序）就直接拒绝，免得下次启用服务器才报错
+    let bindable = tauri::async_runtime::spawn_blocking(move || {
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+    })
+    .await
+    .map_err(|e| format!("端口检测失败: {e}"))?;
+    if !bindable {
+        return Err(format!("端口 {port} 已被其它程序占用"));
+    }
+
+    state.usbip.set_bind(new_bind.clone());
+    {
+        let mut cfg = state.config.lock();
+        cfg.settings.usbip.bind = new_bind.clone();
+    }
+    persist(&app, &state)?;
+    tracing::info!("USB/IP 监听端口已改为 {port}（下次启用服务器时生效）");
+
+    let (enabled, cables) = {
+        let cfg = state.config.lock();
+        (
+            cfg.settings.usbip.enabled,
+            cfg.settings.usbip.cables.clone(),
+        )
+    };
+    let running = state.usbip.running();
+    let local_addr = state.usbip.local_addr().map(|a| a.to_string());
+    tauri::async_runtime::spawn_blocking(move || {
+        build_usbip_status(enabled, new_bind, running, local_addr, &cables)
     })
     .await
     .map_err(|e| format!("状态查询失败: {e}"))

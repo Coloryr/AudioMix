@@ -261,8 +261,7 @@ onMounted(() => {
 <template>
   <n-card title="虚拟声卡（usbip-win2 + UAC1）" size="small">
     <!-- 传输驱动安装状态 -->
-    <n-alert v-if="status && !driverReady" type="warning" title="未检测到 usbip.exe（USB/IP 传输驱动）"
-      style="margin-bottom: 12px">
+    <n-alert v-if="status && !driverReady" type="warning" title="未检测到 usbip.exe（USB/IP 传输驱动）" class="block">
       虚拟声卡由 <b>usbip-win2</b>（BSD-2，微软签名驱动，内存完整性 HVCI 兼容）把应用内置的
       USB/IP 服务器仿真的设备接入 Windows，再由系统自带的 usbaudio.sys（UAC1）暴露为标准播放/录音端点。
       <template v-if="status.driver.installer_path">
@@ -285,12 +284,12 @@ onMounted(() => {
       </div>
     </n-alert>
 
-    <n-alert v-else-if="status" type="success" style="margin-bottom: 12px">
+    <n-alert v-else-if="status" type="success" class="block">
       传输驱动已就绪：<code>{{ status.driver.usbip_path }}</code>
     </n-alert>
 
     <!-- 服务器开关/状态 -->
-    <div class="item-row" style="margin-bottom: 10px">
+    <div class="item-row block">
       <div style="flex: 1">
         <div class="item-title">启用虚拟声卡服务器</div>
         <n-text depth="3" style="font-size: 12px">
@@ -299,7 +298,7 @@ onMounted(() => {
       </div>
       <n-switch :value="enabled" :loading="busy" @update:value="toggleEnabled" />
     </div>
-    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 16px">
+    <div class="item-row block">
       <n-tag size="small" :type="status?.running ? 'success' : 'default'" :bordered="false">
         {{ status?.running ? `运行中 ${status.local_addr ?? ""}` : "未运行" }}
       </n-tag>
@@ -309,11 +308,11 @@ onMounted(() => {
       <n-button size="tiny" @click="load">刷新状态</n-button>
     </div>
 
-    <n-alert v-if="needsReattach" type="info" style="margin-bottom: 12px">
+    <n-alert v-if="needsReattach" type="info" class="block">
       线路配置已更改，系统里旧的虚拟设备需要重新接入 —— 请点「附加全部」。
     </n-alert>
 
-    <n-divider style="margin: 4px 0 12px" />
+    <n-divider class="divider" />
 
     <!-- 线路列表：名称 / 格式 / 接线 -->
     <div class="section-title">虚拟线路（1–32 条，格式独立可配）</div>
@@ -325,7 +324,7 @@ onMounted(() => {
       输出→输入＝播放端的声音原样出现在录音端；输入→输出＝写进录音端的数据回灌到播放端。改完点「保存」即生效。
     </n-text>
 
-    <n-list v-if="cables.length" :show-divider="false" style="margin-bottom: 10px">
+    <n-list v-if="cables.length" :show-divider="false" class="block">
       <n-list-item v-for="c in cables" :key="c.number">
         <div class="cable-row">
           <!-- 第一行：身份与格式（名称/采样率/位深/带宽告警/接入状态/删除） -->
@@ -403,11 +402,11 @@ onMounted(() => {
         </div>
       </n-list-item>
     </n-list>
-    <n-text v-else depth="3" style="display: block; font-size: 13px; margin-bottom: 10px">
+    <n-text v-else depth="3" style="display: block; font-size: 13px" class="block">
       尚未添加线路。线路名会写进 USB 产品字符串——Windows 声音设置里显示的就是它。
     </n-text>
 
-    <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 16px; flex-wrap: wrap">
+    <div class="item-row block">
       <n-button size="small" :disabled="cables.length >= 32" @click="addCable">＋ 添加线路</n-button>
       <n-button size="small" type="primary" :loading="busy" :disabled="!dirty" @click="saveCables">
         保存
@@ -420,15 +419,15 @@ onMounted(() => {
       </n-text>
     </div>
 
-    <n-divider style="margin: 8px 0 14px" />
+    <n-divider class="divider" />
 
     <!-- 接入系统 -->
     <div class="section-title">接入系统（usbip attach，需管理员权限）</div>
-    <n-text depth="3" style="display: block; font-size: 12px; margin-bottom: 8px">
+    <n-text depth="3" style="display: block; font-size: 12px" class="block">
       「附加全部」先断开所有已接入端口，再按当前线路逐条附加（<b>只弹一次 UAC</b>）。
       附加后设备出现在系统声音设置与本应用设备列表（可能需要几秒枚举）。
     </n-text>
-    <div style="display: flex; gap: 10px; margin-bottom: 12px">
+    <div class="item-row block">
       <n-button type="primary" size="small" :loading="busy"
         :disabled="!driverReady || !status?.running || !cables.length" @click="attachAll">
         附加全部（需管理员）
@@ -438,10 +437,10 @@ onMounted(() => {
       </n-button>
     </div>
 
-    <n-alert v-if="status?.ports_error" type="default" style="margin-bottom: 12px">
+    <n-alert v-if="status?.ports_error" type="default" class="block">
       端口状态不可用：{{ status.ports_error }}
     </n-alert>
-    <n-list v-if="status?.ports.length" :show-divider="false" style="margin-bottom: 12px">
+    <n-list v-if="status?.ports.length" :show-divider="false" class="block">
       <n-list-item v-for="p in status.ports" :key="p.port">
         <div class="item-row">
           <n-tag size="small" type="success" :bordered="false">端口 {{ p.port }}</n-tag>
@@ -450,12 +449,11 @@ onMounted(() => {
       </n-list-item>
     </n-list>
 
-    <n-alert v-if="report && report.failed.length" type="error" style="margin-bottom: 12px">
+    <n-alert v-if="report && report.failed.length" type="error" class="block">
       以下线路附加失败：<span v-for="[bus, why] in report.failed" :key="bus">{{ bus }}（{{ why }}） </span>
     </n-alert>
-    <n-text v-if="lastLog" depth="3" style="display: block; font-size: 12px; white-space: pre-wrap; margin-bottom: 8px">
-      {{ lastLog }}
-    </n-text>
+    <!-- 附加/安装命令的原始输出：等宽字体、可选中复制 -->
+    <div v-if="lastLog" class="log-box">{{ lastLog }}</div>
 
   </n-card>
 </template>

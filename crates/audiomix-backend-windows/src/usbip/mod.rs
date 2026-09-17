@@ -85,7 +85,8 @@ const BIND_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// 线缆配置变化 = 重启服务器（描述符是静态的）+ Windows 端重新 attach。
 pub struct UsbIpManager {
     registry: Arc<CableRegistry>,
-    bind: String,
+    /// 可在服务器停止时经 [`Self::set_bind`] 更新，故用锁包一层
+    bind: Mutex<String>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     local_addr: Mutex<Option<std::net::SocketAddr>>,
 }
@@ -101,7 +102,7 @@ impl UsbIpManager {
     pub fn new(bind: impl Into<String>) -> Self {
         Self {
             registry: Arc::new(RwLock::new(Vec::new())),
-            bind: bind.into(),
+            bind: Mutex::new(bind.into()),
             task: Mutex::new(None),
             local_addr: Mutex::new(None),
         }
@@ -124,8 +125,19 @@ impl UsbIpManager {
     }
 
     /// 配置的监听地址（`:0` 时与实际端口可能不同，见 [`Self::local_addr`]）。
-    pub fn bind_addr(&self) -> &str {
-        &self.bind
+    pub fn bind_addr(&self) -> String {
+        self.bind.lock().clone()
+    }
+
+    /// 更新监听地址。仅在服务器停止时允许；运行中修改会被忽略（改端口要先停用）。
+    pub fn set_bind(&self, bind: impl Into<String>) {
+        let bind = bind.into();
+        if self.running() {
+            tracing::warn!("USB/IP 服务器运行中，忽略监听地址修改（{bind}）——请先停用再改");
+            return;
+        }
+        *self.bind.lock() = bind;
+        tracing::info!("USB/IP 监听地址已更新为 {}", self.bind.lock());
     }
 
     /// 实际监听地址（bind :0 时可查分配到的端口）
@@ -161,7 +173,7 @@ impl UsbIpManager {
             *self.registry.write() = cables;
             tracing::info!(
                 "USB/IP 服务器线缆已更新（{count} 条，继续监听 {}）",
-                self.bind
+                self.bind.lock()
             );
             return Ok(());
         }
@@ -176,7 +188,7 @@ impl UsbIpManager {
         let reg = self.registry.clone();
         let task = rt.spawn(async move { server::serve(listener, reg).await });
         *self.task.lock() = Some(task);
-        tracing::info!("USB/IP 服务器已启动（{count} 条线缆，监听 {}）", self.bind);
+        tracing::info!("USB/IP 服务器已启动（{count} 条线缆，监听 {}）", self.bind.lock());
         Ok(())
     }
 
@@ -190,8 +202,9 @@ impl UsbIpManager {
 
         let mut last_err = String::new();
         let mut bound = None;
+        let bind = self.bind.lock().clone();
         for attempt in 0..BIND_ATTEMPTS {
-            match std::net::TcpListener::bind(&self.bind) {
+            match std::net::TcpListener::bind(bind.as_str()) {
                 Ok(l) => {
                     bound = Some(l);
                     break;
@@ -199,17 +212,14 @@ impl UsbIpManager {
                 Err(e) => {
                     last_err = e.to_string();
                     if attempt == 0 {
-                        tracing::debug!("绑定 {} 失败（{e}），等待端口释放后重试", self.bind);
+                        tracing::debug!("绑定 {bind} 失败（{e}），等待端口释放后重试");
                     }
                     std::thread::sleep(BIND_RETRY_INTERVAL);
                 }
             }
         }
         let std_listener = bound.ok_or_else(|| {
-            format!(
-                "绑定 {} 失败: {last_err}（端口被其它程序占用？先关掉占用者再试）",
-                self.bind
-            )
+            format!("绑定 {bind} 失败: {last_err}（端口被其它程序占用？先关掉占用者再试）")
         })?;
         std_listener
             .set_nonblocking(true)

@@ -260,6 +260,10 @@ export const api = {
   usbipStatus: () => invoke<UsbIpStatus>("usbip_status"),
   usbipSetCables: (enabled: boolean, cables: UsbIpCable[]) =>
     invoke<UsbIpStatus>("usbip_set_cables", { enabled, cables }),
+  /** 检测本机端口是否空闲（false = 已被占用） */
+  usbipPortAvailable: (port: number) => invoke<boolean>("usbip_port_available", { port }),
+  /** 修改虚拟声卡服务器监听端口（服务器运行中会被拒绝） */
+  usbipSetPort: (port: number) => invoke<UsbIpStatus>("usbip_set_port", { port }),
   usbipAttachAll: () => invoke<AttachReport>("usbip_attach_all"),
   usbipDetachAll: () => invoke<string>("usbip_detach_all"),
   usbipInstallDriver: () => invoke<string>("usbip_install_driver"),

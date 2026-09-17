@@ -175,6 +175,8 @@ fn main() {
             commands::get_autostart,
             commands::set_autostart,
             commands::usbip_status,
+            commands::usbip_port_available,
+            commands::usbip_set_port,
             commands::usbip_set_cables,
             commands::usbip_attach_all,
             commands::usbip_detach_all,
