@@ -1,5 +1,5 @@
 // Tauri invoke 封装 + 与 Rust 结构对应的类型（snake_case JSON）
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 
 export type DeviceKind = "input" | "output";
 export type SourceMode = "deviceinput" | "loopback";
@@ -35,16 +35,16 @@ export type DspNode =
   | { type: "gain"; enabled: boolean; db: number }
   | { type: "delay"; enabled: boolean; ms: number }
   | {
-      type: "eq3";
-      enabled: boolean;
-      low_gain_db: number;
-      low_freq: number;
-      mid_gain_db: number;
-      mid_freq: number;
-      mid_q: number;
-      high_gain_db: number;
-      high_freq: number;
-    }
+    type: "eq3";
+    enabled: boolean;
+    low_gain_db: number;
+    low_freq: number;
+    mid_gain_db: number;
+    mid_freq: number;
+    mid_q: number;
+    high_gain_db: number;
+    high_freq: number;
+  }
   | { type: "peak_eq"; enabled: boolean; freq: number; gain_db: number; q: number }
   | { type: "graph_eq"; enabled: boolean; gains_db: number[] }
   | { type: "highpass"; enabled: boolean; freq: number; q: number }
@@ -52,7 +52,9 @@ export type DspNode =
   /** 带通：起始/终止频率（中心 = 几何平均，Q = 中心/带宽） */
   | { type: "bandpass"; enabled: boolean; low_freq: number; high_freq: number }
   /** 开关节点：开 = 直通，关 = 静音 */
-  | { type: "switch"; enabled: boolean };
+  | { type: "switch"; enabled: boolean }
+  /** 限幅器：峰值包络压低超阈信号，防削波 */
+  | { type: "limiter"; enabled: boolean; threshold_db: number; release_ms: number };
 
 /** 画布上的 DSP 处理方块：id + 节点类型/参数（与 Rust serde flatten 对应） */
 export type Processor = { id: string } & DspNode;
@@ -84,6 +86,8 @@ export interface Settings {
   resample_quality: "sinc256" | "sinc128" | "linear";
   /** 边缓冲容量（ms，50..=1000，加大更抗卡顿，不影响日常延迟） */
   edge_buffer_ms: number;
+  /** 电平推送间隔（ms，20..=500，越小电平条越顺滑、CPU 略高） */
+  levels_interval_ms: number;
 }
 
 export interface ApiStatus {
@@ -220,7 +224,13 @@ export const api = {
     invoke<void>("set_processor_params", { processorId, node }),
   setSinkVolume: (sinkId: string, volume: number) =>
     invoke<void>("set_sink_volume", { sinkId, volume }),
-  getLevels: () => invoke<Record<string, number>>("get_levels"),
+  /** 电平推送：后端线程 ~20fps 主动推（取代轮询），返回 Promise 在订阅完成后 resolve */
+  subscribeLevels(onLevels: (levels: Record<string, number>) => void): Promise<void> {
+    const channel = new Channel<Record<string, number>>();
+    channel.onmessage = onLevels;
+    return invoke("subscribe_levels", { channel });
+  },
+  unsubscribeLevels: () => invoke<void>("unsubscribe_levels"),
   getSettings: () => invoke<Settings>("get_settings"),
   updateSettings: (settings: Settings) => invoke<void>("update_settings", { settings }),
   getControlApiStatus: () => invoke<ApiStatus>("get_control_api_status"),

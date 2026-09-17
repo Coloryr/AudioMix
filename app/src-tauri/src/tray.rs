@@ -42,11 +42,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&open, &quit])?;
 
     TrayIconBuilder::with_id("main-tray")
-        .icon(
-            app.default_window_icon()
-                .cloned()
-                .expect("缺少应用图标"),
-        )
+        .icon(app.default_window_icon().cloned().expect("缺少应用图标"))
         .tooltip("AudioMix")
         .menu(&menu)
         .show_menu_on_left_click(false)

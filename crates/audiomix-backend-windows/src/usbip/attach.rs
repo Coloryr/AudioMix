@@ -83,9 +83,15 @@ pub fn bundled_installer() -> Option<PathBuf> {
             .map(|e| e.path())
             .filter(|p| {
                 p.is_file()
-                    && p.extension().map(|e| e.eq_ignore_ascii_case("exe")).unwrap_or(false)
+                    && p.extension()
+                        .map(|e| e.eq_ignore_ascii_case("exe"))
+                        .unwrap_or(false)
                     && p.file_name()
-                        .map(|n| n.to_string_lossy().to_ascii_lowercase().starts_with("usbip"))
+                        .map(|n| {
+                            n.to_string_lossy()
+                                .to_ascii_lowercase()
+                                .starts_with("usbip")
+                        })
                         .unwrap_or(false)
             })
             .collect();
@@ -114,7 +120,12 @@ pub fn find_usbip() -> Option<PathBuf> {
             }
         }
     }
-    for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+    for var in [
+        "ProgramFiles",
+        "ProgramW6432",
+        "ProgramFiles(x86)",
+        "LOCALAPPDATA",
+    ] {
         if let Some(base) = std::env::var_os(var) {
             let mut dir = PathBuf::from(base);
             if var == "LOCALAPPDATA" {
@@ -128,7 +139,9 @@ pub fn find_usbip() -> Option<PathBuf> {
             }
         }
     }
-    registry_install_dir().map(|d| d.join("usbip.exe")).filter(|p| p.is_file())
+    registry_install_dir()
+        .map(|d| d.join("usbip.exe"))
+        .filter(|p| p.is_file())
 }
 
 /// 从卸载注册表项读取安装目录（安装时若用户改过路径）
@@ -231,7 +244,11 @@ pub struct RunOutput {
 }
 
 /// 同步执行并捕获 stdout+stderr（带超时；Windows 下不弹控制台窗口）
-pub(crate) fn run_capture(program: &Path, args: &[String], timeout: Duration) -> Result<RunOutput, String> {
+pub(crate) fn run_capture(
+    program: &Path,
+    args: &[String],
+    timeout: Duration,
+) -> Result<RunOutput, String> {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdout(Stdio::piped())
@@ -313,15 +330,19 @@ pub(crate) fn attach_report_from(
         ..Default::default()
     };
     for (bus, o) in bus_ids.iter().zip(results) {
-        report
-            .log
-            .push_str(&format!("[attach {bus}] code={}\n{}\n", o.code, o.output.trim()));
+        report.log.push_str(&format!(
+            "[attach {bus}] code={}\n{}\n",
+            o.code,
+            o.output.trim()
+        ));
         match o.code {
             0 => {
                 let port = parse_attached_port(&o.output);
                 report.attached.push((bus.clone(), port));
             }
-            _ => report.failed.push((bus.clone(), o.output.trim().to_string())),
+            _ => report
+                .failed
+                .push((bus.clone(), o.output.trim().to_string())),
         }
     }
     if let Ok(list) = ports() {
@@ -361,13 +382,15 @@ fn run_elevated_sequence(
 
     let mut script = String::from("$ErrorActionPreference = 'Continue'\n");
     script.push_str("[Console]::OutputEncoding = [Text.Encoding]::UTF8\n");
-    script.push_str(&format!(
-        "$log = '{}'\n",
-        ps_quote(&log.to_string_lossy())
-    ));
+    script.push_str(&format!("$log = '{}'\n", ps_quote(&log.to_string_lossy())));
     for (i, args) in steps.iter().enumerate() {
-        script.push_str(&format!("Add-Content -LiteralPath $log -Value '@@STEP {i}'\n"));
-        script.push_str(&format!("$out = & '{}'", ps_quote(&program.to_string_lossy())));
+        script.push_str(&format!(
+            "Add-Content -LiteralPath $log -Value '@@STEP {i}'\n"
+        ));
+        script.push_str(&format!(
+            "$out = & '{}'",
+            ps_quote(&program.to_string_lossy())
+        ));
         for a in args {
             script.push_str(&format!(" '{}'", ps_quote(a)));
         }
@@ -378,7 +401,8 @@ fn run_elevated_sequence(
     }
     script.push_str("exit 0\n");
     // 带 BOM 写出，Windows PowerShell 5.1 才会按 UTF-8 解析含非 ASCII 的路径
-    std::fs::write(&ps1, format!("\u{FEFF}{script}")).map_err(|e| format!("写入提权脚本失败: {e}"))?;
+    std::fs::write(&ps1, format!("\u{FEFF}{script}"))
+        .map_err(|e| format!("写入提权脚本失败: {e}"))?;
 
     let elevated_cmd = format!(
         "$ErrorActionPreference='Stop'; try {{ $p = Start-Process -Verb RunAs -Wait -PassThru \
@@ -408,7 +432,13 @@ fn run_elevated_sequence(
         outer.code
     );
     if outer.code == 1223 {
-        return Ok(vec![RunOutput { code: 1223, output: String::new() }; steps.len()]);
+        return Ok(vec![
+            RunOutput {
+                code: 1223,
+                output: String::new()
+            };
+            steps.len()
+        ]);
     }
 
     let parsed: Vec<RunOutput> = parse_sequence_log(&output, steps.len())
@@ -417,7 +447,12 @@ fn run_elevated_sequence(
         .collect();
     for (i, step) in steps.iter().enumerate() {
         if let Some(o) = parsed.get(i) {
-            tracing::info!("  提权步骤 {i} [{}] → {}：{}", step.join(" "), o.code, o.output.trim());
+            tracing::info!(
+                "  提权步骤 {i} [{}] → {}：{}",
+                step.join(" "),
+                o.code,
+                o.output.trim()
+            );
         }
     }
     if outer.code != 0 {
@@ -461,7 +496,11 @@ pub fn ports() -> Result<Vec<AttachedPort>, String> {
     let exe = find_usbip().ok_or("未找到 usbip.exe，请先安装 USB/IP 驱动")?;
     let out = run_capture(&exe, &["port".into()], Duration::from_secs(20))?;
     if out.code != 0 {
-        tracing::warn!("usbip port 失败（退出码 {}）：{}", out.code, out.output.trim());
+        tracing::warn!(
+            "usbip port 失败（退出码 {}）：{}",
+            out.code,
+            out.output.trim()
+        );
         return Err(format!(
             "usbip port 失败（退出码 {}）：{}",
             out.code,
@@ -473,9 +512,8 @@ pub fn ports() -> Result<Vec<AttachedPort>, String> {
 
 /// 安装随包捆绑的 usbip-win2（提权静默安装）。返回安装程序输出。
 pub fn install_bundled() -> Result<String, String> {
-    let installer = bundled_installer().ok_or(
-        "未找到随包安装包（resources/drivers/usbip/USBip-*-x64.exe）",
-    )?;
+    let installer =
+        bundled_installer().ok_or("未找到随包安装包（resources/drivers/usbip/USBip-*-x64.exe）")?;
     tracing::info!("开始安装 USB/IP 驱动: {}", installer.display());
     let args: Vec<String> = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"]
         .iter()
@@ -529,11 +567,18 @@ pub(crate) fn detach_args_all() -> Vec<String> {
 /// 附加一条线缆（提权）
 pub fn attach(host: &str, tcp_port: u16, bus_id: &str) -> Result<String, String> {
     let exe = find_usbip().ok_or("未找到 usbip.exe，请先安装 USB/IP 驱动")?;
-    let out = run_elevated(&exe, &attach_args(host, tcp_port, bus_id), Duration::from_secs(120))?;
+    let out = run_elevated(
+        &exe,
+        &attach_args(host, tcp_port, bus_id),
+        Duration::from_secs(120),
+    )?;
     match out.code {
         0 => Ok(out.output),
         1223 => Err("已取消 UAC 授权".into()),
-        code => Err(format!("附加 {bus_id} 失败（退出码 {code}）：{}", out.output.trim())),
+        code => Err(format!(
+            "附加 {bus_id} 失败（退出码 {code}）：{}",
+            out.output.trim()
+        )),
     }
 }
 
@@ -548,7 +593,10 @@ pub fn detach_all() -> Result<String, String> {
             if is_nothing_to_detach(&out.output) {
                 Ok(out.output)
             } else {
-                Err(format!("断开全部端口失败（退出码 {code}）：{}", out.output.trim()))
+                Err(format!(
+                    "断开全部端口失败（退出码 {code}）：{}",
+                    out.output.trim()
+                ))
             }
         }
     }
@@ -571,7 +619,12 @@ pub fn detach_ports(port_list: &[u32]) -> Result<String, String> {
     let mut log = String::new();
     let mut failures: Vec<String> = Vec::new();
     for (i, o) in results.into_iter().enumerate() {
-        log.push_str(&format!("[detach -p {}] code={}\n{}\n", port_list[i], o.code, o.output.trim()));
+        log.push_str(&format!(
+            "[detach -p {}] code={}\n{}\n",
+            port_list[i],
+            o.code,
+            o.output.trim()
+        ));
         match o.code {
             0 => {}
             1223 => return Err("已取消 UAC 授权".into()),
@@ -608,7 +661,11 @@ pub fn attach_all(host: &str, tcp_port: u16, bus_ids: &[String]) -> Result<Attac
         if o.code == 1223 {
             return Err("已取消 UAC 授权".into());
         }
-        report.log.push_str(&format!("[detach --all] code={}\n{}\n", o.code, o.output.trim()));
+        report.log.push_str(&format!(
+            "[detach --all] code={}\n{}\n",
+            o.code,
+            o.output.trim()
+        ));
     }
 
     // 逐条附加
@@ -616,15 +673,22 @@ pub fn attach_all(host: &str, tcp_port: u16, bus_ids: &[String]) -> Result<Attac
         match iter.next() {
             Some(o) if o.code == 0 => {
                 let port = parse_attached_port(&o.output);
-                report.log.push_str(&format!("[attach {bus}] code=0 port={port:?}\n{}\n", o.output.trim()));
+                report.log.push_str(&format!(
+                    "[attach {bus}] code=0 port={port:?}\n{}\n",
+                    o.output.trim()
+                ));
                 report.attached.push((bus.clone(), port));
             }
             Some(o) if o.code == 1223 => return Err("已取消 UAC 授权".into()),
             Some(o) => {
+                report.log.push_str(&format!(
+                    "[attach {bus}] code={}\n{}\n",
+                    o.code,
+                    o.output.trim()
+                ));
                 report
-                    .log
-                    .push_str(&format!("[attach {bus}] code={}\n{}\n", o.code, o.output.trim()));
-                report.failed.push((bus.clone(), o.output.trim().to_string()));
+                    .failed
+                    .push((bus.clone(), o.output.trim().to_string()));
             }
             None => {
                 let e = "提权脚本未返回该步骤结果".to_string();
@@ -696,8 +760,14 @@ Port 00: <Port in Use> at High Speed(480Mbps)
 
     #[test]
     fn parses_attached_port_from_attach_output() {
-        assert_eq!(parse_attached_port("succesfully attached to port 1\n"), Some(1));
-        assert_eq!(parse_attached_port("successfully attached to port 12"), Some(12));
+        assert_eq!(
+            parse_attached_port("succesfully attached to port 1\n"),
+            Some(1)
+        );
+        assert_eq!(
+            parse_attached_port("successfully attached to port 12"),
+            Some(12)
+        );
         assert_eq!(parse_attached_port("12\n"), Some(12));
         assert_eq!(parse_attached_port("error: cannot connect"), None);
     }
@@ -710,7 +780,15 @@ Port 00: <Port in Use> at High Speed(480Mbps)
         let b = attach_args("127.0.0.1", 4000, "1-3");
         assert_eq!(
             b,
-            vec!["--tcp-port", "4000", "attach", "-r", "127.0.0.1", "-b", "1-3"]
+            vec![
+                "--tcp-port",
+                "4000",
+                "attach",
+                "-r",
+                "127.0.0.1",
+                "-b",
+                "1-3"
+            ]
         );
     }
 

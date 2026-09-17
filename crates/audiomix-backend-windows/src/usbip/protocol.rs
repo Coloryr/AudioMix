@@ -181,7 +181,8 @@ pub async fn read_iso_packets(
     r.read_exact(&mut raw).await?;
     let mut packets = Vec::with_capacity(count as usize);
     for chunk in raw.chunks_exact(16) {
-        let be32 = |o: usize| u32::from_be_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]]);
+        let be32 =
+            |o: usize| u32::from_be_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]]);
         packets.push(IsoPacket {
             offset: be32(0),
             length: be32(4),
@@ -276,7 +277,13 @@ mod tests {
     async fn ret_submit_roundtrip() {
         let mut v = Vec::new();
         let req = SubmitRequest {
-            basic: BasicHeader { command: CMD_SUBMIT, sequence: 42, device_id: 1, direction: DIRECTION_IN, endpoint: 2 },
+            basic: BasicHeader {
+                command: CMD_SUBMIT,
+                sequence: 42,
+                device_id: 1,
+                direction: DIRECTION_IN,
+                endpoint: 2,
+            },
             transfer_flags: 0,
             transfer_buffer_length: 192,
             start_frame: 7,
@@ -285,7 +292,12 @@ mod tests {
             setup: [0u8; 8],
         };
         let packets: Vec<IsoPacket> = (0..10)
-            .map(|i| IsoPacket { offset: i * 192, length: 192, actual_length: 192, status: 0 })
+            .map(|i| IsoPacket {
+                offset: i * 192,
+                length: 192,
+                actual_length: 192,
+                status: 0,
+            })
             .collect();
         write_ret_submit(&mut v, &req, STATUS_OK, 192, &[0xAB; 192], &packets, 0)
             .await

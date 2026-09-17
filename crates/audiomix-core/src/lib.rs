@@ -15,9 +15,10 @@ pub mod ring;
 pub mod testing;
 
 pub use backend::{
-    AudioBackend, CaptureCallback, CompositeBackend, RenderCallback, StartedStream, StreamHandle, StreamInfo,
+    AudioBackend, CaptureCallback, CompositeBackend, RenderCallback, StartedStream, StreamHandle,
+    StreamInfo,
 };
-pub use engine::{Engine, EngineEvent, make_processor};
+pub use engine::{make_processor, Engine, EngineEvent};
 pub use error::{Error, Result};
 pub use model::{
     ControlApiSettings, DeviceInfo, DeviceKind, DspKind, DspNode, GraphConfig, GraphSettings,

@@ -25,7 +25,7 @@ use crate::dsp::DspChain;
 use crate::error::{Error, Result};
 use crate::mixer::{convert_channels, mix_into, peak_of, soft_clip};
 use crate::model::{
-    DeviceInfo, DeviceKind, DspNode, GraphConfig, Id, Processor, SourceMode, Route, Sink, Source,
+    DeviceInfo, DeviceKind, DspNode, GraphConfig, Id, Processor, Route, Sink, Source, SourceMode,
 };
 use crate::resample::{PullResampler, ResamplerQuality};
 use crate::ring::{new_edge_ring, EdgeReader, EdgeRing, EdgeWriter};
@@ -218,16 +218,19 @@ impl Engine {
     /// 引擎实例释放（Arc 归零）后线程自动退出。
     fn spawn_device_watchdog(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
-        if let Err(e) = std::thread::Builder::new().name("device-watchdog".into()).spawn(move || {
-            loop {
-                std::thread::sleep(DEVICE_WATCHDOG_INTERVAL);
-                // 睡醒后引擎可能已被释放（应用退出/测试结束）
-                let Some(engine) = weak.upgrade() else { break };
-                if let Err(e) = engine.refresh_devices() {
-                    tracing::debug!("设备看门狗枚举失败（下一轮重试）: {e}");
+        if let Err(e) = std::thread::Builder::new()
+            .name("device-watchdog".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(DEVICE_WATCHDOG_INTERVAL);
+                    // 睡醒后引擎可能已被释放（应用退出/测试结束）
+                    let Some(engine) = weak.upgrade() else { break };
+                    if let Err(e) = engine.refresh_devices() {
+                        tracing::debug!("设备看门狗枚举失败（下一轮重试）: {e}");
+                    }
                 }
-            }
-        }) {
+            })
+        {
             tracing::warn!("设备看门狗线程启动失败（热插拔后需手动刷新设备）: {e}");
         }
     }
@@ -437,7 +440,11 @@ impl Engine {
                 SourceMode::Loopback => self.backend.start_loopback(&src.device_id, cb),
             }
             .map_err(|e| {
-                tracing::error!("启动采集流失败 (source={}, dev={}): {e}", src.id, src.device_id);
+                tracing::error!(
+                    "启动采集流失败 (source={}, dev={}): {e}",
+                    src.id,
+                    src.device_id
+                );
                 e
             })?;
             tracing::info!(
@@ -473,7 +480,11 @@ impl Engine {
                 continue;
             };
             if dev.kind != DeviceKind::Output {
-                tracing::warn!("sink {}: 设备 {} 不是输出设备，跳过", sink.id, sink.device_id);
+                tracing::warn!(
+                    "sink {}: 设备 {} 不是输出设备，跳过",
+                    sink.id,
+                    sink.device_id
+                );
                 continue;
             }
             if let Some(h) = inner.sinks.remove(&sink.id) {
@@ -500,7 +511,11 @@ impl Engine {
                 .backend
                 .start_render(&sink.device_id, cb)
                 .map_err(|e| {
-                    tracing::error!("启动渲染流失败 (sink={}, dev={}): {e}", sink.id, sink.device_id);
+                    tracing::error!(
+                        "启动渲染流失败 (sink={}, dev={}): {e}",
+                        sink.id,
+                        sink.device_id
+                    );
                     e
                 })?;
             info_rate.store(started.info.sample_rate, Ordering::Release);
@@ -544,14 +559,16 @@ impl Engine {
                 }
                 None => {
                     let src = &inner.sources[&path.source_id];
-                    let cap_frames =
-                        src.info.sample_rate as usize * inner.edge_capacity_ms / 1000;
+                    let cap_frames = src.info.sample_rate as usize * inner.edge_capacity_ms / 1000;
                     peak = Arc::new(AtomicU32::new(0));
                     new_edge_ring(cap_frames, src.info.channels as usize)
                 }
             };
             for pid in &path.proc_ids {
-                proc_peaks.entry(pid.clone()).or_default().push(peak.clone());
+                proc_peaks
+                    .entry(pid.clone())
+                    .or_default()
+                    .push(peak.clone());
             }
             new_edges.insert(path.key.clone(), EdgeHandle { ring, peak });
         }
@@ -694,7 +711,16 @@ fn resolve_paths(config: &GraphConfig) -> Vec<ResolvedPath> {
             let mut branches = 0;
             for up in config.routes.iter().filter(|w| &w.sink_id == cur) {
                 branches += 1;
-                walk(config, &up.source_id, chain, ids, gain * up.gain, muted || up.muted, &visiting, out);
+                walk(
+                    config,
+                    &up.source_id,
+                    chain,
+                    ids,
+                    gain * up.gain,
+                    muted || up.muted,
+                    &visiting,
+                    out,
+                );
             }
             if pushed {
                 chain.pop();
@@ -712,10 +738,21 @@ fn resolve_paths(config: &GraphConfig) -> Vec<ResolvedPath> {
     for sink in &config.sinks {
         for r in config.routes.iter().filter(|r| &r.sink_id == &sink.id) {
             let mut paths: Vec<(Id, Vec<DspNode>, Vec<Id>, f32, bool)> = Vec::new();
-            let visiting: std::collections::HashSet<&str> = [sink.id.as_str()].into_iter().collect();
-            walk(config, &r.source_id, &mut Vec::new(), &mut Vec::new(), r.gain, r.muted, &visiting, &mut paths);
+            let visiting: std::collections::HashSet<&str> =
+                [sink.id.as_str()].into_iter().collect();
+            walk(
+                config,
+                &r.source_id,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                r.gain,
+                r.muted,
+                &visiting,
+                &mut paths,
+            );
             // walk 是从 sink 往上游走的，链序反了 → 翻回「源 → 汇」
-            for (idx, (source_id, mut nodes, mut ids, gain, muted)) in paths.into_iter().enumerate() {
+            for (idx, (source_id, mut nodes, mut ids, gain, muted)) in paths.into_iter().enumerate()
+            {
                 nodes.reverse();
                 ids.reverse();
                 out.push(ResolvedPath {
@@ -807,15 +844,17 @@ fn make_render_callback(
 
         for e in edges {
             let created = !states.contains_key(&e.route_id);
-            let st = states
-                .entry(e.route_id.clone())
-                .or_insert_with(|| {
-                    SinkEdgeState::new(e.src_rate, out_rate, e.src_ch, rt.resample_quality)
-                });
+            let st = states.entry(e.route_id.clone()).or_insert_with(|| {
+                SinkEdgeState::new(e.src_rate, out_rate, e.src_ch, rt.resample_quality)
+            });
             // 快照里的质量档位变了 → 重建该边重采样器（设置切换即时生效）
             if st.quality != rt.resample_quality {
                 *st = SinkEdgeState::new(e.src_rate, out_rate, e.src_ch, rt.resample_quality);
-                tracing::info!("路由 {} 重采样质量切换为 {:?}", e.route_id, rt.resample_quality);
+                tracing::info!(
+                    "路由 {} 重采样质量切换为 {:?}",
+                    e.route_id,
+                    rt.resample_quality
+                );
             } else if created {
                 tracing::info!(
                     "路由 {} 重采样器: {}Hz/{}ch → {}Hz/{}ch（step={:.6}）",
@@ -861,7 +900,8 @@ fn make_render_callback(
                 if !st.dsp.is_empty() {
                     st.dsp.process(&mut converted);
                 }
-                e.peak.store(peak_of(&converted).to_bits(), Ordering::Relaxed);
+                e.peak
+                    .store(peak_of(&converted).to_bits(), Ordering::Relaxed);
                 mix_into(out, &converted, gain);
                 st.converted = converted;
             }
@@ -911,7 +951,10 @@ pub fn make_sink(device_id: &str, name: &str) -> Sink {
 
 /// 便捷构造（供控制层使用）：画布上的 DSP 处理方块
 pub fn make_processor(node: DspNode) -> Processor {
-    Processor { id: new_id("dsp"), node }
+    Processor {
+        id: new_id("dsp"),
+        node,
+    }
 }
 
 /// 便捷构造（供控制层使用）

@@ -15,8 +15,8 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use audiomix_core::backend::{RenderCallback, StartedStream, StreamHandle};
 use audiomix_core::error::{Error, Result};
 
-use super::device::{com_init, mix_format_of_by_id};
 use super::capture::check_float_format;
+use super::device::{com_init, mix_format_of_by_id};
 
 /// 共享模式缓冲时长。原来 200ms；实测这一项直接叠加到端到端延迟上，
 /// 50ms 足够（事件回调 + MMCSS 下不会欠载），同时把延迟砍掉约 150ms。
@@ -40,7 +40,11 @@ pub fn start_render(device_id: &str, on_fill: RenderCallback) -> Result<StartedS
     Ok(StartedStream { info, handle })
 }
 
-fn render_thread(device_id: &HSTRING, stop: Arc<AtomicBool>, mut on_fill: RenderCallback) -> Result<()> {
+fn render_thread(
+    device_id: &HSTRING,
+    stop: Arc<AtomicBool>,
+    mut on_fill: RenderCallback,
+) -> Result<()> {
     com_init();
     unsafe {
         let enumerator: IMMDeviceEnumerator =
@@ -86,7 +90,9 @@ fn render_thread(device_id: &HSTRING, stop: Arc<AtomicBool>, mut on_fill: Render
                 continue; // 超时，回头检查 stop 标志
             }
             gap.tick("渲染");
-            let Ok(padding) = client.GetCurrentPadding() else { continue };
+            let Ok(padding) = client.GetCurrentPadding() else {
+                continue;
+            };
             let avail = buffer_frames.saturating_sub(padding as usize);
             if avail == 0 {
                 continue;
@@ -96,8 +102,7 @@ fn render_thread(device_id: &HSTRING, stop: Arc<AtomicBool>, mut on_fill: Render
                 Err(_) => continue,
             };
             if !data.is_null() {
-                let slice =
-                    std::slice::from_raw_parts_mut(data as *mut f32, avail * channels);
+                let slice = std::slice::from_raw_parts_mut(data as *mut f32, avail * channels);
                 on_fill(slice);
             }
             let _ = render.ReleaseBuffer(avail as u32, 0);

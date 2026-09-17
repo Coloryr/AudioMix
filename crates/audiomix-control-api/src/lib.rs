@@ -6,12 +6,12 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use audiomix_core::engine::EngineEvent;
+use audiomix_core::{Engine, GraphConfig};
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
-use audiomix_core::engine::EngineEvent;
-use audiomix_core::{Engine, GraphConfig};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
@@ -99,11 +99,7 @@ async fn put_graph(
 }
 
 async fn status(State(st): State<ApiState>) -> Json<serde_json::Value> {
-    let levels: HashMap<String, f32> = st
-        .engine
-        .levels()
-        .into_iter()
-        .collect();
+    let levels: HashMap<String, f32> = st.engine.levels().into_iter().collect();
     Json(serde_json::json!({
         "backend": st.engine.backend_name(),
         "levels": levels,
@@ -114,8 +110,8 @@ async fn status(State(st): State<ApiState>) -> Json<serde_json::Value> {
 async fn events(
     State(st): State<ApiState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
-    use tokio_stream::StreamExt;
     use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::StreamExt;
     let rx = st.engine.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|res| match res {
         Ok(ev) => {
@@ -124,9 +120,9 @@ async fn events(
                 EngineEvent::DevicesChanged => "devices_changed",
                 EngineEvent::Underrun { .. } => "underrun",
             };
-            Some(Ok(Event::default().event(name).data(
-                serde_json::to_string(&ev).unwrap_or_default(),
-            )))
+            Some(Ok(Event::default()
+                .event(name)
+                .data(serde_json::to_string(&ev).unwrap_or_default())))
         }
         Err(_) => None, // lagged：跳过错过的旧事件
     });

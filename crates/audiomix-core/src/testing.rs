@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::backend::{AudioBackend, CaptureCallback, RenderCallback, StartedStream, StreamHandle, StreamInfo};
+use crate::backend::{
+    AudioBackend, CaptureCallback, RenderCallback, StartedStream, StreamHandle, StreamInfo,
+};
 use crate::error::Result;
 use crate::model::{looks_virtual, DeviceInfo, DeviceKind};
 
@@ -148,7 +150,11 @@ impl AudioBackend for FakeBackend {
         Ok(self.devices.clone())
     }
 
-    fn start_capture(&self, device_id: &str, mut on_data: CaptureCallback) -> Result<StartedStream> {
+    fn start_capture(
+        &self,
+        device_id: &str,
+        mut on_data: CaptureCallback,
+    ) -> Result<StartedStream> {
         let dev = self.find(device_id)?;
         let data = self
             .capture_data

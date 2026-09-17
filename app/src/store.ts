@@ -9,6 +9,8 @@ export const useApp = defineStore("app", {
     devices: [] as DeviceInfo[],
     graph: { sources: [], sinks: [], routes: [], processors: [] } as GraphConfig,
     levels: {} as Record<string, number>,
+    /** 是否已向后端订阅电平推送 */
+    levelsWatching: false,
     settings: {
       control_api: { enabled: false, bind: "127.0.0.1", port: 17643 },
       usbip: { enabled: false, bind: "127.0.0.1:3240", cables: [] },
@@ -16,6 +18,7 @@ export const useApp = defineStore("app", {
       close_to_tray: true,
       resample_quality: "sinc256",
       edge_buffer_ms: 250,
+      levels_interval_ms: 50,
     } as Settings,
     autostart: false,
     apiStatus: { running: false, addr: null } as ApiStatus,
@@ -56,8 +59,21 @@ export const useApp = defineStore("app", {
     async saveGraph() {
       this.graph = await api.applyGraph(this.graph);
     },
-    async pollLevels() {
-      this.levels = await api.getLevels();
+    /** 订阅后端电平推送（Channel，后端 ~20fps 主动推）。重复调用会被忽略 */
+    async watchLevels() {
+      if (this.levelsWatching) return;
+      this.levelsWatching = true;
+      // 不能按「值没变就跳过」优化：MeterBar 的峰值回落靠 level 持续更新驱动，
+      // 跳过更新会把峰值标记冻在半空
+      await api.subscribeLevels((levels) => {
+        this.levels = levels;
+      });
+    },
+    /** 取消电平推送（切走页签/窗口隐藏时调用，省掉后端序列化） */
+    async unwatchLevels() {
+      if (!this.levelsWatching) return;
+      this.levelsWatching = false;
+      await api.unsubscribeLevels().catch(() => { });
     },
     deviceName(id: string): string {
       const d = this.devices.find((x) => x.id === id);

@@ -1,10 +1,15 @@
 //! WASAPI 设备枚举与格式查询（MMDevice API）。
 
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Media::Audio::{eCapture, eConsole, eRender, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE};
 use windows::Win32::Media::Audio::IAudioClient;
+use windows::Win32::Media::Audio::{
+    eCapture, eConsole, eRender, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+    DEVICE_STATE_ACTIVE,
+};
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
+};
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
@@ -46,7 +51,9 @@ pub fn enumerate_devices() -> Result<Vec<DeviceInfo>> {
             let count = coll.GetCount().map_err(Error::backend)?;
             for i in 0..count {
                 let Ok(dev) = coll.Item(i) else { continue };
-                let Some(id) = device_id_of(&dev).ok() else { continue };
+                let Some(id) = device_id_of(&dev).ok() else {
+                    continue;
+                };
                 let name = device_name_of(&dev).unwrap_or_else(|_| id.clone());
                 let (ch, rate) = mix_format_of(&dev).unwrap_or((2, 48000));
                 out.push(DeviceInfo {
@@ -95,7 +102,9 @@ unsafe fn device_id_of(dev: &IMMDevice) -> Result<String> {
 
 unsafe fn device_name_of(dev: &IMMDevice) -> Result<String> {
     let store: IPropertyStore = dev.OpenPropertyStore(STGM_READ).map_err(Error::backend)?;
-    let pv = store.GetValue(&PKEY_Device_FriendlyName).map_err(Error::backend)?;
+    let pv = store
+        .GetValue(&PKEY_Device_FriendlyName)
+        .map_err(Error::backend)?;
     Ok(propvariant_string(&pv).unwrap_or_default())
 }
 

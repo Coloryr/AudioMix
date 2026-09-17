@@ -110,14 +110,24 @@ pub enum DspKind {
         high_freq: f32,
     },
     /// 单段峰式均衡
-    PeakEq { freq: f32, gain_db: f32, q: f32 },
+    PeakEq {
+        freq: f32,
+        gain_db: f32,
+        q: f32,
+    },
     /// 图形 EQ：10 段固定中心频率（31.25Hz..16kHz，1/3 倍频程）各自增益
     GraphEq {
         /// 长度 10（低 → 高），-24 ..= 24 dB
         gains_db: [f32; 10],
     },
-    Highpass { freq: f32, q: f32 },
-    Lowpass { freq: f32, q: f32 },
+    Highpass {
+        freq: f32,
+        q: f32,
+    },
+    Lowpass {
+        freq: f32,
+        q: f32,
+    },
     /// 带通：用「起始/终止频率」定义（中心 = 几何平均，Q = 中心/带宽）。
     /// 旧字段 freq/q（单频点+Q）不再使用；缺字段时按默认值补齐以兼容旧配置。
     Bandpass {
@@ -128,6 +138,13 @@ pub enum DspKind {
     },
     /// 开关节点：开 = 直通，关 = 静音（与其它节点的旁路不同，关掉是切信号不是跳过）
     Switch,
+    /// 限幅器：峰值包络检测 + 增益衰减，防止信号超过阈值削波
+    Limiter {
+        /// -24 ..= 0 dB（线性阈值 = 10^(db/20)）
+        threshold_db: f32,
+        /// 增益包络的释放时间 10 ..= 500 ms（衰减太快泵感明显，太慢压住下一个峰）
+        release_ms: f32,
+    },
 }
 
 fn default_band_low() -> f32 {
@@ -140,8 +157,9 @@ fn default_band_high() -> f32 {
 
 impl DspKind {
     /// 图形 EQ 的 10 段中心频率（1/3 倍频程）
-    pub const GRAPH_EQ_BANDS: [f32; 10] =
-        [31.25, 62.5, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+    pub const GRAPH_EQ_BANDS: [f32; 10] = [
+        31.25, 62.5, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+    ];
 
     /// UI/加载共用的参数钳制：超范围值拉回边界（防 NaN/极端值进滤波器）。
     pub fn clamp_params(&mut self) {
@@ -180,7 +198,10 @@ impl DspKind {
                 *freq = cl(*freq, 20.0, 20000.0);
                 *q = cl(*q, 0.3, 10.0);
             }
-            DspKind::Bandpass { low_freq, high_freq } => {
+            DspKind::Bandpass {
+                low_freq,
+                high_freq,
+            } => {
                 *low_freq = cl(*low_freq, 20.0, 19_000.0);
                 *high_freq = cl(*high_freq, 30.0, 20_000.0);
                 // 终止频率至少比起始高 10Hz（几何平均/带宽计算需要 high > low）
@@ -189,6 +210,13 @@ impl DspKind {
                 }
             }
             DspKind::Switch => {}
+            DspKind::Limiter {
+                threshold_db,
+                release_ms,
+            } => {
+                *threshold_db = cl(*threshold_db, -24.0, 0.0);
+                *release_ms = cl(*release_ms, 10.0, 500.0);
+            }
         }
     }
 }
@@ -547,7 +575,10 @@ impl UsbIpSettings {
         for c in &self.cables {
             c.validate()?;
             if !seen.insert(c.number) {
-                return Err(crate::Error::InvalidSettings(format!("线缆号 {} 重复", c.number)));
+                return Err(crate::Error::InvalidSettings(format!(
+                    "线缆号 {} 重复",
+                    c.number
+                )));
             }
         }
         Ok(())
@@ -566,7 +597,10 @@ impl UsbIpSettings {
     /// 载入旧配置时把超出内置线路规格的线缆降到可用组合；
     /// 返回每条被改动线缆的说明，交给界面/日志提示用户。
     pub fn clamp_cables_to_supported(&mut self) -> Vec<String> {
-        self.cables.iter_mut().filter_map(|c| c.clamp_supported()).collect()
+        self.cables
+            .iter_mut()
+            .filter_map(|c| c.clamp_supported())
+            .collect()
     }
 }
 
@@ -589,6 +623,8 @@ pub struct Settings {
     pub resample_quality: ResamplerQuality,
     /// 边环形缓冲容量（ms，钳制 50..=1000；加大更抗卡顿，不影响日常延迟）
     pub edge_buffer_ms: u32,
+    /// 电平推送间隔（ms，钳制 20..=500）：后端向前端推电平的频率，越小电平条越顺滑、CPU 略高
+    pub levels_interval_ms: u64,
 }
 
 impl Default for Settings {
@@ -602,6 +638,7 @@ impl Default for Settings {
             default_input: None,
             resample_quality: ResamplerQuality::default(),
             edge_buffer_ms: 250,
+            levels_interval_ms: 50,
         }
     }
 }
@@ -670,7 +707,10 @@ mod tests {
             }],
             processors: vec![Processor {
                 id: "p1".into(),
-                node: DspNode { kind: DspKind::Gain { db: 0.0 }, enabled: true },
+                node: DspNode {
+                    kind: DspKind::Gain { db: 0.0 },
+                    enabled: true,
+                },
             }],
         }
     }
@@ -716,7 +756,10 @@ mod tests {
         let mut g = valid_graph();
         g.processors.push(Processor {
             id: "p1".into(),
-            node: DspNode { kind: DspKind::Gain { db: 0.0 }, enabled: true },
+            node: DspNode {
+                kind: DspKind::Gain { db: 0.0 },
+                enabled: true,
+            },
         });
         assert!(matches!(g.validate(), Err(crate::Error::InvalidGraph(_))));
     }
@@ -736,7 +779,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.id, "dsp-x");
-        assert_eq!(p.node.kind, DspKind::PeakEq { freq: 1000.0, gain_db: 3.0, q: 1.0 });
+        assert_eq!(
+            p.node.kind,
+            DspKind::PeakEq {
+                freq: 1000.0,
+                gain_db: 3.0,
+                q: 1.0
+            }
+        );
 
         // enabled 缺省 = true
         let n: DspNode = serde_json::from_str(r#"{"type":"delay","ms":50}"#).unwrap();
@@ -766,7 +816,9 @@ mod tests {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.control_api.port, 17643);
         assert!(s.close_to_tray);
-        let s: Settings = serde_json::from_str(r#"{"control_api":{"enabled":true,"bind":"0.0.0.0","port":1}}"#).unwrap();
+        let s: Settings =
+            serde_json::from_str(r#"{"control_api":{"enabled":true,"bind":"0.0.0.0","port":1}}"#)
+                .unwrap();
         assert!(s.control_api.enabled);
         assert_eq!(s.control_api.port, 1);
         assert!(s.close_to_tray, "未指定的字段应取默认值");
@@ -835,7 +887,11 @@ mod tests {
             (UsbIpCableMode::Reverse, "reverse"),
             (UsbIpCableMode::Mixer, "mixer"),
         ] {
-            let c = UsbIpCableSettings { number: 2, mode, ..Default::default() };
+            let c = UsbIpCableSettings {
+                number: 2,
+                mode,
+                ..Default::default()
+            };
             let json = serde_json::to_string(&c).unwrap();
             assert!(json.contains(&format!("\"{text}\"")), "{json}");
             let back: UsbIpCableSettings = serde_json::from_str(&json).unwrap();
@@ -848,24 +904,44 @@ mod tests {
 
     #[test]
     fn cable_display_name_falls_back_to_number() {
-        let c = UsbIpCableSettings { number: 7, ..Default::default() };
+        let c = UsbIpCableSettings {
+            number: 7,
+            ..Default::default()
+        };
         assert_eq!(c.display_name(), "Virtual Cable 07");
-        let c = UsbIpCableSettings { number: 7, name: "    ".into(), ..Default::default() };
+        let c = UsbIpCableSettings {
+            number: 7,
+            name: "    ".into(),
+            ..Default::default()
+        };
         assert_eq!(c.display_name(), "Virtual Cable 07", "空白名视为未命名");
-        let c = UsbIpCableSettings { number: 7, name: "  直播线  ".into(), ..Default::default() };
+        let c = UsbIpCableSettings {
+            number: 7,
+            name: "  直播线  ".into(),
+            ..Default::default()
+        };
         assert_eq!(c.display_name(), "直播线", "两端空白应去掉");
     }
 
     #[test]
     fn cable_name_is_validated() {
-        let ok = UsbIpCableSettings { name: "あ".repeat(UsbIpCableSettings::MAX_NAME_CHARS), ..Default::default() };
+        let ok = UsbIpCableSettings {
+            name: "あ".repeat(UsbIpCableSettings::MAX_NAME_CHARS),
+            ..Default::default()
+        };
         assert!(ok.validate().is_ok(), "上限内应通过（按字符而非字节计）");
         let too_long = UsbIpCableSettings {
             name: "x".repeat(UsbIpCableSettings::MAX_NAME_CHARS + 1),
             ..Default::default()
         };
-        assert!(matches!(too_long.validate(), Err(crate::Error::InvalidSettings(_))));
-        let control = UsbIpCableSettings { name: "a\nb".into(), ..Default::default() };
+        assert!(matches!(
+            too_long.validate(),
+            Err(crate::Error::InvalidSettings(_))
+        ));
+        let control = UsbIpCableSettings {
+            name: "a\nb".into(),
+            ..Default::default()
+        };
         assert!(control.validate().is_err(), "控制字符应被拒绝");
     }
 
@@ -898,7 +974,10 @@ mod tests {
         let legacy: UsbIpCableSettings =
             serde_json::from_str(r#"{"number":1,"sample_rate":48000,"bits":16,"protocol":"uac2"}"#)
                 .unwrap();
-        assert_eq!((legacy.number, legacy.sample_rate, legacy.bits), (1, 48_000, 16));
+        assert_eq!(
+            (legacy.number, legacy.sample_rate, legacy.bits),
+            (1, 48_000, 16)
+        );
         assert!(legacy.validate().is_ok());
     }
 
@@ -924,14 +1003,23 @@ mod tests {
             (88_200, 32),
             (96_000, 16),
         ] {
-            let cfg = UsbIpCableSettings { number: 1, sample_rate: rate, bits, ..Default::default() };
+            let cfg = UsbIpCableSettings {
+                number: 1,
+                sample_rate: rate,
+                bits,
+                ..Default::default()
+            };
             assert!(cfg.validate().is_ok(), "{rate}/{bits} 应合法");
         }
         // 96 kHz 以上一律拒绝（实测主机侧 ISO OUT 无法稳定承载，见 TASK.md P1）
         for rate in [176_400u32, 192_000] {
             for bits in [16u16, 24, 32] {
-                let cfg =
-                    UsbIpCableSettings { number: 1, sample_rate: rate, bits, ..Default::default() };
+                let cfg = UsbIpCableSettings {
+                    number: 1,
+                    sample_rate: rate,
+                    bits,
+                    ..Default::default()
+                };
                 assert!(
                     matches!(cfg.validate(), Err(crate::Error::InvalidSettings(_))),
                     "{rate}/{bits} 必须被拒绝（超出内置线路规格）"
@@ -941,7 +1029,12 @@ mod tests {
         }
         // 88.2k 以上只支持 16bit：双向（OUT+IN 同帧）96k/24 = 1152 B/ms 超全速帧预算
         for bits in [24u16, 32] {
-            let cfg = UsbIpCableSettings { number: 1, sample_rate: 96_000, bits, ..Default::default() };
+            let cfg = UsbIpCableSettings {
+                number: 1,
+                sample_rate: 96_000,
+                bits,
+                ..Default::default()
+            };
             assert!(
                 matches!(cfg.validate(), Err(crate::Error::InvalidSettings(_))),
                 "96k/{bits} 必须被拒绝（双向带宽超限）"
@@ -953,52 +1046,105 @@ mod tests {
     #[test]
     fn usbip_cable_clamps_unsupported_format() {
         // 旧配置里可能是 192k/24（当年 UAC2 规划的规格）：载入时应降级而不是报错
-        let mut c =
-            UsbIpCableSettings { number: 2, sample_rate: 192_000, bits: 24, ..Default::default() };
+        let mut c = UsbIpCableSettings {
+            number: 2,
+            sample_rate: 192_000,
+            bits: 24,
+            ..Default::default()
+        };
         let note = c.clamp_supported().expect("应给出降级说明");
         assert!(note.contains("192000/24bit"), "{note}");
-        assert_eq!((c.sample_rate, c.bits), (96_000, 16), "96k 只支持 16bit，位深一并降级");
+        assert_eq!(
+            (c.sample_rate, c.bits),
+            (96_000, 16),
+            "96k 只支持 16bit，位深一并降级"
+        );
         assert!(c.validate().is_ok());
         // 96k/24 同样要降到 96k/16
-        let mut hi = UsbIpCableSettings { number: 1, sample_rate: 96_000, bits: 24, ..Default::default() };
+        let mut hi = UsbIpCableSettings {
+            number: 1,
+            sample_rate: 96_000,
+            bits: 24,
+            ..Default::default()
+        };
         assert!(hi.clamp_supported().is_some());
         assert_eq!((hi.sample_rate, hi.bits), (96_000, 16));
         // 合法组合不该被改动
-        let mut ok = UsbIpCableSettings { number: 1, sample_rate: 96_000, bits: 16, ..Default::default() };
+        let mut ok = UsbIpCableSettings {
+            number: 1,
+            sample_rate: 96_000,
+            bits: 16,
+            ..Default::default()
+        };
         assert!(ok.clamp_supported().is_none());
         assert_eq!((ok.sample_rate, ok.bits), (96_000, 16));
         // 垃圾值兜底
-        let mut bad = UsbIpCableSettings { number: 1, sample_rate: 1, bits: 9, ..Default::default() };
+        let mut bad = UsbIpCableSettings {
+            number: 1,
+            sample_rate: 1,
+            bits: 9,
+            ..Default::default()
+        };
         assert!(bad.clamp_supported().is_some());
         assert!(bad.validate().is_ok(), "{:?}", (bad.sample_rate, bad.bits));
     }
 
     #[test]
     fn usbip_validate_rejects_bad_format() {
-        let bad_rate = UsbIpCableSettings { sample_rate: 8_000, ..Default::default() };
-        assert!(matches!(bad_rate.validate(), Err(crate::Error::InvalidSettings(_))));
-        let bad_bits = UsbIpCableSettings { bits: 8, ..Default::default() };
+        let bad_rate = UsbIpCableSettings {
+            sample_rate: 8_000,
+            ..Default::default()
+        };
+        assert!(matches!(
+            bad_rate.validate(),
+            Err(crate::Error::InvalidSettings(_))
+        ));
+        let bad_bits = UsbIpCableSettings {
+            bits: 8,
+            ..Default::default()
+        };
         assert!(bad_bits.validate().is_err());
-        let bad_number = UsbIpCableSettings { number: 0, ..Default::default() };
+        let bad_number = UsbIpCableSettings {
+            number: 0,
+            ..Default::default()
+        };
         assert!(bad_number.validate().is_err());
-        let bad_buffer = UsbIpCableSettings { buffer_ms: 1, ..Default::default() };
+        let bad_buffer = UsbIpCableSettings {
+            buffer_ms: 1,
+            ..Default::default()
+        };
         assert!(bad_buffer.validate().is_err());
     }
 
     #[test]
     fn usbip_validate_rejects_duplicates_and_overflow() {
-        let cable = UsbIpCableSettings { number: 1, ..Default::default() };
-        let mut s = UsbIpSettings { enabled: true, ..Default::default() };
+        let cable = UsbIpCableSettings {
+            number: 1,
+            ..Default::default()
+        };
+        let mut s = UsbIpSettings {
+            enabled: true,
+            ..Default::default()
+        };
         s.cables = vec![cable.clone(), cable];
-        assert!(matches!(s.validate(), Err(crate::Error::InvalidSettings(_))));
+        assert!(matches!(
+            s.validate(),
+            Err(crate::Error::InvalidSettings(_))
+        ));
 
         let mut s = UsbIpSettings::default();
         s.cables = (1..=UsbIpCableSettings::MAX_NUMBER)
-            .map(|n| UsbIpCableSettings { number: n, ..Default::default() })
+            .map(|n| UsbIpCableSettings {
+                number: n,
+                ..Default::default()
+            })
             .collect();
         assert!(s.validate().is_ok());
         assert_eq!(s.next_free_number(), None);
-        s.cables.push(UsbIpCableSettings { number: 9, ..Default::default() });
+        s.cables.push(UsbIpCableSettings {
+            number: 9,
+            ..Default::default()
+        });
         assert!(s.validate().is_err(), "超过 32 条应被拒绝");
     }
 
@@ -1008,8 +1154,14 @@ mod tests {
             enabled: true,
             bind: UsbIpSettings::default().bind,
             cables: vec![
-                UsbIpCableSettings { number: 1, ..Default::default() },
-                UsbIpCableSettings { number: 3, ..Default::default() },
+                UsbIpCableSettings {
+                    number: 1,
+                    ..Default::default()
+                },
+                UsbIpCableSettings {
+                    number: 3,
+                    ..Default::default()
+                },
             ],
         };
         assert_eq!(s.next_free_number(), Some(2));

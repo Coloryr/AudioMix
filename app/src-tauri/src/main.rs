@@ -61,15 +61,17 @@ fn main() {
             // 引擎初始化涉及 WASAPI/COM（MTA）；而主窗口创建要求主线程保持 STA
             // （OleInitialize），因此引擎初始化放到独立线程执行，避免污染主线程 COM 模式
             let engine = {
-                let backend: Arc<dyn audiomix_core::AudioBackend> = Arc::new(CompositeBackend::new(vec![
-                    Arc::new(WindowsBackend::new()),
-                    Arc::new(UsbIpBackend::new(registry)),
-                ]));
+                let backend: Arc<dyn audiomix_core::AudioBackend> =
+                    Arc::new(CompositeBackend::new(vec![
+                        Arc::new(WindowsBackend::new()),
+                        Arc::new(UsbIpBackend::new(registry)),
+                    ]));
                 let graph = settings.graph.clone();
                 let resample_quality = settings.settings.resample_quality;
                 let edge_buffer_ms = settings.settings.edge_buffer_ms;
                 std::thread::spawn(move || -> Result<_, String> {
-                    let engine = Engine::new(backend).map_err(|e| format!("音频引擎初始化失败: {e}"))?;
+                    let engine =
+                        Engine::new(backend).map_err(|e| format!("音频引擎初始化失败: {e}"))?;
                     engine.set_resample_quality(resample_quality);
                     engine.set_edge_buffer_ms(edge_buffer_ms);
                     if let Err(e) = engine.apply_graph(graph) {
@@ -85,7 +87,10 @@ fn main() {
 
             // 虚拟声卡服务器（配置里启用时随应用启动）
             if usbip_cfg.enabled {
-                match usbip.start(tauri::async_runtime::handle().inner(), cable_configs(&usbip_cfg)) {
+                match usbip.start(
+                    tauri::async_runtime::handle().inner(),
+                    cable_configs(&usbip_cfg),
+                ) {
                     Ok(()) => tracing::info!("USB/IP 虚拟声卡服务器已随应用启动"),
                     Err(e) => tracing::warn!("USB/IP 服务器启动失败: {e}"),
                 }
@@ -153,7 +158,8 @@ fn main() {
             commands::set_route_muted,
             commands::set_processor_params,
             commands::set_sink_volume,
-            commands::get_levels,
+            commands::subscribe_levels,
+            commands::unsubscribe_levels,
             commands::get_stats,
             commands::get_settings,
             commands::update_settings,

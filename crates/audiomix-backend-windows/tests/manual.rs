@@ -17,8 +17,5 @@ fn enumerate_real_devices() {
         );
     }
     // 有声卡的机器至少应有默认输出
-    assert!(
-        devices.iter().any(|d| d.is_default),
-        "至少应有一个默认设备"
-    );
+    assert!(devices.iter().any(|d| d.is_default), "至少应有一个默认设备");
 }

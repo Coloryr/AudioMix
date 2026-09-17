@@ -81,7 +81,11 @@ pub struct CableConfig {
 
 impl CableConfig {
     pub fn format(&self) -> CableFormat {
-        CableFormat { sample_rate: self.sample_rate, bits: self.bits, channels: 2 }
+        CableFormat {
+            sample_rate: self.sample_rate,
+            bits: self.bits,
+            channels: 2,
+        }
     }
 
     /// 最终显示名（与 `UsbIpCableSettings::display_name` 一致）
@@ -350,10 +354,17 @@ impl Cable {
         let le = |v: i16| v.to_le_bytes().to_vec();
 
         // 端点采样率（3 字节）
-        if recipient == 0x02 && selector == CS_SAMPLING_FREQ && (low_byte == 0x01 || low_byte == 0x82) {
+        if recipient == 0x02
+            && selector == CS_SAMPLING_FREQ
+            && (low_byte == 0x01 || low_byte == 0x82)
+        {
             let rate = s.sample_rate;
             let rate24 = |v: u32| {
-                vec![(v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8]
+                vec![
+                    (v & 0xFF) as u8,
+                    ((v >> 8) & 0xFF) as u8,
+                    ((v >> 16) & 0xFF) as u8,
+                ]
             };
             return match setup.request {
                 UAC_SET_CUR => {
@@ -375,7 +386,11 @@ impl Cable {
         if recipient == 0x01
             && (entity == ID_FEATURE_PLAY_ENTITY || entity == ID_FEATURE_CAPTURE_ENTITY)
         {
-            let unit = if entity == ID_FEATURE_PLAY_ENTITY { 0 } else { 1 };
+            let unit = if entity == ID_FEATURE_PLAY_ENTITY {
+                0
+            } else {
+                1
+            };
             return match (selector, setup.request) {
                 (CS_MUTE, UAC_SET_CUR) => {
                     if !out.is_empty() {
@@ -383,9 +398,7 @@ impl Cable {
                     }
                     (Vec::new(), STATUS_OK)
                 }
-                (CS_MUTE, UAC_GET_CUR) => {
-                    (vec![u8::from(s.mute[unit])], STATUS_OK)
-                }
+                (CS_MUTE, UAC_GET_CUR) => (vec![u8::from(s.mute[unit])], STATUS_OK),
                 (CS_VOLUME, UAC_SET_CUR) => {
                     if out.len() >= 2 {
                         s.volume[unit] = i16::from_le_bytes([out[0], out[1]]);
@@ -441,14 +454,18 @@ impl SetupPacket {
 /// 电平表还顶到 100%。
 pub fn pcm_to_f32(pcm: &[u8], bits: u16, out: &mut Vec<f32>) {
     match bits {
-        16 => out.extend(pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)),
+        16 => out.extend(
+            pcm.chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0),
+        ),
         24 => out.extend(pcm.chunks_exact(3).map(|c| {
             let v = ((c[2] as i32) << 24 | (c[1] as i32) << 16 | (c[0] as i32) << 8) >> 8;
             v as f32 / 8388608.0
         })),
-        32 => out.extend(pcm.chunks_exact(4).map(|c| {
-            i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2147483648.0
-        })),
+        32 => out.extend(
+            pcm.chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2147483648.0),
+        ),
         _ => {}
     }
 }
@@ -458,19 +475,25 @@ pub fn f32_to_pcm(samples: &[f32], bits: u16, out: &mut [u8]) {
     match bits {
         16 => {
             for (c, &s) in out.chunks_exact_mut(2).zip(samples) {
-                let v = (s.clamp(-1.0, 1.0) * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+                let v = (s.clamp(-1.0, 1.0) * 32768.0)
+                    .round()
+                    .clamp(-32768.0, 32767.0) as i16;
                 c.copy_from_slice(&v.to_le_bytes());
             }
         }
         24 => {
             for (c, &s) in out.chunks_exact_mut(3).zip(samples) {
-                let v = (s.clamp(-1.0, 1.0) * 8388608.0).round().clamp(-8388608.0, 8388607.0) as i32;
+                let v = (s.clamp(-1.0, 1.0) * 8388608.0)
+                    .round()
+                    .clamp(-8388608.0, 8388607.0) as i32;
                 c.copy_from_slice(&v.to_le_bytes()[0..3]);
             }
         }
         32 => {
             for (c, &s) in out.chunks_exact_mut(4).zip(samples) {
-                let v = (s.clamp(-1.0, 1.0) * 2147483648.0).round().clamp(-2147483648.0, 2147483647.0) as i32;
+                let v = (s.clamp(-1.0, 1.0) * 2147483648.0)
+                    .round()
+                    .clamp(-2147483648.0, 2147483647.0) as i32;
                 c.copy_from_slice(&v.to_le_bytes());
             }
         }
@@ -484,14 +507,27 @@ mod tests {
     use crate::usbip::protocol::{STATUS_OK, STATUS_PIPE};
 
     fn cfg(number: u8, rate: u32, bits: u16, mode: CableMode) -> CableConfig {
-        CableConfig { number, name: String::new(), sample_rate: rate, bits, mode, buffer_ms: 250 }
+        CableConfig {
+            number,
+            name: String::new(),
+            sample_rate: rate,
+            bits,
+            mode,
+            buffer_ms: 250,
+        }
     }
 
     #[test]
     fn self_test_loopback_16bit() {
         let c = Cable::new(cfg(1, 48_000, 16, CableMode::Loopback)).unwrap();
         // 枚举序列：设配置 → 激活两个接口
-        let set_cfg = SetupPacket { request_type: 0x00, request: REQ_SET_CONFIGURATION, value: 1, index: 0, length: 0 };
+        let set_cfg = SetupPacket {
+            request_type: 0x00,
+            request: REQ_SET_CONFIGURATION,
+            value: 1,
+            index: 0,
+            length: 0,
+        };
         assert_eq!(c.handle_control(set_cfg, &[]).1, STATUS_OK);
         for iface in 1..=2u16 {
             let set_if = SetupPacket {
@@ -516,7 +552,10 @@ mod tests {
         let mut roundtrip = Vec::with_capacity(100);
         pcm_to_f32(&out, 16, &mut roundtrip);
         for (a, b) in samples.iter().zip(&roundtrip) {
-            assert!((a - b).abs() < 1.0 / 32767.0, "loopback 回环误差过大: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1.0 / 32767.0,
+                "loopback 回环误差过大: {a} vs {b}"
+            );
         }
     }
 
@@ -524,10 +563,25 @@ mod tests {
     fn self_test_loopback_24_and_32bit() {
         for bits in [24u16, 32] {
             let c = Cable::new(cfg(2, 48_000, bits, CableMode::Loopback)).unwrap();
-            let set_cfg = SetupPacket { request_type: 0x00, request: REQ_SET_CONFIGURATION, value: 1, index: 0, length: 0 };
+            let set_cfg = SetupPacket {
+                request_type: 0x00,
+                request: REQ_SET_CONFIGURATION,
+                value: 1,
+                index: 0,
+                length: 0,
+            };
             c.handle_control(set_cfg, &[]);
             for iface in 1..=2u16 {
-                c.handle_control(SetupPacket { request_type: 0x01, request: REQ_SET_INTERFACE, value: 1, index: iface, length: 0 }, &[]);
+                c.handle_control(
+                    SetupPacket {
+                        request_type: 0x01,
+                        request: REQ_SET_INTERFACE,
+                        value: 1,
+                        index: iface,
+                        length: 0,
+                    },
+                    &[],
+                );
             }
             let sub = (bits / 8) as usize;
             let samples = [-1.0f32, -0.5, 0.0, 0.25, 0.999];
@@ -549,13 +603,34 @@ mod tests {
     #[test]
     fn mixer_mode_no_echo() {
         let c = Cable::new(cfg(3, 48_000, 16, CableMode::Mixer)).unwrap();
-        c.handle_control(SetupPacket { request_type: 0x00, request: REQ_SET_CONFIGURATION, value: 1, index: 0, length: 0 }, &[]);
-        c.handle_control(SetupPacket { request_type: 0x01, request: REQ_SET_INTERFACE, value: 1, index: 2, length: 0 }, &[]);
+        c.handle_control(
+            SetupPacket {
+                request_type: 0x00,
+                request: REQ_SET_CONFIGURATION,
+                value: 1,
+                index: 0,
+                length: 0,
+            },
+            &[],
+        );
+        c.handle_control(
+            SetupPacket {
+                request_type: 0x01,
+                request: REQ_SET_INTERFACE,
+                value: 1,
+                index: 2,
+                length: 0,
+            },
+            &[],
+        );
         let pcm = vec![0x40u8; 16];
         c.write_playback(&pcm);
         let mut out = vec![0u8; 16];
         c.read_capture(&mut out);
-        assert!(out.iter().all(|&b| b == 0), "mixer 模式无路由时麦克风端为静音");
+        assert!(
+            out.iter().all(|&b| b == 0),
+            "mixer 模式无路由时麦克风端为静音"
+        );
     }
 
     /// **字节序自检**：线缆两端的 PCM 必须是小端。
@@ -566,17 +641,43 @@ mod tests {
     #[test]
     fn pcm_stream_is_little_endian() {
         let c = Cable::new(cfg(7, 48_000, 16, CableMode::Mixer)).unwrap();
-        c.handle_control(SetupPacket { request_type: 0x00, request: REQ_SET_CONFIGURATION, value: 1, index: 0, length: 0 }, &[]);
+        c.handle_control(
+            SetupPacket {
+                request_type: 0x00,
+                request: REQ_SET_CONFIGURATION,
+                value: 1,
+                index: 0,
+                length: 0,
+            },
+            &[],
+        );
         for iface in 1..=2u16 {
-            c.handle_control(SetupPacket { request_type: 0x01, request: REQ_SET_INTERFACE, value: 1, index: iface, length: 0 }, &[]);
+            c.handle_control(
+                SetupPacket {
+                    request_type: 0x01,
+                    request: REQ_SET_INTERFACE,
+                    value: 1,
+                    index: iface,
+                    length: 0,
+                },
+                &[],
+            );
         }
 
         // Windows 播放 0x1234 = 4660 → 小端字节是 [0x34, 0x12]
         c.write_playback(&[0x34, 0x12, 0x00, 0x80]);
         let mut play = vec![0f32; 2];
         c.play_ring.pop(&mut play);
-        assert!((play[0] - 4660.0 / 32768.0).abs() < 1e-6, "ISO OUT 没按小端解析: {}", play[0]);
-        assert!((play[1] + 1.0).abs() < 1e-6, "-32768 应解成 -1.0: {}", play[1]);
+        assert!(
+            (play[0] - 4660.0 / 32768.0).abs() < 1e-6,
+            "ISO OUT 没按小端解析: {}",
+            play[0]
+        );
+        assert!(
+            (play[1] + 1.0).abs() < 1e-6,
+            "-32768 应解成 -1.0: {}",
+            play[1]
+        );
 
         // 反过来：0.5 → 16384 = 0x4000 → 录音端字节必须是 [0x00, 0x40]
         c.write_capture(&[0.5, -0.5]);
@@ -589,9 +690,27 @@ mod tests {
     #[test]
     fn reverse_mode_copies_capture_to_playback() {
         let c = Cable::new(cfg(9, 48_000, 16, CableMode::Reverse)).unwrap();
-        c.handle_control(SetupPacket { request_type: 0x00, request: REQ_SET_CONFIGURATION, value: 1, index: 0, length: 0 }, &[]);
+        c.handle_control(
+            SetupPacket {
+                request_type: 0x00,
+                request: REQ_SET_CONFIGURATION,
+                value: 1,
+                index: 0,
+                length: 0,
+            },
+            &[],
+        );
         for iface in 1..=2u16 {
-            c.handle_control(SetupPacket { request_type: 0x01, request: REQ_SET_INTERFACE, value: 1, index: iface, length: 0 }, &[]);
+            c.handle_control(
+                SetupPacket {
+                    request_type: 0x01,
+                    request: REQ_SET_INTERFACE,
+                    value: 1,
+                    index: iface,
+                    length: 0,
+                },
+                &[],
+            );
         }
         // 引擎写入录音端（线路输出）
         let samples: Vec<f32> = (0..64).map(|i| (i as f32 * 0.02).sin() * 0.5).collect();
@@ -608,7 +727,10 @@ mod tests {
         let mut play = vec![0f32; samples.len()];
         c.play_ring.pop(&mut play);
         for (a, b) in samples.iter().zip(&play) {
-            assert!((a - b).abs() < 1e-6, "reverse 模式未回灌到播放端: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-6,
+                "reverse 模式未回灌到播放端: {a} vs {b}"
+            );
         }
     }
 
@@ -628,24 +750,61 @@ mod tests {
     fn endpoint_sampling_frequency_control() {
         let c = Cable::new(cfg(4, 96_000, 16, CableMode::Mixer)).unwrap();
         // GET_CUR（真实驱动发的 0xA2：class IN + endpoint recipient，wIndex 低字节 = 端点 0x01）
-        let get = SetupPacket { request_type: 0xA2, request: UAC_GET_CUR, value: 0x0100, index: 0x0001, length: 3 };
+        let get = SetupPacket {
+            request_type: 0xA2,
+            request: UAC_GET_CUR,
+            value: 0x0100,
+            index: 0x0001,
+            length: 3,
+        };
         let (data, st) = c.handle_control(get, &[]);
         assert_eq!(st, STATUS_OK);
         assert_eq!(data, vec![0x00, 0x77, 0x01], "96000 = 0x017700 小端 3 字节");
         // GET_MIN / GET_MAX 返回同一个离散值，GET_RES 返回 1
-        for (req, want) in [(UAC_GET_MIN, data.clone()), (UAC_GET_MAX, data.clone()), (UAC_GET_RES, vec![1, 0, 0])] {
-            let q = SetupPacket { request_type: 0xA2, request: req, value: 0x0100, index: 0x0001, length: 3 };
+        for (req, want) in [
+            (UAC_GET_MIN, data.clone()),
+            (UAC_GET_MAX, data.clone()),
+            (UAC_GET_RES, vec![1, 0, 0]),
+        ] {
+            let q = SetupPacket {
+                request_type: 0xA2,
+                request: req,
+                value: 0x0100,
+                index: 0x0001,
+                length: 3,
+            };
             assert_eq!(c.handle_control(q, &[]).0, want, "bRequest=0x{req:02x}");
         }
         // 采集端点（0x82）同样应答
-        let cap = SetupPacket { request_type: 0xA2, request: UAC_GET_CUR, value: 0x0100, index: 0x0082, length: 3 };
+        let cap = SetupPacket {
+            request_type: 0xA2,
+            request: UAC_GET_CUR,
+            value: 0x0100,
+            index: 0x0082,
+            length: 3,
+        };
         assert_eq!(c.handle_control(cap, &[]).0, data);
         // SET_CUR：错误速率 → STALL；正确速率 → OK
-        let set = SetupPacket { request_type: 0x22, request: UAC_SET_CUR, value: 0x0100, index: 0x0001, length: 3 };
-        assert_eq!(c.handle_control(set, &48_000u32.to_le_bytes()[0..3]).1, STATUS_PIPE);
+        let set = SetupPacket {
+            request_type: 0x22,
+            request: UAC_SET_CUR,
+            value: 0x0100,
+            index: 0x0001,
+            length: 3,
+        };
+        assert_eq!(
+            c.handle_control(set, &48_000u32.to_le_bytes()[0..3]).1,
+            STATUS_PIPE
+        );
         assert_eq!(c.handle_control(set, &data).1, STATUS_OK);
         // 未知选择器 → STALL
-        let unknown = SetupPacket { request_type: 0xA2, request: UAC_GET_CUR, value: 0x0300, index: 0x0001, length: 3 };
+        let unknown = SetupPacket {
+            request_type: 0xA2,
+            request: UAC_GET_CUR,
+            value: 0x0300,
+            index: 0x0001,
+            length: 3,
+        };
         assert_eq!(c.handle_control(unknown, &[]).1, STATUS_PIPE);
     }
 
@@ -662,7 +821,11 @@ mod tests {
                 index: entity << 8,
                 length: 4,
             };
-            assert_eq!(c.handle_control(get, &[]).1, STATUS_PIPE, "实体 {entity} 不应答");
+            assert_eq!(
+                c.handle_control(get, &[]).1,
+                STATUS_PIPE,
+                "实体 {entity} 不应答"
+            );
         }
     }
 
@@ -670,27 +833,78 @@ mod tests {
     fn feature_unit_mute_and_volume() {
         let c = Cable::new(cfg(8, 48_000, 16, CableMode::Mixer)).unwrap();
         // 播放 Feature Unit（实体 2）静音 GET_CUR
-        let get_mute = SetupPacket { request_type: 0xA1, request: UAC_GET_CUR, value: 0x0100, index: 0x0200, length: 1 };
+        let get_mute = SetupPacket {
+            request_type: 0xA1,
+            request: UAC_GET_CUR,
+            value: 0x0100,
+            index: 0x0200,
+            length: 1,
+        };
         let (data, st) = c.handle_control(get_mute, &[]);
         assert_eq!(st, STATUS_OK);
         assert_eq!(data, vec![0u8]);
         // SET_CUR 静音
-        let set_mute = SetupPacket { request_type: 0x21, request: UAC_SET_CUR, value: 0x0100, index: 0x0200, length: 1 };
+        let set_mute = SetupPacket {
+            request_type: 0x21,
+            request: UAC_SET_CUR,
+            value: 0x0100,
+            index: 0x0200,
+            length: 1,
+        };
         assert_eq!(c.handle_control(set_mute, &[1]).1, STATUS_OK);
         assert_eq!(c.handle_control(get_mute, &[]).0, vec![1u8]);
         // 音量范围：UAC1 分开的 GET_MIN / GET_MAX / GET_RES（16 位控制 → 各 2 字节）
-        let min = SetupPacket { request_type: 0xA1, request: UAC_GET_MIN, value: 0x0200, index: 0x0200, length: 2 };
-        assert_eq!(c.handle_control(min, &[]).0, (-60i16 * 256).to_le_bytes().to_vec());
-        let max = SetupPacket { request_type: 0xA1, request: UAC_GET_MAX, value: 0x0200, index: 0x0200, length: 2 };
+        let min = SetupPacket {
+            request_type: 0xA1,
+            request: UAC_GET_MIN,
+            value: 0x0200,
+            index: 0x0200,
+            length: 2,
+        };
+        assert_eq!(
+            c.handle_control(min, &[]).0,
+            (-60i16 * 256).to_le_bytes().to_vec()
+        );
+        let max = SetupPacket {
+            request_type: 0xA1,
+            request: UAC_GET_MAX,
+            value: 0x0200,
+            index: 0x0200,
+            length: 2,
+        };
         assert_eq!(c.handle_control(max, &[]).0, 0i16.to_le_bytes().to_vec());
-        let res = SetupPacket { request_type: 0xA1, request: UAC_GET_RES, value: 0x0200, index: 0x0200, length: 2 };
+        let res = SetupPacket {
+            request_type: 0xA1,
+            request: UAC_GET_RES,
+            value: 0x0200,
+            index: 0x0200,
+            length: 2,
+        };
         assert_eq!(c.handle_control(res, &[]).0, 256i16.to_le_bytes().to_vec());
         // 音量 GET_CUR / SET_CUR
-        let cur = SetupPacket { request_type: 0xA1, request: UAC_GET_CUR, value: 0x0200, index: 0x0500, length: 2 };
+        let cur = SetupPacket {
+            request_type: 0xA1,
+            request: UAC_GET_CUR,
+            value: 0x0200,
+            index: 0x0500,
+            length: 2,
+        };
         assert_eq!(c.handle_control(cur, &[]).0, 0i16.to_le_bytes().to_vec());
-        let set_vol = SetupPacket { request_type: 0x21, request: UAC_SET_CUR, value: 0x0200, index: 0x0500, length: 2 };
-        assert_eq!(c.handle_control(set_vol, &(-1000i16).to_le_bytes()).1, STATUS_OK);
-        assert_eq!(c.handle_control(cur, &[]).0, (-1000i16).to_le_bytes().to_vec());
+        let set_vol = SetupPacket {
+            request_type: 0x21,
+            request: UAC_SET_CUR,
+            value: 0x0200,
+            index: 0x0500,
+            length: 2,
+        };
+        assert_eq!(
+            c.handle_control(set_vol, &(-1000i16).to_le_bytes()).1,
+            STATUS_OK
+        );
+        assert_eq!(
+            c.handle_control(cur, &[]).0,
+            (-1000i16).to_le_bytes().to_vec()
+        );
     }
 
     #[test]
@@ -705,10 +919,22 @@ mod tests {
     fn get_descriptor_has_no_qualifier() {
         let c = Cable::new(cfg(6, 48_000, 16, CableMode::Mixer)).unwrap();
         // 全速设备请求 device qualifier 应 STALL（标准做法，主机据此判定「无另一种速度」）
-        let qual = SetupPacket { request_type: 0x80, request: REQ_GET_DESCRIPTOR, value: 0x0600, index: 0, length: 10 };
+        let qual = SetupPacket {
+            request_type: 0x80,
+            request: REQ_GET_DESCRIPTOR,
+            value: 0x0600,
+            index: 0,
+            length: 10,
+        };
         assert_eq!(c.handle_control(qual, &[]).1, STATUS_PIPE);
         // 语言 ID 字符串
-        let get = SetupPacket { request_type: 0x80, request: REQ_GET_DESCRIPTOR, value: 0x0300, index: 0, length: 255 };
+        let get = SetupPacket {
+            request_type: 0x80,
+            request: REQ_GET_DESCRIPTOR,
+            value: 0x0300,
+            index: 0,
+            length: 255,
+        };
         let (data, st) = c.handle_control(get, &[]);
         assert_eq!(st, STATUS_OK);
         assert_eq!(data, vec![4, 3, 0x09, 0x04]);

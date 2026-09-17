@@ -54,7 +54,13 @@ fn route(id: &str, source_id: &str, sink_id: &str, gain: f32) -> Route {
 }
 
 fn processor(id: &str, kind: DspKind) -> Processor {
-    Processor { id: id.into(), node: DspNode { kind, enabled: true } }
+    Processor {
+        id: id.into(),
+        node: DspNode {
+            kind,
+            enabled: true,
+        },
+    }
 }
 
 /// 等待渲染 buffer 积累到 min_samples，然后返回 [skip..] 段的均值
@@ -102,7 +108,10 @@ fn passthrough_single_source() {
     let peak = levels["src"];
     assert!((peak - 0.5).abs() < 0.01, "源峰值 {peak} 应为 0.5");
     let out_peak = levels["out"];
-    assert!((out_peak - 0.5).abs() < 0.05, "输出峰值 {out_peak} 应约为 0.5");
+    assert!(
+        (out_peak - 0.5).abs() < 0.05,
+        "输出峰值 {out_peak} 应约为 0.5"
+    );
 }
 
 #[test]
@@ -148,13 +157,17 @@ fn gain_hot_update() {
     assert!((m1 - 0.5).abs() < TOL, "初始增益 1.0 → 均值 {m1} 应为 0.5");
 
     // 热更新增益，不重启流
-    let started_before = backend.captures_started.load(std::sync::atomic::Ordering::SeqCst);
+    let started_before = backend
+        .captures_started
+        .load(std::sync::atomic::Ordering::SeqCst);
     engine.set_route_gain("r", 0.5).unwrap();
     backend.reset_render_buffer("dev-out-1");
     let m2 = wait_mean(&backend, "dev-out-1", MIN_SAMPLES, SKIP_SAMPLES);
     assert!((m2 - 0.25).abs() < TOL, "增益 0.5 → 均值 {m2} 应为 0.25");
 
-    let started_after = backend.captures_started.load(std::sync::atomic::Ordering::SeqCst);
+    let started_after = backend
+        .captures_started
+        .load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(started_before, started_after, "改增益不应重启采集流");
 }
 
@@ -198,7 +211,10 @@ fn processor_chain_hot_update_without_stream_restart() {
             processors: vec![processor("dsp", DspKind::Gain { db: -20.0 })],
             sources: vec![source("src", "dev-in-1", SourceMode::DeviceInput)],
             sinks: vec![sink("out", "dev-out-1")],
-            routes: vec![route("r1", "src", "dsp", 1.0), route("r2", "dsp", "out", 1.0)],
+            routes: vec![
+                route("r1", "src", "dsp", 1.0),
+                route("r2", "dsp", "out", 1.0),
+            ],
         })
         .unwrap();
 
@@ -207,11 +223,16 @@ fn processor_chain_hot_update_without_stream_restart() {
     assert!((m1 - 0.05).abs() < TOL, "经处理器后均值 {m1} 应为 0.05");
 
     // 热改参数（-20dB → -6dB ≈ ×0.501），不重启流
-    let started_before = backend.captures_started.load(std::sync::atomic::Ordering::SeqCst);
+    let started_before = backend
+        .captures_started
+        .load(std::sync::atomic::Ordering::SeqCst);
     engine
         .set_processor_params(
             "dsp",
-            DspNode { kind: DspKind::Gain { db: -6.0 }, enabled: true },
+            DspNode {
+                kind: DspKind::Gain { db: -6.0 },
+                enabled: true,
+            },
         )
         .unwrap();
     backend.reset_render_buffer("dev-out-1");
@@ -222,7 +243,9 @@ fn processor_chain_hot_update_without_stream_restart() {
     );
     assert_eq!(
         started_before,
-        backend.captures_started.load(std::sync::atomic::Ordering::SeqCst),
+        backend
+            .captures_started
+            .load(std::sync::atomic::Ordering::SeqCst),
         "改处理器参数不应重启采集流"
     );
 
@@ -230,7 +253,10 @@ fn processor_chain_hot_update_without_stream_restart() {
     engine
         .set_processor_params(
             "dsp",
-            DspNode { kind: DspKind::Gain { db: -6.0 }, enabled: false },
+            DspNode {
+                kind: DspKind::Gain { db: -6.0 },
+                enabled: false,
+            },
         )
         .unwrap();
     backend.reset_render_buffer("dev-out-1");
@@ -287,7 +313,10 @@ fn processor_cycle_branch_is_dropped() {
         .unwrap();
 
     let mean = wait_mean(&backend, "dev-out-1", MIN_SAMPLES, SKIP_SAMPLES);
-    assert!((mean - 0.5).abs() < TOL, "环分支应被丢弃，正常路径均值 {mean} 应为 0.5");
+    assert!(
+        (mean - 0.5).abs() < TOL,
+        "环分支应被丢弃，正常路径均值 {mean} 应为 0.5"
+    );
     engine.shutdown();
 }
 
@@ -373,7 +402,10 @@ fn loopback_mode_routes_output_capture() {
         .unwrap();
 
     let mean = wait_mean(&backend, "dev-out-hi", MIN_SAMPLES, SKIP_SAMPLES);
-    assert!((mean - 0.4).abs() < TOL, "loopback 混音均值 {mean} 应为 0.4");
+    assert!(
+        (mean - 0.4).abs() < TOL,
+        "loopback 混音均值 {mean} 应为 0.4"
+    );
 }
 
 #[test]
@@ -383,7 +415,7 @@ fn stream_lifecycle_start_stop_restart() {
 
     let engine = Engine::new(backend.clone()).unwrap();
     let graph = GraphConfig {
-            processors: Vec::new(),
+        processors: Vec::new(),
         sources: vec![source("src", "dev-in-1", SourceMode::DeviceInput)],
         sinks: vec![sink("out", "dev-out-1")],
         routes: vec![route("r", "src", "out", 1.0)],
@@ -391,7 +423,12 @@ fn stream_lifecycle_start_stop_restart() {
     engine.apply_graph(graph).unwrap();
     assert_eq!(backend.alive_captures(), 1);
     assert_eq!(backend.alive_renders(), 1);
-    assert_eq!(backend.captures_started.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        backend
+            .captures_started
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 
     // 禁用源 → 采集流停止
     engine.set_source_enabled("src", false).unwrap();
@@ -402,7 +439,9 @@ fn stream_lifecycle_start_stop_restart() {
     engine.set_source_enabled("src", true).unwrap();
     assert_eq!(backend.alive_captures(), 1);
     assert_eq!(
-        backend.captures_started.load(std::sync::atomic::Ordering::SeqCst),
+        backend
+            .captures_started
+            .load(std::sync::atomic::Ordering::SeqCst),
         2,
         "重新启用应创建新流"
     );
@@ -428,14 +467,16 @@ fn source_device_change_restarts_stream() {
 
     let engine = Engine::new(backend.clone()).unwrap();
     let mut g = GraphConfig {
-            processors: Vec::new(),
+        processors: Vec::new(),
         sources: vec![source("src", "dev-in-1", SourceMode::DeviceInput)],
         sinks: vec![sink("out", "dev-out-1")],
         routes: vec![route("r", "src", "out", 1.0)],
     };
     engine.apply_graph(g.clone()).unwrap();
     assert_eq!(
-        backend.captures_started.load(std::sync::atomic::Ordering::SeqCst),
+        backend
+            .captures_started
+            .load(std::sync::atomic::Ordering::SeqCst),
         1
     );
 
@@ -443,7 +484,9 @@ fn source_device_change_restarts_stream() {
     g.sources[0].device_id = "dev-mono".into();
     engine.apply_graph(g).unwrap();
     assert_eq!(
-        backend.captures_started.load(std::sync::atomic::Ordering::SeqCst),
+        backend
+            .captures_started
+            .load(std::sync::atomic::Ordering::SeqCst),
         2,
         "换绑设备应重启采集流"
     );

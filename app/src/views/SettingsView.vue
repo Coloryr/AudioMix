@@ -168,16 +168,11 @@ onUnmounted(() => window.clearInterval(timer));
               sinc 通带平坦、抗混叠好；linear 高频失真较大但零延迟（耳返场景选它）。
             </n-text>
           </div>
-          <n-select
-            v-model:value="app.settings.resample_quality"
-            :options="[
-              { label: '高质量 sinc（延迟 ~7ms）', value: 'sinc256' },
-              { label: '轻量 sinc（延迟 ~3.5ms）', value: 'sinc128' },
-              { label: 'linear（零延迟，耳返用）', value: 'linear' },
-            ]"
-            style="width: 230px"
-            @update:value="save"
-          />
+          <n-select v-model:value="app.settings.resample_quality" :options="[
+            { label: '高质量 sinc（延迟 ~7ms）', value: 'sinc256' },
+            { label: '轻量 sinc（延迟 ~3.5ms）', value: 'sinc128' },
+            { label: 'linear（零延迟，耳返用）', value: 'linear' },
+          ]" style="width: 230px" @update:value="save" />
         </div>
         <n-divider />
         <div class="item-row">
@@ -188,14 +183,21 @@ onUnmounted(() => window.clearInterval(timer));
               不影响日常延迟；调小则卡顿上限更低。修改后路由边缓冲立即重建。
             </n-text>
           </div>
-          <n-input-number
-            v-model:value="app.settings.edge_buffer_ms"
-            :min="50"
-            :max="1000"
-            :step="50"
-            style="width: 130px"
-            @update:value="save"
-          >
+          <n-input-number v-model:value="app.settings.edge_buffer_ms" :min="50" :max="1000" :step="50"
+            style="width: 130px" @update:value="save">
+            <template #suffix>ms</template>
+          </n-input-number>
+        </div>
+        <n-divider />
+        <div class="item-row">
+          <div style="flex: 1">
+            <div class="item-title">电平刷新间隔</div>
+            <n-text depth="3" style="font-size: 12px">
+              混音页电平条的后端推送频率（20–500ms）。越小越顺滑，CPU 占用略高；改动立即生效。
+            </n-text>
+          </div>
+          <n-input-number v-model:value="app.settings.levels_interval_ms" :min="20" :max="500" :step="10"
+            style="width: 130px" @update:value="save">
             <template #suffix>ms</template>
           </n-input-number>
         </div>
@@ -242,12 +244,7 @@ onUnmounted(() => window.clearInterval(timer));
           <n-switch v-model:value="app.settings.control_api.enabled" @update:value="save" />
         </div>
         <n-form-item label="端口" label-placement="left" style="margin-top: 12px; max-width: 220px">
-          <n-input-number
-            v-model:value="app.settings.control_api.port"
-            :min="1024"
-            :max="65535"
-            @update:value="save"
-          />
+          <n-input-number v-model:value="app.settings.control_api.port" :min="1024" :max="65535" @update:value="save" />
         </n-form-item>
         <div class="item-row">
           <n-tag size="small" :type="app.apiStatus.running ? 'success' : 'default'" :bordered="false">
@@ -266,9 +263,7 @@ onUnmounted(() => window.clearInterval(timer));
       <n-card title="关于" size="small">
         <n-text depth="3" style="font-size: 12px; line-height: 1.9">
           AudioMix v0.1.0 — Windows WASAPI 混音引擎 + Vue 前端。<br />
-          虚拟声卡：usbip-win2（BSD-2）+ UAC1 描述符 → Windows 自带的 usbaudio.sys 端点
-          （44.1–96kHz 的 16/24/32bit，176.4/192kHz 只 16bit）。<br />
-          更高规格请自装第三方虚拟声卡（VB-CABLE、VoiceMeeter 等），可直接拖进混音画布接线。
+          虚拟声卡的规格与用法见「驱动」页。
         </n-text>
         <n-divider />
         <n-popconfirm @positive-click="api.quitApp()">
@@ -318,47 +313,56 @@ onUnmounted(() => window.clearInterval(timer));
   gap: 14px;
   align-items: start;
 }
+
 .log-card {
   min-width: 0;
 }
+
 .log-box {
   height: calc(100vh - 236px);
   min-height: 260px;
   overflow: auto;
   padding: 6px 8px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--border-weak);
   border-radius: 8px;
-  background: #131317;
+  background: var(--inset);
   font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
   font-size: 11.5px;
   line-height: 1.55;
   user-select: text;
   cursor: text;
 }
+
 .log-line {
   display: flex;
   gap: 8px;
   white-space: pre-wrap;
   word-break: break-all;
 }
+
 .log-seq {
   flex: 0 0 44px;
   text-align: right;
   opacity: 0.35;
 }
+
 .log-text {
   flex: 1;
   min-width: 0;
 }
+
 .log-error .log-text {
-  color: #ff7875;
+  color: var(--err-text);
 }
+
 .log-warn .log-text {
   color: #f0a020;
 }
+
 .log-debug .log-text {
   opacity: 0.55;
 }
+
 .log-empty {
   opacity: 0.5;
   padding: 8px;

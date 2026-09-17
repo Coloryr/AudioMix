@@ -103,7 +103,6 @@ async function load() {
     buffer_ms: c.buffer_ms,
   }));
   dirty.value = false;
-  return s;
 }
 
 async function guarded(fn: () => Promise<void>) {
@@ -262,12 +261,8 @@ onMounted(() => {
 <template>
   <n-card title="虚拟声卡（usbip-win2 + UAC1）" size="small">
     <!-- 传输驱动安装状态 -->
-    <n-alert
-      v-if="status && !driverReady"
-      type="warning"
-      title="未检测到 usbip.exe（USB/IP 传输驱动）"
-      style="margin-bottom: 12px"
-    >
+    <n-alert v-if="status && !driverReady" type="warning" title="未检测到 usbip.exe（USB/IP 传输驱动）"
+      style="margin-bottom: 12px">
       虚拟声卡由 <b>usbip-win2</b>（BSD-2，微软签名驱动，内存完整性 HVCI 兼容）把应用内置的
       USB/IP 服务器仿真的设备接入 Windows，再由系统自带的 usbaudio.sys（UAC1）暴露为标准播放/录音端点。
       <template v-if="status.driver.installer_path">
@@ -275,13 +270,8 @@ onMounted(() => {
       </template>
       <template v-else>未找到随包安装包（resources/drivers/usbip/），请确认安装包完整。</template>
       <div style="margin-top: 8px; display: flex; gap: 10px; align-items: center">
-        <n-button
-          type="primary"
-          size="small"
-          :loading="busy"
-          :disabled="!status.driver.installer_path"
-          @click="installDriver"
-        >
+        <n-button type="primary" size="small" :loading="busy" :disabled="!status.driver.installer_path"
+          @click="installDriver">
           安装 USB/IP 驱动（管理员）
         </n-button>
         <n-button size="small" @click="load">刷新</n-button>
@@ -328,17 +318,11 @@ onMounted(() => {
     <!-- 线路列表：名称 / 格式 / 接线 -->
     <div class="section-title">虚拟线路（1–32 条，格式独立可配）</div>
     <n-text depth="3" style="font-size: 12px; display: block; margin-bottom: 10px; line-height: 1.8">
-      线路两端对应 Windows 里的两个端点：<br />
-      · <b>线路输入</b> ＝ 系统<b>录音</b>端（麦克风）——混音器写到这里，别的软件从「Virtual Cable NN 麦克风」录；<br />
-      · <b>线路输出</b> ＝ 系统<b>播放</b>端（扬声器）——别的软件选「Virtual Cable NN 扬声器」播放，声音从这进混音器。<br />
-      内置线路是 <b>UAC1（USB 1.1 全速，系统自带 usbaudio.sys）</b>，格式上限：
-      <b>44.1–96 kHz 的 16/24/32bit</b>，<b>176.4/192 kHz 只支持 16bit</b>。<br />
-      需要更高规格（例如 192kHz/24bit）或更低延迟的线路，请自行安装第三方虚拟声卡（VB-CABLE、VoiceMeeter 等）——
-      它们会作为普通 Windows 端点出现在混音画布左侧设备列表里，直接拖进来接线即可。<br />
-      内部拷贝方向：<b>直接点接线图上的箭头</b>选（点中间那条线也可以循环切换；再点一次箭头即取消）——
-      <b>线路输出 → 拷贝到 → 线路输入</b>（播放端的声音原样出现在录音端）、
-      <b>线路输入 → 拷贝到 → 线路输出</b>（写进录音端的数据回灌到播放端）、或都不点＝<b>不拷贝</b>（只走混音图）。
-      改完点「保存」即生效。
+      每条线路对应 Windows 里的两个端点：<b>线路输入</b>＝录音端（麦克风，混音器写到这里）、<b>线路输出</b>＝播放端（扬声器，别的软件播放的声音从这进混音器）。<br />
+      内置线路为 UAC1 全速：44.1/48/88.2 kHz 支持 16/24/32bit，96 kHz 只支持 16bit；
+      更高规格或更低延迟请自装第三方虚拟声卡（VB-CABLE 等），同样能拖进混音画布。<br />
+      内部拷贝方向直接点右侧接线图的箭头选择（再点一次取消）：
+      输出→输入＝播放端的声音原样出现在录音端；输入→输出＝写进录音端的数据回灌到播放端。改完点「保存」即生效。
     </n-text>
 
     <n-list v-if="cables.length" :show-divider="false" style="margin-bottom: 10px">
@@ -347,43 +331,17 @@ onMounted(() => {
           <!-- 第一行：身份与格式（名称/采样率/位深/带宽告警/接入状态/删除） -->
           <div class="cable-row-line">
             <n-tag size="small" type="warning" :bordered="false">{{ String(c.number).padStart(2, "0") }}</n-tag>
-            <n-input
-              v-model:value="c.name"
-              size="small"
-              style="width: 190px"
-              :placeholder="`Virtual Cable ${String(c.number).padStart(2, '0')}`"
-              maxlength="64"
-              clearable
-              @update:value="dirty = true"
-            />
-            <n-select
-              v-model:value="c.sample_rate"
-              :options="RATE_OPTIONS"
-              size="small"
-              style="width: 112px"
-              @update:value="(v: number) => onRateChange(c, v)"
-            />
-            <n-select
-              v-model:value="c.bits"
-              :options="bitOptionsOf(c)"
-              size="small"
-              style="width: 92px"
-              @update:value="dirty = true"
-            />
-            <n-tag
-              v-if="!formatSupported(c)"
-              size="small"
-              type="error"
-              :bordered="false"
-              :title="formatHint(c)"
-            >
+            <n-input v-model:value="c.name" size="small" style="width: 190px"
+              :placeholder="`Virtual Cable ${String(c.number).padStart(2, '0')}`" maxlength="64" clearable
+              @update:value="dirty = true" />
+            <n-select v-model:value="c.sample_rate" :options="RATE_OPTIONS" size="small" style="width: 112px"
+              @update:value="(v: number) => onRateChange(c, v)" />
+            <n-select v-model:value="c.bits" :options="bitOptionsOf(c)" size="small" style="width: 92px"
+              @update:value="dirty = true" />
+            <n-tag v-if="!formatSupported(c)" size="small" type="error" :bordered="false" :title="formatHint(c)">
               超出内置线路规格
             </n-tag>
-            <n-tag
-              size="small"
-              :type="attachedOf(c.number)?.attached ? 'success' : 'default'"
-              :bordered="false"
-            >
+            <n-tag size="small" :type="attachedOf(c.number)?.attached ? 'success' : 'default'" :bordered="false">
               {{ attachedOf(c.number)?.attached ? `已接入（端口 ${attachedOf(c.number)?.port}）` : "未接入" }}
             </n-tag>
             <n-popconfirm @positive-click="removeCable(c.number)">
@@ -396,92 +354,47 @@ onMounted(() => {
 
           <!-- 第二行：线路内部拷贝方向接线图（直接点箭头选，不用下拉框） -->
           <div class="cable-row-line">
-            <div
-              class="patch"
-              :title="
-                copyMode(c) === 'in2out'
-                  ? '线路输入 → 拷贝到 → 线路输出：混音器写进录音端的数据同时回灌到播放端'
-                  : copyMode(c) === 'out2in'
-                    ? '线路输出 → 拷贝到 → 线路输入：系统播放进这条线路的声音原样出现在系统录音端（混音图的「线路输出」能读到）'
-                    : '不拷贝：线路输入只输出混音图路由过来的信号'
-              "
-            >
-            <div class="patch-box">
-              <div class="patch-label">线路输入</div>
-              <div class="patch-sub">系统录音端（麦克风）</div>
+            <div class="patch" :title="copyMode(c) === 'in2out'
+              ? '线路输入 → 拷贝到 → 线路输出：混音器写进录音端的数据同时回灌到播放端'
+              : copyMode(c) === 'out2in'
+                ? '线路输出 → 拷贝到 → 线路输入：系统播放进这条线路的声音原样出现在系统录音端（混音图的「线路输出」能读到）'
+                : '不拷贝：线路输入只输出混音图路由过来的信号'
+              ">
+              <div class="patch-box">
+                <div class="patch-label">线路输入</div>
+                <div class="patch-sub">系统录音端（麦克风）</div>
+              </div>
+
+              <div class="patch-mid">
+                <!-- 两条虚线箭头：同一 x 范围、同一虚线相位（对齐）；点右向＝输入→输出，点左向＝输出→输入 -->
+                <svg class="patch-arrows" width="160" height="46" viewBox="0 0 160 46">
+                  <!-- 右向：线路输入 → 线路输出（＝ 录音端回灌到播放端）；三角用 polygon 画在线之后，保证盖在虚线上面 -->
+                  <g class="arrow-g" @click.stop="setCopy(c, 'in2out')">
+                    <title>线路输入 → 拷贝到 → 线路输出（再点一次取消）</title>
+                    <line class="hit" x1="16" y1="13" x2="144" y2="13" />
+                    <line class="arrow-line" :class="{ active: copyMode(c) === 'in2out' }" x1="16" y1="13" x2="133"
+                      y2="13" />
+                    <polygon class="arrow-head" :class="{ active: copyMode(c) === 'in2out' }"
+                      points="144,13 133,8.5 133,17.5" />
+                  </g>
+
+                  <!-- 左向：线路输出 → 线路输入（与右向等长对称，箭头画在左端） -->
+                  <g class="arrow-g" @click.stop="setCopy(c, 'out2in')">
+                    <title>线路输出 → 拷贝到 → 线路输入（再点一次取消）</title>
+                    <line class="hit" x1="16" y1="33" x2="144" y2="33" />
+                    <line class="arrow-line" :class="{ active: copyMode(c) === 'out2in' }" x1="27" y1="33" x2="144"
+                      y2="33" />
+                    <polygon class="arrow-head" :class="{ active: copyMode(c) === 'out2in' }"
+                      points="16,33 27,28.5 27,37.5" />
+                  </g>
+                </svg>
+              </div>
+
+              <div class="patch-box right">
+                <div class="patch-label">线路输出</div>
+                <div class="patch-sub">系统播放端（扬声器）</div>
+              </div>
             </div>
-
-            <div class="patch-mid">
-              <!-- 两条虚线箭头：同一 x 范围、同一虚线相位（对齐）；点右向＝输入→输出，点左向＝输出→输入 -->
-              <svg class="patch-arrows" width="160" height="46" viewBox="0 0 160 46">
-                <defs>
-                  <marker id="pa-r" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-                    <path d="M 0 0 L 10 5 L 0 10 z" fill="#4b9cd3" />
-                  </marker>
-                  <marker
-                    id="pa-l"
-                    viewBox="0 0 10 10"
-                    refX="10"
-                    refY="5"
-                    markerWidth="7"
-                    markerHeight="7"
-                    orient="auto-start-reverse"
-                  >
-                    <path d="M 0 0 L 10 5 L 0 10 z" fill="#4b9cd3" />
-                  </marker>
-                  <marker id="pa-dim" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-                    <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(255,255,255,0.32)" />
-                  </marker>
-                  <marker
-                    id="pa-dim-l"
-                    viewBox="0 0 10 10"
-                    refX="10"
-                    refY="5"
-                    markerWidth="7"
-                    markerHeight="7"
-                    orient="auto-start-reverse"
-                  >
-                    <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(255,255,255,0.32)" />
-                  </marker>
-                </defs>
-
-                <!-- 右向：线路输入 → 线路输出（＝ 录音端回灌到播放端） -->
-                <g class="arrow-g" @click.stop="setCopy(c, 'in2out')">
-                  <title>线路输入 → 拷贝到 → 线路输出（再点一次取消）</title>
-                  <line class="hit" x1="16" y1="13" x2="144" y2="13" />
-                  <line
-                    class="arrow-line"
-                    :class="{ active: copyMode(c) === 'in2out' }"
-                    x1="16"
-                    y1="13"
-                    x2="144"
-                    y2="13"
-                    :marker-end="copyMode(c) === 'in2out' ? 'url(#pa-r)' : 'url(#pa-dim)'"
-                  />
-                </g>
-
-                <!-- 左向：线路输出 → 线路输入（同样的 x 起止，箭头画在左端） -->
-                <g class="arrow-g" @click.stop="setCopy(c, 'out2in')">
-                  <title>线路输出 → 拷贝到 → 线路输入（再点一次取消）</title>
-                  <line class="hit" x1="16" y1="33" x2="144" y2="33" />
-                  <line
-                    class="arrow-line"
-                    :class="{ active: copyMode(c) === 'out2in' }"
-                    x1="16"
-                    y1="33"
-                    x2="144"
-                    y2="33"
-                    :marker-start="copyMode(c) === 'out2in' ? 'url(#pa-l)' : 'url(#pa-dim-l)'"
-                  />
-                </g>
-              </svg>
-            </div>
-
-            <div class="patch-box right">
-              <div class="patch-label">线路输出</div>
-              <div class="patch-sub">系统播放端（扬声器）</div>
-            </div>
-          </div>
 
             <n-tag size="small" :type="copyMode(c) === 'none' ? 'info' : 'success'" :bordered="false">
               {{ copyLabel(c) }}
@@ -503,7 +416,7 @@ onMounted(() => {
         有未保存的改动 —— 点「保存」后立即生效（会自动重新附加，弹一次 UAC）
       </n-text>
       <n-text v-else depth="3" style="font-size: 12px">
-        当前：{{ cables.map((c) => cableLabel(c)).join("、") || "无线路" }}
+        当前：{{cables.map((c) => cableLabel(c)).join("、") || "无线路"}}
       </n-text>
     </div>
 
@@ -512,17 +425,12 @@ onMounted(() => {
     <!-- 接入系统 -->
     <div class="section-title">接入系统（usbip attach，需管理员权限）</div>
     <n-text depth="3" style="display: block; font-size: 12px; margin-bottom: 8px">
-      「附加全部」先断开所有已接入端口，再按当前线路逐条附加（**只弹一次 UAC**）。
+      「附加全部」先断开所有已接入端口，再按当前线路逐条附加（<b>只弹一次 UAC</b>）。
       附加后设备出现在系统声音设置与本应用设备列表（可能需要几秒枚举）。
     </n-text>
     <div style="display: flex; gap: 10px; margin-bottom: 12px">
-      <n-button
-        type="primary"
-        size="small"
-        :loading="busy"
-        :disabled="!driverReady || !status?.running || !cables.length"
-        @click="attachAll"
-      >
+      <n-button type="primary" size="small" :loading="busy"
+        :disabled="!driverReady || !status?.running || !cables.length" @click="attachAll">
         附加全部（需管理员）
       </n-button>
       <n-button size="small" :loading="busy" :disabled="!driverReady || !attachedCount" @click="detachAll">
@@ -545,19 +453,10 @@ onMounted(() => {
     <n-alert v-if="report && report.failed.length" type="error" style="margin-bottom: 12px">
       以下线路附加失败：<span v-for="[bus, why] in report.failed" :key="bus">{{ bus }}（{{ why }}） </span>
     </n-alert>
-    <n-text
-      v-if="lastLog"
-      depth="3"
-      style="display: block; font-size: 12px; white-space: pre-wrap; margin-bottom: 8px"
-    >
+    <n-text v-if="lastLog" depth="3" style="display: block; font-size: 12px; white-space: pre-wrap; margin-bottom: 8px">
       {{ lastLog }}
     </n-text>
 
-    <n-text depth="3" style="display: block; font-size: 12px; line-height: 1.8; margin-top: 8px">
-      混音页用法：设备面板里每条线路拆成两个可分别拖入的节点 ——
-      <b>线路输入</b>（系统录音端，混音图写到这）和 <b>线路输出</b>（系统播放端，混音图当源用）。
-      所有声卡设备（含第三方虚拟声卡）也都能直接拖进画布：自装的虚拟声卡（VB-CABLE 等）就是走这条路接入混音的。
-    </n-text>
   </n-card>
 </template>
 
@@ -569,84 +468,94 @@ onMounted(() => {
   gap: 8px;
   width: 100%;
 }
+
 .cable-row-line {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
 }
+
 .patch {
   display: flex;
   align-items: center;
 }
+
 .patch-mid {
   display: flex;
   align-items: center;
 }
+
 .patch-arrows {
   display: block;
   overflow: visible;
 }
+
 .arrow-g {
   cursor: pointer;
 }
-/* 细虚线箭头：选中（active）变实线蓝；未选中是灰色虚线 */
+
+/* 细虚线箭头：选中（active）变实线蓝；未选中是灰色虚线。
+   箭头三角是同组内的 polygon，画在虚线之上，颜色也走 class，hover 时与线一起变色 */
 .arrow-line {
-  stroke: rgba(255, 255, 255, 0.3);
+  stroke: var(--wire-dim);
   stroke-width: 1.6;
   stroke-dasharray: 6 5;
   fill: none;
 }
+
 .arrow-line.active {
-  stroke: #4b9cd3;
+  stroke: var(--accent);
   stroke-width: 2.2;
   stroke-dasharray: none;
 }
-.arrow-g:hover .arrow-line {
-  stroke: #7cc0ea;
+
+.arrow-head {
+  fill: var(--wire-dim);
 }
+
+.arrow-head.active {
+  fill: var(--accent);
+}
+
+.arrow-g:hover .arrow-line {
+  stroke: var(--accent-hover);
+}
+
+.arrow-g:hover .arrow-head {
+  fill: var(--accent-hover);
+}
+
 /* 透明加粗命中线：点起来更容易 */
 .hit {
   stroke: transparent;
   stroke-width: 16;
   fill: none;
 }
+
 .patch-box {
   position: relative;
   padding: 3px 9px;
-  border: 1px solid rgba(255, 255, 255, 0.18);
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: #1f1f23;
+  background: var(--surface);
   font-size: 11px;
   min-width: 104px;
   text-align: right;
 }
+
 .patch-box.right {
   text-align: left;
 }
+
 .patch-label {
   font-weight: 600;
 }
+
 .patch-sub {
   opacity: 0.6;
   font-size: 10px;
   white-space: nowrap;
 }
-.patch-wire {
-  display: block;
-  cursor: pointer;
-}
-.wire {
-  fill: none;
-  stroke: #4b9cd3;
-  stroke-width: 2.5;
-}
-.wire.off {
-  stroke: rgba(255, 255, 255, 0.25);
-  stroke-dasharray: 5 4;
-}
-.wire-hint {
-  font-size: 10px;
-  fill: rgba(255, 255, 255, 0.55);
-}
+
 </style>

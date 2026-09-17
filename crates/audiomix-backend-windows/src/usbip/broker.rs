@@ -86,9 +86,7 @@ fn start_broker() -> Result<(), String> {
 
     // 等提权后的 broker 连回来并完成 token 认证
     let deadline = std::time::Instant::now() + ACCEPT_WINDOW;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| e.to_string())?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     loop {
         if std::time::Instant::now() > deadline {
             return Err("提权代理未在规定时间内连回".into());
@@ -172,7 +170,10 @@ fn broker_command(line: &str) -> Result<String, String> {
         *guard = None;
         return Err(format!("读取 broker 数据长度失败: {e}"));
     }
-    let len: usize = len_line.trim().parse().map_err(|_| "broker 数据长度非法".to_string())?;
+    let len: usize = len_line
+        .trim()
+        .parse()
+        .map_err(|_| "broker 数据长度非法".to_string())?;
     let mut payload = vec![0u8; len];
     if let Err(e) = conn.read_exact(&mut payload) {
         *guard = None;
@@ -236,7 +237,9 @@ pub fn shutdown_broker() {
 
 /// broker 主循环：认证后逐条执行命令；连接断开即退出。
 pub fn run_broker(addr: &str, token: &str) -> Result<(), String> {
-    if !addr.starts_with("127.0.0.1:") || token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit())
+    if !addr.starts_with("127.0.0.1:")
+        || token.len() != 64
+        || !token.bytes().all(|b| b.is_ascii_hexdigit())
     {
         return Err("broker 参数非法".into());
     }
@@ -281,12 +284,20 @@ fn execute(line: &str, exe: &Path) -> (String, String) {
             let mut all_ok = true;
             for (i, bus) in bus_ids.iter().enumerate() {
                 payload.push_str(&format!("@@STEP {i}\n"));
-                let r = run_capture(exe, &attach_args(host, tcp_port, bus), Duration::from_secs(120))
-                    .unwrap_or(super::attach::RunOutput {
-                        code: -1,
-                        output: "执行失败".into(),
-                    });
-                tracing::info!("  broker attach {host}:{tcp_port} {bus} → {}：{}", r.code, r.output.trim());
+                let r = run_capture(
+                    exe,
+                    &attach_args(host, tcp_port, bus),
+                    Duration::from_secs(120),
+                )
+                .unwrap_or(super::attach::RunOutput {
+                    code: -1,
+                    output: "执行失败".into(),
+                });
+                tracing::info!(
+                    "  broker attach {host}:{tcp_port} {bus} → {}：{}",
+                    r.code,
+                    r.output.trim()
+                );
                 payload.push_str(&r.output);
                 if !payload.ends_with('\n') {
                     payload.push('\n');
@@ -303,11 +314,12 @@ fn execute(line: &str, exe: &Path) -> (String, String) {
             }
         }
         ["DETACH_ALL"] => {
-            let r = run_capture(exe, &detach_args_all(), Duration::from_secs(120))
-                .unwrap_or(super::attach::RunOutput {
+            let r = run_capture(exe, &detach_args_all(), Duration::from_secs(120)).unwrap_or(
+                super::attach::RunOutput {
                     code: -1,
                     output: "执行失败".into(),
-                });
+                },
+            );
             tracing::info!("  broker detach --all → {}：{}", r.code, r.output.trim());
             (ok_or_err(r.code), r.output)
         }
@@ -316,13 +328,18 @@ fn execute(line: &str, exe: &Path) -> (String, String) {
             let mut all_ok = true;
             for p in list.split(',') {
                 let args = vec!["detach".to_string(), "-p".to_string(), p.to_string()];
-                let r = run_capture(exe, &args, Duration::from_secs(120))
-                    .unwrap_or(super::attach::RunOutput {
+                let r = run_capture(exe, &args, Duration::from_secs(120)).unwrap_or(
+                    super::attach::RunOutput {
                         code: -1,
                         output: "执行失败".into(),
-                    });
+                    },
+                );
                 tracing::info!("  broker detach -p {p} → {}：{}", r.code, r.output.trim());
-                payload.push_str(&format!("[detach -p {p}] code={}\n{}\n", r.code, r.output.trim()));
+                payload.push_str(&format!(
+                    "[detach -p {p}] code={}\n{}\n",
+                    r.code,
+                    r.output.trim()
+                ));
                 if r.code != 0 {
                     all_ok = false;
                 }

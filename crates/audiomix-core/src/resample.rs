@@ -11,11 +11,11 @@
 
 use std::collections::VecDeque;
 
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{
     Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
 };
-use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use serde::{Deserialize, Serialize};
 
 /// 重采样质量档位（设置里可切换；切换后引擎重建各边重采样器，立即生效）。
@@ -75,7 +75,10 @@ impl PullResampler {
                 ResamplerQuality::Linear => Inner::Linear(LinearCore::new(src_rate, dst_rate, ch)),
             }
         };
-        Self { inner, underruns: 0 }
+        Self {
+            inner,
+            underruns: 0,
+        }
     }
 
     pub fn input_samples(&mut self, data: &[f32]) {
@@ -128,7 +131,12 @@ struct PassthroughCore {
 
 impl PassthroughCore {
     fn new(ch: usize) -> Self {
-        Self { src_ch: ch, buf: VecDeque::new(), prev: vec![0.0; ch], primed: false }
+        Self {
+            src_ch: ch,
+            buf: VecDeque::new(),
+            prev: vec![0.0; ch],
+            primed: false,
+        }
     }
 
     fn generate(&mut self, frames: usize, out: &mut Vec<f32>) -> usize {
@@ -269,15 +277,8 @@ impl SincCore {
             window: WindowFunction::BlackmanHarris2,
         };
         // 输入块 = sinc 长度：块越大单位开销越低，块越小管道延迟越小
-        let res = Async::<f32>::new_sinc(
-            ratio,
-            1.1,
-            &params,
-            sinc_len,
-            ch,
-            FixedAsync::Input,
-        )
-        .ok()?;
+        let res =
+            Async::<f32>::new_sinc(ratio, 1.1, &params, sinc_len, ch, FixedAsync::Input).ok()?;
         let in_need = res.input_frames_next();
         let out_max = res.output_frames_max();
         let delay_left = res.output_delay();
@@ -440,10 +441,14 @@ mod tests {
         // 分析中段 8192 帧（远离启动延迟与结尾欠载区）
         let n = 8192usize;
         let seg = &all[all.len() - 2 * n..all.len() - n];
-        let total: f64 = seg.iter().map(|v| {
-            let v = *v as f64;
-            v * v
-        }).sum::<f64>() / n as f64;
+        let total: f64 = seg
+            .iter()
+            .map(|v| {
+                let v = *v as f64;
+                v * v
+            })
+            .sum::<f64>()
+            / n as f64;
         let k = 2560usize;
         let (mut re, mut im) = (0.0f64, 0.0f64);
         for (i, v) in seg.iter().enumerate() {
@@ -462,8 +467,14 @@ mod tests {
         let linear = thdn_db(ResamplerQuality::Linear);
         // 15kHz 每周期只有约 2.9 个输入样本，线性插值失真严重；sinc 档应远好于线性
         assert!(sinc < -40.0, "sinc256 THD+N = {sinc:.1} dB，应 < -40 dB");
-        assert!(sinc128 < -40.0, "sinc128 THD+N = {sinc128:.1} dB，应 < -40 dB");
-        assert!(linear > -25.0, "linear THD+N = {linear:.1} dB，应 > -25 dB（对照组）");
+        assert!(
+            sinc128 < -40.0,
+            "sinc128 THD+N = {sinc128:.1} dB，应 < -40 dB"
+        );
+        assert!(
+            linear > -25.0,
+            "linear THD+N = {linear:.1} dB，应 > -25 dB（对照组）"
+        );
     }
 
     #[test]

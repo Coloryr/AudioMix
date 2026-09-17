@@ -4,12 +4,16 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use audiomix_backend_windows::driver;
-use audiomix_backend_windows::usbip::{attach as usbip_attach, broker as usbip_broker, cable_configs};use audiomix_core::engine::EngineStats;
+use audiomix_backend_windows::usbip::{
+    attach as usbip_attach, broker as usbip_broker, cable_configs,
+};
+use audiomix_core::engine::EngineStats;
 use audiomix_core::model::NodePos;
 use audiomix_core::{
     DeviceInfo, DeviceKind, GraphConfig, Settings, UsbIpCableSettings, UsbIpSettings,
 };
 use serde_json::json;
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
 use crate::config;
@@ -89,7 +93,11 @@ fn refresh_and_guard_defaults(
             // 否则视为 Windows 抢过去的：优先回到记住的物理设备，没有就挑第一个非虚拟设备
             let target = saved_id
                 .as_deref()
-                .and_then(|id| devices.iter().find(|d| d.id == id && d.kind == kind && !d.is_virtual))
+                .and_then(|id| {
+                    devices
+                        .iter()
+                        .find(|d| d.id == id && d.kind == kind && !d.is_virtual)
+                })
                 .or_else(|| devices.iter().find(|d| d.kind == kind && !d.is_virtual));
             let Some(t) = target else { continue };
             restore.push((kind, t.id.clone()));
@@ -158,13 +166,18 @@ pub fn spawn_default_device_guard(app: AppHandle) {
             // 清理走提权 broker（在线时零 UAC），所以随时清理都不打扰用户。
             if ticks % 15 == 0 {
                 let state = app.state::<AppState>();
-                let cable_bus_ids: std::collections::HashSet<String> =
-                    state.usbip.cables().iter().map(|c| c.bus_id.clone()).collect();
+                let cable_bus_ids: std::collections::HashSet<String> = state
+                    .usbip
+                    .cables()
+                    .iter()
+                    .map(|c| c.bus_id.clone())
+                    .collect();
                 if !cable_bus_ids.is_empty() {
                     if let Ok(ports) = usbip_attach::ports() {
                         let in_use: Vec<_> = ports.iter().filter(|p| p.in_use).collect();
                         // 同一 bus_id 占多个端口：保留最小端口号（最早附加、在流式的那个）
-                        let mut by_bus: std::collections::BTreeMap<String, Vec<u32>> = Default::default();
+                        let mut by_bus: std::collections::BTreeMap<String, Vec<u32>> =
+                            Default::default();
                         let mut stale: Vec<u32> = Vec::new(); // bus_id 不在线缆表里（线缆已删除）
                         let mut unclassified = 0usize; // bus_id 解析不出来，没法分类
                         for p in &in_use {
@@ -249,9 +262,10 @@ pub fn spawn_default_device_guard(app: AppHandle) {
                 }
             }
 
-            // 枚举一次设备，看有没有新的虚拟端点（虚拟线路每次重连都会换端点 id）
-            let devices = audiomix_backend_windows::wasapi::device::enumerate_devices()
-                .unwrap_or_default();
+            // 检查有没有新的虚拟端点（虚拟线路每次重连都会换端点 id）。
+            // 读引擎的设备缓存而不自己枚举：引擎看门狗（3s）和前端刷新都会更新缓存，
+            // 这里每秒自己再枚举一遍纯属重复的 COM 开销
+            let devices = app.state::<AppState>().engine.list_devices();
             let virtual_ids: HashSet<String> = devices
                 .iter()
                 .filter(|d| d.is_virtual)
@@ -301,7 +315,12 @@ fn repair_cables(app: &AppHandle) -> Result<(), String> {
         tracing::info!("USB/IP 服务器未运行，自愈仅执行断开: {out}");
         return Ok(());
     };
-    let bus_ids: Vec<String> = state.usbip.cables().iter().map(|c| c.bus_id.clone()).collect();
+    let bus_ids: Vec<String> = state
+        .usbip
+        .cables()
+        .iter()
+        .map(|c| c.bus_id.clone())
+        .collect();
     if bus_ids.is_empty() {
         return Ok(());
     }
@@ -338,8 +357,12 @@ pub fn auto_attach_if_needed(app: &AppHandle) {
     if state.usbip.cables().is_empty() {
         return;
     }
-    let bus_ids: std::collections::HashSet<String> =
-        state.usbip.cables().iter().map(|c| c.bus_id.clone()).collect();
+    let bus_ids: std::collections::HashSet<String> = state
+        .usbip
+        .cables()
+        .iter()
+        .map(|c| c.bus_id.clone())
+        .collect();
     let attached = usbip_attach::ports().map_or(false, |ports| {
         ports
             .iter()
@@ -360,7 +383,8 @@ pub fn auto_attach_if_needed(app: &AppHandle) {
 /// 并把这次选择记进配置（虚拟线路接入时用它恢复）。
 /// 返回刷新后的设备列表，便于前端立即反映 `is_default`。
 #[tauri::command]
-pub fn set_default_device(    app: AppHandle,
+pub fn set_default_device(
+    app: AppHandle,
     state: State<AppState>,
     device_id: String,
 ) -> Result<Vec<DeviceInfo>, String> {
@@ -423,7 +447,9 @@ pub fn set_mixer_layout(
     let mut clean: HashMap<String, NodePos> = HashMap::new();
     if let Some(obj) = layout.as_object() {
         for (key, value) in obj {
-            let Some(arr) = value.as_array() else { continue };
+            let Some(arr) = value.as_array() else {
+                continue;
+            };
             if arr.len() < 2 {
                 continue;
             }
@@ -433,7 +459,12 @@ pub fn set_mixer_layout(
             if !x.is_finite() || !y.is_finite() {
                 continue;
             }
-            clean.insert(key.clone(), [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)]);
+            // 前端布局直接存像素坐标（相对画布左上角），平移后可视区可能是负坐标区域；
+            // 后端只做宽松的合理性钳制（前端会按实际画布尺寸精钳）
+            clean.insert(
+                key.clone(),
+                [x.clamp(-8192.0, 16384.0), y.clamp(-8192.0, 16384.0)],
+            );
         }
     }
     {
@@ -454,10 +485,7 @@ pub fn apply_graph(
     state: State<AppState>,
     graph: GraphConfig,
 ) -> Result<GraphConfig, String> {
-    state
-        .engine
-        .apply_graph(graph)
-        .map_err(|e| e.to_string())?;
+    state.engine.apply_graph(graph).map_err(|e| e.to_string())?;
     let applied = state.engine.get_graph();
     {
         let mut cfg = state.config.lock();
@@ -539,9 +567,44 @@ pub fn set_sink_volume(
     persist(&app, &state)
 }
 
+/// 电平推送：前端用 Tauri Channel 订阅，后端线程按 20fps 主动推 ——
+/// 取代旧的前端 setInterval + get_levels 轮询（每 tick 一次完整 IPC 往返）。
+/// 不可见（最小化/托盘）或未订阅时线程只做空读，开销可忽略。
 #[tauri::command]
-pub fn get_levels(state: State<AppState>) -> HashMap<String, f32> {
-    state.engine.levels()
+pub fn subscribe_levels(
+    state: State<AppState>,
+    app: AppHandle,
+    channel: Channel<HashMap<String, f32>>,
+) {
+    *state.levels_channel.lock() = Some(channel);
+    // 推送线程常驻（只起一次），循环里每 tick 检查是否真的要推送
+    if !state.levels_thread_started.swap(true, Ordering::Relaxed) {
+        let engine = state.engine.clone();
+        std::thread::spawn(move || loop {
+            let app_state = app.state::<AppState>();
+            // 间隔是设置项（settings.levels_interval_ms），改动即时生效，无需重新订阅
+            let interval = app_state.config.lock().settings.levels_interval_ms.clamp(20, 500);
+            std::thread::sleep(std::time::Duration::from_millis(interval));
+            let Some(channel) = app_state.levels_channel.lock().clone() else {
+                continue;
+            };
+            // 窗口不可见（最小化/关到托盘）时跳过：读电平 + 序列化纯属白跑
+            let visible = app
+                .get_webview_window(tray::MAIN_WINDOW)
+                .map(|w| w.is_visible().unwrap_or(false))
+                .unwrap_or(false);
+            if !visible {
+                continue;
+            }
+            let _ = channel.send(engine.levels());
+        });
+    }
+}
+
+/// 停止电平推送（前端切走页签/窗口隐藏时调用；通道置空后线程自动空转）
+#[tauri::command]
+pub fn unsubscribe_levels(state: State<AppState>) {
+    *state.levels_channel.lock() = None;
 }
 
 #[tauri::command]
@@ -557,7 +620,11 @@ pub fn get_settings(state: State<AppState>) -> Settings {
 }
 
 #[tauri::command]
-pub fn update_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> Result<(), String> {
+pub fn update_settings(
+    app: AppHandle,
+    state: State<AppState>,
+    settings: Settings,
+) -> Result<(), String> {
     let old_settings = state.config.lock().settings.clone();
     {
         let mut cfg = state.config.lock();
@@ -565,9 +632,7 @@ pub fn update_settings(app: AppHandle, state: State<AppState>, settings: Setting
     }
     // 重采样质量变化 → 引擎重建各边重采样器（渲染线程自动跟随快照）
     if settings.resample_quality != old_settings.resample_quality {
-        state
-            .engine
-            .set_resample_quality(settings.resample_quality);
+        state.engine.set_resample_quality(settings.resample_quality);
     }
     // 边缓冲容量变化 → 重建边缓冲（瞬时可能有一小段间隙）
     if settings.edge_buffer_ms != old_settings.edge_buffer_ms {
@@ -594,7 +659,11 @@ pub fn get_control_api_status(state: State<AppState>) -> serde_json::Value {
 }
 
 #[tauri::command]
-pub fn set_control_api_enabled(app: AppHandle, state: State<AppState>, enabled: bool) -> Result<(), String> {
+pub fn set_control_api_enabled(
+    app: AppHandle,
+    state: State<AppState>,
+    enabled: bool,
+) -> Result<(), String> {
     {
         let mut cfg = state.config.lock();
         cfg.settings.control_api.enabled = enabled;
@@ -741,7 +810,9 @@ fn build_usbip_status(
         .iter()
         .map(|c| {
             let bus_id = format!("1-{}", c.number);
-            let hit = ports.iter().find(|p| p.bus_id.as_deref() == Some(bus_id.as_str()));
+            let hit = ports
+                .iter()
+                .find(|p| p.bus_id.as_deref() == Some(bus_id.as_str()));
             UsbIpCableStatus {
                 number: c.number,
                 sample_rate: c.sample_rate,
@@ -771,7 +842,8 @@ fn build_usbip_status(
         driver: UsbIpDriverInfo {
             installed: usbip_attach::installed(),
             usbip_path: usbip_attach::find_usbip().map(|p| p.to_string_lossy().to_string()),
-            installer_path: usbip_attach::bundled_installer().map(|p| p.to_string_lossy().to_string()),
+            installer_path: usbip_attach::bundled_installer()
+                .map(|p| p.to_string_lossy().to_string()),
             test_signing: driver::test_signing_enabled(),
             hvci_enabled: driver::hvci_enabled(),
         },
@@ -821,7 +893,10 @@ pub async fn usbip_set_cables(
 
     let (previous, previous_enabled) = {
         let cfg = state.config.lock();
-        (cable_configs(&cfg.settings.usbip), cfg.settings.usbip.enabled)
+        (
+            cable_configs(&cfg.settings.usbip),
+            cfg.settings.usbip.enabled,
+        )
     };
     let manager = state.usbip.clone();
     // RuntimeHandle 是临时值，.inner() 借它；闭包要求 'static，这里克隆出 tokio Handle（廉价 Arc 克隆）
@@ -841,8 +916,12 @@ pub async fn usbip_set_cables(
             Err(e) => {
                 if previous_enabled && !previous.is_empty() {
                     match manager.start(&rt, previous) {
-                        Ok(()) => tracing::warn!("USB/IP 服务器启动失败（{e}），已回滚到上次的线缆配置"),
-                        Err(e2) => tracing::error!("USB/IP 服务器启动失败（{e}），回滚亦失败: {e2}"),
+                        Ok(()) => {
+                            tracing::warn!("USB/IP 服务器启动失败（{e}），已回滚到上次的线缆配置")
+                        }
+                        Err(e2) => {
+                            tracing::error!("USB/IP 服务器启动失败（{e}），回滚亦失败: {e2}")
+                        }
                     }
                 }
                 Err(e)
@@ -881,7 +960,12 @@ pub async fn usbip_attach_all(
     let Some(addr) = state.usbip.local_addr() else {
         return Err("USB/IP 服务器未运行——请先启用虚拟声卡并保存线缆".into());
     };
-    let bus_ids: Vec<String> = state.usbip.cables().iter().map(|c| c.bus_id.clone()).collect();
+    let bus_ids: Vec<String> = state
+        .usbip
+        .cables()
+        .iter()
+        .map(|c| c.bus_id.clone())
+        .collect();
     if bus_ids.is_empty() {
         return Err("尚未配置任何虚拟线缆".into());
     }
@@ -918,7 +1002,10 @@ pub async fn usbip_attach_all(
 
 /// 断开全部已接入的线缆（提权 broker 优先，回退一次性提权）
 #[tauri::command]
-pub async fn usbip_detach_all(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+pub async fn usbip_detach_all(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
     let out = tauri::async_runtime::spawn_blocking(detach_via_broker_or_elevated)
         .await
         .map_err(|e| format!("断开任务失败: {e}"))??;

@@ -53,7 +53,8 @@ impl EdgeWriter {
         let mut prod = self.producer.lock();
         let pushed = prod.push_slice(data);
         if pushed < data.len() {
-            self.dropped.fetch_add((data.len() - pushed) as u64, Ordering::Relaxed);
+            self.dropped
+                .fetch_add((data.len() - pushed) as u64, Ordering::Relaxed);
         }
     }
 

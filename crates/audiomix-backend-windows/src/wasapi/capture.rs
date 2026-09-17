@@ -27,7 +27,11 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
 /// 在指定设备上启动采集流；`loopback=true` 时捕获该**输出**设备正在播放的声音。
 /// 调用线程先查一次设备格式（供引擎配置重采样），流线程内重新打开设备。
-pub fn start_capture(device_id: &str, loopback: bool, on_data: CaptureCallback) -> Result<StartedStream> {
+pub fn start_capture(
+    device_id: &str,
+    loopback: bool,
+    on_data: CaptureCallback,
+) -> Result<StartedStream> {
     // 在调用线程查询格式（供引擎配置重采样），流线程内重新打开设备
     let info = mix_format_of_by_id(device_id)?;
     let device_id = HSTRING::from(device_id);
@@ -44,7 +48,12 @@ pub fn start_capture(device_id: &str, loopback: bool, on_data: CaptureCallback) 
     Ok(StartedStream { info, handle })
 }
 
-fn capture_thread(device_id: &HSTRING, loopback: bool, stop: Arc<AtomicBool>, mut on_data: CaptureCallback) -> Result<()> {
+fn capture_thread(
+    device_id: &HSTRING,
+    loopback: bool,
+    stop: Arc<AtomicBool>,
+    mut on_data: CaptureCallback,
+) -> Result<()> {
     com_init();
     unsafe {
         let enumerator: IMMDeviceEnumerator =
@@ -75,9 +84,7 @@ fn capture_thread(device_id: &HSTRING, loopback: bool, stop: Arc<AtomicBool>, mu
         CoTaskMemFree(Some(fmt as *const _));
 
         let event = CreateEventW(None, false, false, None).map_err(Error::backend)?;
-        client
-            .SetEventHandle(event)
-            .map_err(Error::backend)?;
+        client.SetEventHandle(event).map_err(Error::backend)?;
         let capture: IAudioCaptureClient = client.GetService().map_err(Error::backend)?;
         client.Start().map_err(Error::backend)?;
 
@@ -90,7 +97,9 @@ fn capture_thread(device_id: &HSTRING, loopback: bool, stop: Arc<AtomicBool>, mu
             if w == WAIT_OBJECT_0 {
                 gap.tick("采集");
                 loop {
-                    let Ok(packets) = capture.GetNextPacketSize() else { break };
+                    let Ok(packets) = capture.GetNextPacketSize() else {
+                        break;
+                    };
                     if packets == 0 {
                         break;
                     }

@@ -232,7 +232,10 @@ mod tests {
 
     #[test]
     fn enumerate_concatenates_all_backends() {
-        let c = composite(fake("wasapi-out", DeviceKind::Output), fake("usbip-in", DeviceKind::Input));
+        let c = composite(
+            fake("wasapi-out", DeviceKind::Output),
+            fake("usbip-in", DeviceKind::Input),
+        );
         let devices = c.enumerate_devices().unwrap();
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[0].id, "wasapi-out");
@@ -261,11 +264,18 @@ mod tests {
         b.set_capture_data("usbip-in", vec![0.5, -0.5]);
         let got2 = got.clone();
         let stream = c
-            .start_capture("usbip-in", Box::new(move |d| got2.lock().unwrap().extend_from_slice(d)))
+            .start_capture(
+                "usbip-in",
+                Box::new(move |d| got2.lock().unwrap().extend_from_slice(d)),
+            )
             .unwrap();
         assert_eq!(stream.info.sample_rate, 48_000);
         assert_eq!(b.captures_started.load(Ordering::SeqCst), 1);
-        assert_eq!(a.captures_started.load(Ordering::SeqCst), 0, "不应打到第一个后端");
+        assert_eq!(
+            a.captures_started.load(Ordering::SeqCst),
+            0,
+            "不应打到第一个后端"
+        );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while got.lock().unwrap().is_empty() {
@@ -283,7 +293,9 @@ mod tests {
         let c = composite(a.clone(), b.clone());
         c.enumerate_devices().unwrap();
 
-        let stream = c.start_render("usbip-cap", Box::new(|buf| buf.fill(0.25))).unwrap();
+        let stream = c
+            .start_render("usbip-cap", Box::new(|buf| buf.fill(0.25)))
+            .unwrap();
         assert_eq!(b.renders_started.load(Ordering::SeqCst), 1);
         assert_eq!(a.renders_started.load(Ordering::SeqCst), 0);
         drop(stream);
@@ -304,14 +316,20 @@ mod tests {
     #[test]
     fn routing_works_without_prior_enumerate() {
         // 未枚举过时（路由表为空）应自动重新枚举
-        let c = composite(fake("wasapi-out", DeviceKind::Output), fake("usbip-in", DeviceKind::Input));
+        let c = composite(
+            fake("wasapi-out", DeviceKind::Output),
+            fake("usbip-in", DeviceKind::Input),
+        );
         let stream = c.start_capture("usbip-in", Box::new(|_| {})).unwrap();
         drop(stream);
     }
 
     #[test]
     fn unknown_device_is_not_found() {
-        let c = composite(fake("wasapi-out", DeviceKind::Output), fake("usbip-in", DeviceKind::Input));
+        let c = composite(
+            fake("wasapi-out", DeviceKind::Output),
+            fake("usbip-in", DeviceKind::Input),
+        );
         assert!(matches!(
             c.start_capture("nope", Box::new(|_| {})),
             Err(Error::DeviceNotFound(_))
@@ -325,7 +343,10 @@ mod tests {
 
     #[test]
     fn owner_name_reports_source_backend() {
-        let c = composite(fake("wasapi-out", DeviceKind::Output), fake("usbip-in", DeviceKind::Input));
+        let c = composite(
+            fake("wasapi-out", DeviceKind::Output),
+            fake("usbip-in", DeviceKind::Input),
+        );
         c.enumerate_devices().unwrap();
         assert_eq!(c.owner_name("wasapi-out"), Some("fake"));
         assert_eq!(c.owner_name("usbip-in"), Some("fake"));

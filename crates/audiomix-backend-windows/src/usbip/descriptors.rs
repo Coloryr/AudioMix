@@ -306,7 +306,10 @@ pub fn build(number: u8, product: &str, fmt: &CableFormat) -> Result<Descriptors
     // 格式变了 → serial 变 → 全新实例 → 缓存从零开始，改格式后重新 attach 即恢复。
     // 代价：换格式会丢该端点的默认设备/音量记忆，注册表留下不可见 phantom（WASAPI 不显示）。
     // 名称（product）不编进去：改显示名不应变成新设备。
-    let serial = format!("AUDIOMIX-VCABLE-{number:03}-{}-{}", fmt.sample_rate, fmt.bits);
+    let serial = format!(
+        "AUDIOMIX-VCABLE-{number:03}-{}-{}",
+        fmt.sample_rate, fmt.bits
+    );
 
     let mut strings = BTreeMap::new();
     strings.insert(0u8, vec![4, DESC_STRING, 0x09, 0x04]); // en-US
@@ -391,24 +394,72 @@ fn uac1_configuration(fmt: &CableFormat) -> Vec<u8> {
     // 播放路径：USB streaming IT → Feature Unit → Speaker OT
     app(&uac1_input_terminal(ID_USB_STREAMING_IT, 0x0101));
     app(&uac1_feature_unit(ID_FEATURE_PLAY, ID_USB_STREAMING_IT));
-    app(&uac1_output_terminal(ID_SPEAKER_OT, ID_FEATURE_PLAY, 0x0301));
+    app(&uac1_output_terminal(
+        ID_SPEAKER_OT,
+        ID_FEATURE_PLAY,
+        0x0301,
+    ));
 
     // 采集路径：Mic IT → Feature Unit → USB streaming OT
     app(&uac1_input_terminal(ID_MIC_IT, 0x0201));
     app(&uac1_feature_unit(ID_FEATURE_CAPTURE, ID_MIC_IT));
-    app(&uac1_output_terminal(ID_USB_STREAMING_OT, ID_FEATURE_CAPTURE, 0x0101));
+    app(&uac1_output_terminal(
+        ID_USB_STREAMING_OT,
+        ID_FEATURE_CAPTURE,
+        0x0101,
+    ));
 
     // —— 接口 1：AudioStreaming 播放（EP 0x01 OUT）——
-    app(&[9, DESC_INTERFACE, 1, 0, 0, AUDIO_CLASS, SUBCLASS_AUDIOSTREAMING, 0x00, 0]);
-    app(&[9, DESC_INTERFACE, 1, 1, 1, AUDIO_CLASS, SUBCLASS_AUDIOSTREAMING, 0x00, 0]);
+    app(&[
+        9,
+        DESC_INTERFACE,
+        1,
+        0,
+        0,
+        AUDIO_CLASS,
+        SUBCLASS_AUDIOSTREAMING,
+        0x00,
+        0,
+    ]);
+    app(&[
+        9,
+        DESC_INTERFACE,
+        1,
+        1,
+        1,
+        AUDIO_CLASS,
+        SUBCLASS_AUDIOSTREAMING,
+        0x00,
+        0,
+    ]);
     app(&uac1_as_general(ID_USB_STREAMING_IT));
     app(&uac1_type_i_format(fmt));
     app(&iso_endpoint(0x01, 0x09, fmt));
     app(&uac1_cs_iso_endpoint());
 
     // —— 接口 2：AudioStreaming 采集（EP 0x82 IN）——
-    app(&[9, DESC_INTERFACE, 2, 0, 0, AUDIO_CLASS, SUBCLASS_AUDIOSTREAMING, 0x00, 0]);
-    app(&[9, DESC_INTERFACE, 2, 1, 1, AUDIO_CLASS, SUBCLASS_AUDIOSTREAMING, 0x00, 0]);
+    app(&[
+        9,
+        DESC_INTERFACE,
+        2,
+        0,
+        0,
+        AUDIO_CLASS,
+        SUBCLASS_AUDIOSTREAMING,
+        0x00,
+        0,
+    ]);
+    app(&[
+        9,
+        DESC_INTERFACE,
+        2,
+        1,
+        1,
+        AUDIO_CLASS,
+        SUBCLASS_AUDIOSTREAMING,
+        0x00,
+        0,
+    ]);
     app(&uac1_as_general(ID_USB_STREAMING_OT));
     app(&uac1_type_i_format(fmt));
     app(&iso_endpoint(0x82, 0x0D, fmt));
@@ -545,7 +596,11 @@ mod tests {
     use super::*;
 
     fn fmt(rate: u32, bits: u16) -> CableFormat {
-        CableFormat { sample_rate: rate, bits, channels: 2 }
+        CableFormat {
+            sample_rate: rate,
+            bits,
+            channels: 2,
+        }
     }
 
     /// 内置支持矩阵：88.2k 及以下 16/24/32bit；88.2k 以上（96k 档）只 16bit
@@ -566,7 +621,8 @@ mod tests {
     fn every_supported_format_builds_and_validates() {
         for &(rate, bits) in SUPPORTED {
             let d = build(1, "", &fmt(rate, bits)).unwrap_or_else(|e| panic!("{rate}/{bits}: {e}"));
-            d.validate().unwrap_or_else(|e| panic!("{rate}/{bits} 自检失败: {e}"));
+            d.validate()
+                .unwrap_or_else(|e| panic!("{rate}/{bits} 自检失败: {e}"));
             // 包长 = 每毫秒字节数
             let pos = d
                 .config
@@ -574,26 +630,55 @@ mod tests {
                 .position(|c| c[1] == DESC_ENDPOINT && c[2] == 0x01)
                 .expect("播放端点存在");
             let wmax = u16::from_le_bytes([d.config[pos + 4], d.config[pos + 5]]);
-            assert_eq!(wmax, fmt(rate, bits).fs_wmax_packet(), "{rate}/{bits} 包长不符");
+            assert_eq!(
+                wmax,
+                fmt(rate, bits).fs_wmax_packet(),
+                "{rate}/{bits} 包长不符"
+            );
             assert!(wmax <= FS_MAX_PACKET, "{rate}/{bits} 超过全速单包上限");
             assert_eq!(d.config[pos + 6], 1, "{rate}/{bits} bInterval 应为 1");
             // 包长必须是整数个采样帧（真机实测：44.1k 系按标称字节数写会导致 Windows 认不出格式）
             let frame_size = (fmt(rate, bits).channels * fmt(rate, bits).subslot()) as u16;
-            assert_eq!(wmax % frame_size, 0, "{rate}/{bits} 包长 {wmax} 不是整帧（帧长 {frame_size}）");
-            assert!(wmax >= fmt(rate, bits).frame_bytes(), "{rate}/{bits} 包长小于标称需求");
+            assert_eq!(
+                wmax % frame_size,
+                0,
+                "{rate}/{bits} 包长 {wmax} 不是整帧（帧长 {frame_size}）"
+            );
+            assert!(
+                wmax >= fmt(rate, bits).frame_bytes(),
+                "{rate}/{bits} 包长小于标称需求"
+            );
         }
     }
 
     #[test]
     fn rejects_formats_beyond_builtin_capability() {
         // 96 kHz 以上一律拒绝（实测主机侧 ISO OUT 无法稳定承载）
-        assert!(build(1, "", &fmt(192_000, 16)).is_err(), "192k/16bit 应被拒绝");
-        assert!(build(1, "", &fmt(176_400, 16)).is_err(), "176.4k/16bit 应被拒绝");
-        assert!(build(1, "", &fmt(176_400, 24)).is_err(), "176.4k/24bit 应被拒绝");
-        assert!(build(1, "", &fmt(100_000, 16)).is_err(), "100k/16bit 应被拒绝（>96kHz）");
+        assert!(
+            build(1, "", &fmt(192_000, 16)).is_err(),
+            "192k/16bit 应被拒绝"
+        );
+        assert!(
+            build(1, "", &fmt(176_400, 16)).is_err(),
+            "176.4k/16bit 应被拒绝"
+        );
+        assert!(
+            build(1, "", &fmt(176_400, 24)).is_err(),
+            "176.4k/24bit 应被拒绝"
+        );
+        assert!(
+            build(1, "", &fmt(100_000, 16)).is_err(),
+            "100k/16bit 应被拒绝（>96kHz）"
+        );
         // 88.2k 以上只支持 16bit：双向（OUT+IN 同帧）96k/24 = 1152 B/ms 超全速帧预算
-        assert!(build(1, "", &fmt(96_000, 24)).is_err(), "96k/24bit 应被拒绝（双向带宽）");
-        assert!(build(1, "", &fmt(96_000, 32)).is_err(), "96k/32bit 应被拒绝（双向带宽）");
+        assert!(
+            build(1, "", &fmt(96_000, 24)).is_err(),
+            "96k/24bit 应被拒绝（双向带宽）"
+        );
+        assert!(
+            build(1, "", &fmt(96_000, 32)).is_err(),
+            "96k/32bit 应被拒绝（双向带宽）"
+        );
     }
 
     #[test]
@@ -613,44 +698,74 @@ mod tests {
         // 设备描述符：USB 1.1 全速、类字段全 0、无 qualifier
         assert_eq!(&d.device[2..4], &[0x10, 0x01], "bcdUSB = 0x0110");
         assert_eq!(&d.device[4..7], &[0x00, 0x00, 0x00], "类字段全 0");
-        assert!(d.get(DESC_QUALIFIER, 0).is_none(), "全速设备无 qualifier，请求应 STALL");
+        assert!(
+            d.get(DESC_QUALIFIER, 0).is_none(),
+            "全速设备无 qualifier，请求应 STALL"
+        );
 
         let cfg = &d.config;
         // AC 头：10 字节、bcdADC=0x0100、wTotalLength=72、bInCollection=2、baInterfaceNr=[1,2]
         // 布局：配置头(9) + AC 接口描述符(9) + AC 头
         assert_eq!(cfg[9 + 9], 10, "AC 头 bLength");
-        assert_eq!(&cfg[18..28], &[10, 0x24, 0x01, 0x00, 0x01, 72, 0, 2, 1, 2], "UAC1 AC 头");
+        assert_eq!(
+            &cfg[18..28],
+            &[10, 0x24, 0x01, 0x00, 0x01, 72, 0, 2, 1, 2],
+            "UAC1 AC 头"
+        );
         // 播放 AS：AS_GENERAL(7B) + FORMAT_TYPE_I(11B) + EP + CS_EP
-        assert!(cfg.windows(7).any(|w| w == [7, 0x24, 0x01, 1, 1, 0x01, 0x00]), "UAC1 AS_GENERAL");
         assert!(
-            cfg.windows(11).any(|w| w == [11, 0x24, 0x02, 1, 2, 2, 16, 1, 0x80, 0xBB, 0x00]),
+            cfg.windows(7)
+                .any(|w| w == [7, 0x24, 0x01, 1, 1, 0x01, 0x00]),
+            "UAC1 AS_GENERAL"
+        );
+        assert!(
+            cfg.windows(11)
+                .any(|w| w == [11, 0x24, 0x02, 1, 2, 2, 16, 1, 0x80, 0xBB, 0x00]),
             "UAC1 FORMAT_TYPE_I（48kHz/16bit 离散）"
         );
         // 端点：全速 bInterval=1，包长 = 每毫秒字节数 192
         assert!(
-            cfg.windows(9).any(|w| w == [9, 0x05, 0x01, 0x09, 0xC0, 0x00, 1, 0, 0]),
+            cfg.windows(9)
+                .any(|w| w == [9, 0x05, 0x01, 0x09, 0xC0, 0x00, 1, 0, 0]),
             "播放端点应等于参考实现 [.. 0x09, 0xC0, 0x00, 1 ..]"
         );
         assert!(
-            cfg.windows(9).any(|w| w == [9, 0x05, 0x82, 0x0D, 0xC0, 0x00, 1, 0, 0]),
+            cfg.windows(9)
+                .any(|w| w == [9, 0x05, 0x82, 0x0D, 0xC0, 0x00, 1, 0, 0]),
             "采集端点应等于参考实现（同步 IN）"
         );
         // CS 端点：UAC1 是 7 字节
-        assert!(cfg.windows(7).any(|w| w == [7, 0x25, 0x01, 0, 0, 0, 0]), "UAC1 CS 端点");
+        assert!(
+            cfg.windows(7).any(|w| w == [7, 0x25, 0x01, 0, 0, 0, 0]),
+            "UAC1 CS 端点"
+        );
     }
 
     #[test]
     fn all_interface_headers_are_uac1() {
         let d = build(1, "", &fmt(88_200, 24)).unwrap();
-        let ifaces: Vec<&[u8]> =
-            d.config.windows(9).filter(|c| c[0] == 9 && c[1] == DESC_INTERFACE).collect();
-        assert_eq!(ifaces.len(), 5, "AC(alt0) + 播放 AS(alt0/alt1) + 录音 AS(alt0/alt1)");
+        let ifaces: Vec<&[u8]> = d
+            .config
+            .windows(9)
+            .filter(|c| c[0] == 9 && c[1] == DESC_INTERFACE)
+            .collect();
+        assert_eq!(
+            ifaces.len(),
+            5,
+            "AC(alt0) + 播放 AS(alt0/alt1) + 录音 AS(alt0/alt1)"
+        );
         for iface in &ifaces {
             assert_eq!(iface[5], AUDIO_CLASS, "bInterfaceClass = AUDIO");
             assert_eq!(iface[7], 0x00, "UAC1 的 bInterfaceProtocol = 0");
         }
-        assert!(ifaces.iter().filter(|c| c[2] == 0).all(|c| c[6] == SUBCLASS_AUDIOCONTROL));
-        assert!(ifaces.iter().filter(|c| c[2] != 0).all(|c| c[6] == SUBCLASS_AUDIOSTREAMING));
+        assert!(ifaces
+            .iter()
+            .filter(|c| c[2] == 0)
+            .all(|c| c[6] == SUBCLASS_AUDIOCONTROL));
+        assert!(ifaces
+            .iter()
+            .filter(|c| c[2] != 0)
+            .all(|c| c[6] == SUBCLASS_AUDIOSTREAMING));
         assert_eq!(d.num_interfaces(), 3, "接口 0/1/2");
     }
 
@@ -673,7 +788,7 @@ mod tests {
         assert_eq!(fmt(44_100, 16).fs_wmax_packet(), 180); // 45 × 4
         assert_eq!(fmt(44_100, 32).fs_wmax_packet(), 360); // 45 × 8
         assert_eq!(fmt(88_200, 24).fs_wmax_packet(), 534); // 89 × 6
-        // 48k 系本来就是整帧，不能变
+                                                           // 48k 系本来就是整帧，不能变
         assert_eq!(fmt(48_000, 16).fs_wmax_packet(), 192);
         assert_eq!(fmt(96_000, 24).fs_wmax_packet(), 576);
         assert_eq!(fmt(96_000, 16).fs_wmax_packet(), 384);
@@ -708,7 +823,10 @@ mod tests {
         assert_eq!(a.serial, renamed.serial, "改名称不应换设备实例");
         // 格式变化：serial 必须变（新实例 → 缓存干净）
         let other = build(7, "x", &fmt(48_000, 24)).unwrap();
-        assert_ne!(a.serial, other.serial, "改格式必须换设备实例（usbaudio.sys 实例格式缓存）");
+        assert_ne!(
+            a.serial, other.serial,
+            "改格式必须换设备实例（usbaudio.sys 实例格式缓存）"
+        );
         let b = build(7, "y", &fmt(48_000, 24)).unwrap();
         assert_eq!(other.serial, b.serial);
     }

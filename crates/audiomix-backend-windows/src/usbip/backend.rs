@@ -91,7 +91,11 @@ impl AudioBackend for UsbIpBackend {
         Ok(devices)
     }
 
-    fn start_capture(&self, device_id: &str, mut on_data: CaptureCallback) -> Result<StartedStream> {
+    fn start_capture(
+        &self,
+        device_id: &str,
+        mut on_data: CaptureCallback,
+    ) -> Result<StartedStream> {
         let Some((number, "playback")) = parse_endpoint(device_id) else {
             return Err(Error::DeviceNotFound(device_id.into()));
         };
@@ -102,7 +106,10 @@ impl AudioBackend for UsbIpBackend {
             .find(|c| c.cfg.number == number)
             .cloned()
             .ok_or_else(|| Error::DeviceNotFound(device_id.into()))?;
-        let info = StreamInfo { sample_rate: cable.cfg.sample_rate, channels: 2 };
+        let info = StreamInfo {
+            sample_rate: cable.cfg.sample_rate,
+            channels: 2,
+        };
 
         // 10ms 一拍，但帧数按单调时钟累计算（见 frames_due）；不足补静音后推给混音引擎
         let rate = info.sample_rate as u64;
@@ -136,8 +143,7 @@ impl AudioBackend for UsbIpBackend {
                     let (p_avail, p_dropped, p_under) = cable.play_ring.stats();
                     let (c_avail, c_dropped, c_under) = cable.cap_ring.stats();
                     let active = (cable.playback_active(), cable.capture_active());
-                    let anomaly =
-                        (p_dropped, c_dropped) != last_dropped || active != last_active;
+                    let anomaly = (p_dropped, c_dropped) != last_dropped || active != last_active;
                     if anomaly || ticks % 3000 == 0 {
                         let fed_secs = fed as f64 / rate as f64;
                         let real = start.elapsed().as_secs_f64();
@@ -176,7 +182,10 @@ impl AudioBackend for UsbIpBackend {
             .find(|c| c.cfg.number == number)
             .cloned()
             .ok_or_else(|| Error::DeviceNotFound(device_id.into()))?;
-        let info = StreamInfo { sample_rate: cable.cfg.sample_rate, channels: 2 };
+        let info = StreamInfo {
+            sample_rate: cable.cfg.sample_rate,
+            channels: 2,
+        };
 
         // 10ms 一拍，帧数同样按单调时钟算；写入 cap_ring 供 ISO IN 侧取走
         let rate = info.sample_rate as u64;
@@ -266,7 +275,10 @@ mod tests {
         // 还没到下一拍时不应重复喂
         assert_eq!(frames_due(0.0, rate, cushion, fed), 0);
         // 单次补数有上限
-        assert_eq!(frames_due(100.0, rate, cushion, 0), (rate * MAX_CATCHUP_MS / 1000) as usize);
+        assert_eq!(
+            frames_due(100.0, rate, cushion, 0),
+            (rate * MAX_CATCHUP_MS / 1000) as usize
+        );
     }
 
     #[test]
@@ -274,12 +286,18 @@ mod tests {
         let backend = UsbIpBackend::new(registry_with(&[cable(1), cable(2)]));
         let devices = backend.enumerate_devices().unwrap();
         assert_eq!(devices.len(), 4);
-        let input = devices.iter().find(|d| d.id == "usbip://1/playback").unwrap();
+        let input = devices
+            .iter()
+            .find(|d| d.id == "usbip://1/playback")
+            .unwrap();
         assert_eq!(input.kind, DeviceKind::Input);
         assert!(input.is_virtual);
         assert_eq!(input.sample_rate, 48_000);
         assert!(input.name.contains("Virtual Cable 01"));
-        let output = devices.iter().find(|d| d.id == "usbip://1/capture").unwrap();
+        let output = devices
+            .iter()
+            .find(|d| d.id == "usbip://1/capture")
+            .unwrap();
         assert_eq!(output.kind, DeviceKind::Output);
         assert!(audiomix_core::model::looks_virtual(&input.name));
     }
@@ -314,9 +332,12 @@ mod tests {
         let got = Arc::new(parking_lot::Mutex::new(Vec::<f32>::new()));
         let got2 = got.clone();
         let stream = backend
-            .start_capture("usbip://1/playback", Box::new(move |d| {
-                got2.lock().extend_from_slice(d);
-            }))
+            .start_capture(
+                "usbip://1/playback",
+                Box::new(move |d| {
+                    got2.lock().extend_from_slice(d);
+                }),
+            )
             .unwrap();
         assert_eq!(stream.info.sample_rate, 48_000);
 
@@ -343,13 +364,17 @@ mod tests {
             backend.start_capture("wasapi://whatever", Box::new(|_| {})),
             Err(Error::DeviceNotFound(_))
         ));
-        assert!(backend.start_loopback("usbip://1/capture", Box::new(|_| {})).is_err());
+        assert!(backend
+            .start_loopback("usbip://1/capture", Box::new(|_| {}))
+            .is_err());
     }
 
     #[test]
     fn stop_flag_ends_thread() {
         let backend = UsbIpBackend::new(registry_with(&[cable(1)]));
-        let stream = backend.start_capture("usbip://1/playback", Box::new(|_| {})).unwrap();
+        let stream = backend
+            .start_capture("usbip://1/playback", Box::new(|_| {}))
+            .unwrap();
         assert!(!stream.handle.is_stopped());
         stream.handle.request_stop();
         // Drop 会 join 线程

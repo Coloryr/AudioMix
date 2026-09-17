@@ -1,5 +1,48 @@
+/* 主题变量：默认深色；App.vue 的主题开关给 <html> 挂 .light 类时覆盖为亮色 */
 :root {
   color-scheme: dark;
+  --bg: #101014;
+  --inset: #131317; /* 更深一度的面板（日志框） */
+  --surface: #1f1f23; /* 自绘卡片：画布节点、接线盒 */
+  --surface-2: #26262b; /* 右键菜单 */
+  --surface-pop: #232330; /* 画布悬浮属性面板 */
+  --surface-dsp: #232030; /* DSP 节点（紫调） */
+  --border: rgba(255, 255, 255, 0.18);
+  --border-weak: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.32);
+  --text: #e8e8ea;
+  --accent: #4b9cd3;
+  --accent-hover: #7cc0ea;
+  --purple-text: #cfa9f9;
+  --err-text: #ff7875;
+  --meter-track: rgba(255, 255, 255, 0.08);
+  --hover-soft: rgba(255, 255, 255, 0.1);
+  --hover-chip: rgba(255, 255, 255, 0.22);
+  --chip-strong: rgba(255, 255, 255, 0.38);
+  --wire-dim: rgba(255, 255, 255, 0.32);
+}
+
+html.light {
+  color-scheme: light;
+  --bg: #f2f4f8;
+  --inset: #e9ebf0;
+  --surface: #ffffff;
+  --surface-2: #f1f2f5;
+  --surface-pop: #ffffff;
+  --surface-dsp: #f7f3fd;
+  --border: rgba(0, 0, 0, 0.16);
+  --border-weak: rgba(0, 0, 0, 0.1);
+  --border-strong: rgba(0, 0, 0, 0.3);
+  --text: #1f2329;
+  --accent: #2b81bd;
+  --accent-hover: #1c6ca6;
+  --purple-text: #7647c4;
+  --err-text: #d03050;
+  --meter-track: rgba(0, 0, 0, 0.1);
+  --hover-soft: rgba(0, 0, 0, 0.06);
+  --hover-chip: rgba(0, 0, 0, 0.08);
+  --chip-strong: rgba(0, 0, 0, 0.16);
+  --wire-dim: rgba(0, 0, 0, 0.32);
 }
 
 html,
@@ -12,7 +55,7 @@ body,
 
 body {
   font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-  background: #101014;
+  background: var(--bg);
   overflow: hidden;
   /* 桌面应用观感：拖拽时不选中文字；输入框/文本域仍可选中 */
   user-select: none;
@@ -54,7 +97,7 @@ textarea,
   min-width: 120px;
   height: 8px;
   border-radius: 4px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--meter-track);
   overflow: hidden;
 }
 
@@ -68,9 +111,11 @@ textarea,
 .meter-fill.safe {
   background: #18a058;
 }
+
 .meter-fill.warm {
   background: #f0a020;
 }
+
 .meter-fill.hot {
   background: #d03050;
 }

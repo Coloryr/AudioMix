@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use audiomix_backend_windows::WindowsBackend;
 use audiomix_core::backend::{AudioBackend, CaptureCallback, RenderCallback};
-use audiomix_core::model::{DeviceKind, DeviceInfo};
+use audiomix_core::model::{DeviceInfo, DeviceKind};
 
 fn find_virtual(devices: &[DeviceInfo], kind: DeviceKind) -> Option<DeviceInfo> {
     devices
@@ -32,9 +32,12 @@ fn virtual_pair_copies_render_to_capture() {
     // ---- 渲染端：向虚拟输出播放 DC 0.4 ----
     const SIGNAL: f32 = 0.4;
     let render = backend
-        .start_render(&out.id, Box::new(move |buf: &mut [f32]| {
-            buf.fill(SIGNAL);
-        }) as RenderCallback)
+        .start_render(
+            &out.id,
+            Box::new(move |buf: &mut [f32]| {
+                buf.fill(SIGNAL);
+            }) as RenderCallback,
+        )
         .expect("打开虚拟输出失败");
 
     // ---- 采集端：从虚拟输入采集，累积到 buffer ----

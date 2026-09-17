@@ -88,7 +88,9 @@ static BUFFER: OnceLock<Arc<LogBuffer>> = OnceLock::new();
 
 /// 全局日志缓冲（首次调用时创建）
 pub fn buffer() -> Arc<LogBuffer> {
-    BUFFER.get_or_init(|| Arc::new(LogBuffer::default())).clone()
+    BUFFER
+        .get_or_init(|| Arc::new(LogBuffer::default()))
+        .clone()
 }
 
 /// 同时写 stdout、日志缓冲与日志文件的 writer
@@ -114,11 +116,18 @@ fn append_to_file(text: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if std::fs::metadata(&path).map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(false) {
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > MAX_FILE_BYTES)
+        .unwrap_or(false)
+    {
         let _ = std::fs::remove_file(&path);
     }
     use std::io::Write as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "{text}");
     }
 }

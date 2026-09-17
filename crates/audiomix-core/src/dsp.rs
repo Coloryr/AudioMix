@@ -13,8 +13,15 @@ use crate::model::DspKind;
 /// 便捷构造系数：钳到奈奎斯特内，Q 防负；构造失败（理论不可达）回退直通。
 fn coeffs(ty: Type<f32>, f0: f32, q: f32, fs: u32) -> Coefficients<f32> {
     let f0 = f0.clamp(10.0, fs as f32 / 2.0 - 100.0);
-    Coefficients::<f32>::from_params(ty, (fs as f32).hz(), f0.hz(), q.max(0.05))
-        .unwrap_or(Coefficients { a1: 0.0, a2: 0.0, b0: 1.0, b1: 0.0, b2: 0.0 })
+    Coefficients::<f32>::from_params(ty, (fs as f32).hz(), f0.hz(), q.max(0.05)).unwrap_or(
+        Coefficients {
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+        },
+    )
 }
 
 /// 每声道独立的 Direct Form 1 双二阶滤波器组
@@ -34,7 +41,10 @@ struct DelayLine {
 
 impl DelayLine {
     fn new(samples: usize) -> Self {
-        Self { buf: vec![0.0; samples.max(1)], pos: 0 }
+        Self {
+            buf: vec![0.0; samples.max(1)],
+            pos: 0,
+        }
     }
 
     #[inline]
@@ -48,10 +58,21 @@ impl DelayLine {
 
 /// 链中的一个节点（只在 `enabled` 时构建）
 enum Stage {
-    Gain { linear: f32 },
-    Delay { lines: Vec<DelayLine> },
+    Gain {
+        linear: f32,
+    },
+    Delay {
+        lines: Vec<DelayLine>,
+    },
     /// 级联的滤波器：外层 = 级数，内层 = 每声道一个
     Filters(Vec<BiquadBank>),
+    /// 峰值限幅器：每声道独立的峰值包络（attack 即时、release 指数衰减）
+    Limiter {
+        threshold: f32,
+        /// 每个样本的包络衰减系数（由 release_ms 与采样率换算）
+        release_coef: f32,
+        env: Vec<f32>,
+    },
     /// 全部置零（开关节点的「关」）
     Mute,
 }
@@ -85,7 +106,9 @@ impl DspChain {
             kind.clamp_params();
             match kind {
                 DspKind::Gain { db } => {
-                    stages.push(Stage::Gain { linear: 10f32.powf(db / 20.0) });
+                    stages.push(Stage::Gain {
+                        linear: 10f32.powf(db / 20.0),
+                    });
                 }
                 DspKind::Delay { ms } => {
                     let samples = ((ms as f64 / 1000.0) * rate as f64).round() as usize;
@@ -104,9 +127,21 @@ impl DspChain {
                     high_gain_db,
                     high_freq,
                 } => stages.push(Stage::Filters(vec![
-                    bank(Type::LowShelf(low_gain_db), low_freq, Q_BUTTERWORTH_F32, ch, rate),
+                    bank(
+                        Type::LowShelf(low_gain_db),
+                        low_freq,
+                        Q_BUTTERWORTH_F32,
+                        ch,
+                        rate,
+                    ),
                     bank(Type::PeakingEQ(mid_gain_db), mid_freq, mid_q, ch, rate),
-                    bank(Type::HighShelf(high_gain_db), high_freq, Q_BUTTERWORTH_F32, ch, rate),
+                    bank(
+                        Type::HighShelf(high_gain_db),
+                        high_freq,
+                        Q_BUTTERWORTH_F32,
+                        ch,
+                        rate,
+                    ),
                 ])),
                 DspKind::PeakEq { freq, gain_db, q } => stages.push(Stage::Filters(vec![bank(
                     Type::PeakingEQ(gain_db),
@@ -122,21 +157,47 @@ impl DspChain {
                         .map(|(&f, &g)| bank(Type::PeakingEQ(g), f, 1.41, ch, rate))
                         .collect(),
                 )),
-                DspKind::Highpass { freq, q } => {
-                    stages.push(Stage::Filters(vec![bank(Type::HighPass, freq, q, ch, rate)]))
-                }
+                DspKind::Highpass { freq, q } => stages.push(Stage::Filters(vec![bank(
+                    Type::HighPass,
+                    freq,
+                    q,
+                    ch,
+                    rate,
+                )])),
                 DspKind::Lowpass { freq, q } => {
                     stages.push(Stage::Filters(vec![bank(Type::LowPass, freq, q, ch, rate)]))
                 }
-                DspKind::Bandpass { low_freq, high_freq } => {
+                DspKind::Bandpass {
+                    low_freq,
+                    high_freq,
+                } => {
                     // 中心 = 几何平均，Q = 中心 / 带宽（clamp_params 保证 high > low）。
                     // biquad 的 BandPass 是恒裙增益变体（中心增益 = Q），补 1/Q 恢复 0dB 峰值
                     let center = (low_freq * high_freq).sqrt();
                     let q = (center / (high_freq - low_freq)).max(0.05);
-                    stages.push(Stage::Filters(vec![bank(Type::BandPass, center, q, ch, rate)]));
+                    stages.push(Stage::Filters(vec![bank(
+                        Type::BandPass,
+                        center,
+                        q,
+                        ch,
+                        rate,
+                    )]));
                     stages.push(Stage::Gain { linear: 1.0 / q });
                 }
                 DspKind::Switch => {} // 在 match 前特判：开 = 无级直通，关 = Mute 级
+                DspKind::Limiter {
+                    threshold_db,
+                    release_ms,
+                } => {
+                    // 包络按指数衰减：release_ms 衰减到 1/e（-8.7dB），每样本系数 = exp(-1/(ms*rate/1000))
+                    let tau = (release_ms as f64 / 1000.0) * rate as f64;
+                    let release_coef = (-1.0 / tau.max(1.0)).exp() as f32;
+                    stages.push(Stage::Limiter {
+                        threshold: 10f32.powf(threshold_db / 20.0),
+                        release_coef,
+                        env: vec![0.0; ch],
+                    });
+                }
             }
         }
         Self { stages, ch }
@@ -171,6 +232,26 @@ impl DspChain {
                         }
                     }
                 }
+                Stage::Limiter {
+                    threshold,
+                    release_coef,
+                    env,
+                } => {
+                    // 峰值包络：attack 即时（超阈立刻压），release 按指数衰减回 1
+                    for (i, s) in io.iter_mut().enumerate() {
+                        let e = &mut env[i % ch];
+                        let peak = s.abs();
+                        if peak > *e {
+                            *e = peak; // attack 即时：新峰直接抬包络
+                        } else {
+                            *e *= *release_coef;
+                        }
+                        // 包络超阈值时按比例衰减增益（软一点可以用平方根，硬限幅就是线性比）
+                        if *e > *threshold {
+                            *s *= *threshold / *e;
+                        }
+                    }
+                }
                 Stage::Mute => {
                     for s in io.iter_mut() {
                         *s = 0.0;
@@ -187,7 +268,10 @@ mod tests {
     use crate::model::{DspKind, DspNode};
 
     fn node(kind: DspKind) -> DspNode {
-        DspNode { kind, enabled: true }
+        DspNode {
+            kind,
+            enabled: true,
+        }
     }
 
     /// 构建单个节点的链（控制 enabled，用于开关节点等需要区分开/关的用例）
@@ -199,8 +283,13 @@ mod tests {
     fn magnitude_at(c: &Coefficients<f32>, f: f32, fs: u32) -> f32 {
         let w = 2.0 * std::f64::consts::PI * f as f64 / fs as f64;
         let (wr, wi) = (w.cos(), w.sin());
-        let (b0, b1, b2, a1, a2) =
-            (c.b0 as f64, c.b1 as f64, c.b2 as f64, c.a1 as f64, c.a2 as f64);
+        let (b0, b1, b2, a1, a2) = (
+            c.b0 as f64,
+            c.b1 as f64,
+            c.b2 as f64,
+            c.a1 as f64,
+            c.a2 as f64,
+        );
         let num_re = b0 + b1 * wr + b2 * (2.0 * w).cos();
         let num_im = -(b1 * wi + b2 * (2.0 * w).sin());
         let den_re = 1.0 + a1 * wr + a2 * (2.0 * w).cos();
@@ -217,7 +306,10 @@ mod tests {
         // 中心频率处幅度 ≈ 增益（+12dB ≈ 4 倍）
         let g_boost = magnitude_at(&boost, 1000.0, fs);
         let g_cut = magnitude_at(&cut, 1000.0, fs);
-        assert!((g_boost - 3.98).abs() < 0.15, "peaking +12dB @1k = {g_boost}");
+        assert!(
+            (g_boost - 3.98).abs() < 0.15,
+            "peaking +12dB @1k = {g_boost}"
+        );
         assert!((g_cut - 0.251).abs() < 0.02, "peaking -12dB @1k = {g_cut}");
         // 离中心远的频段几乎不受影响
         assert!((magnitude_at(&boost, 100.0, fs) - 1.0).abs() < 0.1);
@@ -281,8 +373,14 @@ mod tests {
         assert!(io.iter().all(|&v| (v - 0.1).abs() < 1e-6));
 
         // bypass 节点不进链 → 空链直通
-        let mut chain_off =
-            DspChain::new(&[DspNode { kind: DspKind::Gain { db: -20.0 }, enabled: false }], 48_000, 2);
+        let mut chain_off = DspChain::new(
+            &[DspNode {
+                kind: DspKind::Gain { db: -20.0 },
+                enabled: false,
+            }],
+            48_000,
+            2,
+        );
         assert!(chain_off.is_empty());
         let mut io = vec![1.0f32; 8];
         chain_off.process(&mut io);
@@ -298,20 +396,40 @@ mod tests {
         io[0] = 1.0; // 左（帧 0 的 ch0）
         io[1] = 0.5; // 右（帧 0 的 ch1）
         chain.process(&mut io);
-        let left: Vec<f32> =
-            io.iter().enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, v)| *v).collect();
-        let right: Vec<f32> =
-            io.iter().enumerate().filter(|(i, _)| i % 2 == 1).map(|(_, v)| *v).collect();
-        assert!(left[..48].iter().all(|&v| v == 0.0), "延迟期间左声道应为静音");
+        let left: Vec<f32> = io
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(_, v)| *v)
+            .collect();
+        let right: Vec<f32> = io
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, v)| *v)
+            .collect();
+        assert!(
+            left[..48].iter().all(|&v| v == 0.0),
+            "延迟期间左声道应为静音"
+        );
         assert_eq!(left[48], 1.0, "左通道冲激应延迟 48 帧出现");
-        assert!(right[..48].iter().all(|&v| v == 0.0), "右声道同样延迟 48 帧（不应被左声道影响）");
+        assert!(
+            right[..48].iter().all(|&v| v == 0.0),
+            "右声道同样延迟 48 帧（不应被左声道影响）"
+        );
         assert_eq!(right[48], 0.5, "右声道自己的样本延迟 48 帧回来");
     }
 
     #[test]
     fn graph_eq_ten_bands_roundtrip() {
         // 10 段全 0 增益 = 直通
-        let mut chain = DspChain::new(&[node(DspKind::GraphEq { gains_db: [0.0; 10] })], 48_000, 1);
+        let mut chain = DspChain::new(
+            &[node(DspKind::GraphEq {
+                gains_db: [0.0; 10],
+            })],
+            48_000,
+            1,
+        );
         let mut io: Vec<f32> = (0..100).map(|i| (i as f32 * 0.01).sin()).collect();
         let before = io.clone();
         chain.process(&mut io);
@@ -323,14 +441,24 @@ mod tests {
     #[test]
     fn highpass_chain_attenuates_bass() {
         // 高通 200Hz：50Hz 正弦应被显著衰减
-        let mut chain = DspChain::new(&[node(DspKind::Highpass { freq: 200.0, q: 0.707 })], 48_000, 1);
+        let mut chain = DspChain::new(
+            &[node(DspKind::Highpass {
+                freq: 200.0,
+                q: 0.707,
+            })],
+            48_000,
+            1,
+        );
         let n = 48_00; // 100ms
         let mut io: Vec<f32> = (0..n)
             .map(|i| (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 48_000.0).sin())
             .collect();
         chain.process(&mut io);
         let tail_peak = io[n / 2..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        assert!(tail_peak < 0.2, "50Hz 通过 200Hz 高通后峰值应 <0.2，实际 {tail_peak}");
+        assert!(
+            tail_peak < 0.2,
+            "50Hz 通过 200Hz 高通后峰值应 <0.2，实际 {tail_peak}"
+        );
     }
 
     #[test]
@@ -350,11 +478,19 @@ mod tests {
     #[test]
     fn bandpass_low_high_params() {
         // 300–3000Hz 带通：带内 1000Hz 基本保留，带外 50Hz / 10kHz 显著衰减
-        let mut chain = DspChain::new(&[node(DspKind::Bandpass { low_freq: 300.0, high_freq: 3000.0 })], 48_000, 1);
+        let mut chain = DspChain::new(
+            &[node(DspKind::Bandpass {
+                low_freq: 300.0,
+                high_freq: 3000.0,
+            })],
+            48_000,
+            1,
+        );
         for (f, expect_keep) in [(1000.0, true), (50.0, false), (10_000.0, false)] {
             let n = 9600; // 200ms
-            let mut io: Vec<f32> =
-                (0..n).map(|i| (2.0 * std::f32::consts::PI * f * i as f32 / 48_000.0).sin()).collect();
+            let mut io: Vec<f32> = (0..n)
+                .map(|i| (2.0 * std::f32::consts::PI * f * i as f32 / 48_000.0).sin())
+                .collect();
             chain.process(&mut io);
             let tail_peak = io[n / 2..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
             if expect_keep {
@@ -367,12 +503,58 @@ mod tests {
     }
 
     #[test]
+    fn limiter_caps_output_at_threshold() {
+        // 阈值 -6dB（0.5 线性）、快速释放：0dBFS 正弦的输出峰值应被压到 ≈ 阈值
+        let mut chain = DspChain::new(
+            &[node(DspKind::Limiter {
+                threshold_db: -6.0,
+                release_ms: 50.0,
+            })],
+            48_000,
+            1,
+        );
+        let n = 4_800; // 100ms，正弦走稳后取尾部峰值
+        let mut io: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin())
+            .collect();
+        chain.process(&mut io);
+        let tail_peak = io[n / 2..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        // -6dB 的线性阈值 = 10^(-6/20) ≈ 0.5012（不是精确 0.5），容差给到 0.5+
+        assert!(
+            tail_peak <= 0.5 + 0.01,
+            "输出峰值 {tail_peak} 应 ≈ 阈值 0.5"
+        );
+        assert!(
+            tail_peak > 0.4,
+            "峰值 {tail_peak} 不应被过度压（限幅器不是静音器）"
+        );
+        // -12dB 的小信号不应被压：直通
+        let mut chain2 = DspChain::new(
+            &[node(DspKind::Limiter {
+                threshold_db: -6.0,
+                release_ms: 50.0,
+            })],
+            48_000,
+            1,
+        );
+        let mut io2: Vec<f32> = (0..960)
+            .map(|i| 0.2 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin())
+            .collect();
+        chain2.process(&mut io2);
+        let peak2 = io2.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!((peak2 - 0.2).abs() < 1e-3, "阈下信号应直通，峰值 {peak2}");
+    }
+
+    #[test]
     fn params_are_clamped_at_build() {
         let _chain = DspChain::new(&[node(DspKind::Delay { ms: 99999.0 })], 48_000, 1);
         // 只要不 panic / 不爆内存即可（1000ms 上限 → 48000 样本）
         let mut chain = DspChain::new(&[node(DspKind::Gain { db: -999.0 })], 48_000, 1);
         let mut io = vec![1.0f32; 4];
         chain.process(&mut io);
-        assert!(io.iter().all(|v| *v <= 0.001), "超低增益应被钳到 -60dB 附近");
+        assert!(
+            io.iter().all(|v| *v <= 0.001),
+            "超低增益应被钳到 -60dB 附近"
+        );
     }
 }

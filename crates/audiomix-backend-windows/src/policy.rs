@@ -119,7 +119,9 @@ pub fn set_default_endpoint_roles(device_id: &str, roles: &[Role]) -> Result<(),
 // ---------- 端点（Windows 系统）音量 ----------
 
 /// 打开某个端点的音量控制接口
-unsafe fn endpoint_volume(device_id: &str) -> Result<windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume, String> {
+unsafe fn endpoint_volume(
+    device_id: &str,
+) -> Result<windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume, String> {
     use windows::core::HSTRING;
     use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator};
 
@@ -138,7 +140,9 @@ unsafe fn endpoint_volume(device_id: &str) -> Result<windows::Win32::Media::Audi
 ///
 /// 轻量查询：用于「默认设备守护」高频轮询，不必枚举全部端点。
 pub fn default_endpoint_id(render: bool) -> Option<String> {
-    use windows::Win32::Media::Audio::{eCapture, eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+    use windows::Win32::Media::Audio::{
+        eCapture, eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
+    };
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let enumerator: IMMDeviceEnumerator =
@@ -275,14 +279,19 @@ mod tests {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).expect("枚举器");
-            let dev = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).expect("默认输出");
+            let dev = enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .expect("默认输出");
             dev.GetId().expect("端点 id").to_string().expect("转字符串")
         };
         let level = get_endpoint_volume(&current).expect("应能读到系统音量");
         assert!((0.0..=1.0).contains(&level), "音量应在 0..1：{level}");
         set_endpoint_volume(&current, level).expect("应能设置系统音量");
         let after = get_endpoint_volume(&current).expect("再读一次");
-        assert!((after - level).abs() < 0.02, "写回后应基本一致：{level} vs {after}");
+        assert!(
+            (after - level).abs() < 0.02,
+            "写回后应基本一致：{level} vs {after}"
+        );
         let mute = get_endpoint_mute(&current).expect("应能读静音状态");
         set_endpoint_mute(&current, mute).expect("写回静音状态");
     }
@@ -299,7 +308,9 @@ mod tests {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).expect("枚举器");
-            let dev = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).expect("默认输出");
+            let dev = enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .expect("默认输出");
             dev.GetId().expect("端点 id").to_string().expect("转字符串")
         };
         println!("当前默认输出: {current}");

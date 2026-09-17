@@ -49,7 +49,12 @@ impl From<UsbIpCableSettings> for CableConfig {
 
 /// 设置里的线缆表 → 后端线缆配置（启动服务器用）
 pub fn cable_configs(settings: &UsbIpSettings) -> Vec<CableConfig> {
-    settings.cables.iter().cloned().map(CableConfig::from).collect()
+    settings
+        .cables
+        .iter()
+        .cloned()
+        .map(CableConfig::from)
+        .collect()
 }
 
 /// 从 `host:port` 形式拆出（host, port）；缺端口时用默认 3240
@@ -136,7 +141,11 @@ impl UsbIpManager {
     /// ② accept 任务的 abort 是异步的，紧接着 bind 会撞上自己还没释放的监听套接字
     ///    （实测就是用户看到的「绑定 127.0.0.1:3240 失败（端口被占用？）」）。
     /// 已接入的设备保持连接，改格式/改名要重新 attach 才生效（UI 已提示）。
-    pub fn start(&self, rt: &tokio::runtime::Handle, configs: Vec<CableConfig>) -> Result<(), String> {
+    pub fn start(
+        &self,
+        rt: &tokio::runtime::Handle,
+        configs: Vec<CableConfig>,
+    ) -> Result<(), String> {
         // 先建线缆：描述符自检不过就别动正在跑的服务
         let mut seen = std::collections::HashSet::new();
         let mut cables = Vec::with_capacity(configs.len());
@@ -150,7 +159,10 @@ impl UsbIpManager {
         if self.running() {
             let count = cables.len();
             *self.registry.write() = cables;
-            tracing::info!("USB/IP 服务器线缆已更新（{count} 条，继续监听 {}）", self.bind);
+            tracing::info!(
+                "USB/IP 服务器线缆已更新（{count} 条，继续监听 {}）",
+                self.bind
+            );
             return Ok(());
         }
 
@@ -170,7 +182,10 @@ impl UsbIpManager {
 
     /// 绑定监听套接字：先等上一次的 accept 任务真正退出（它一退出，
     /// JoinSet 就把所有会话连套接字一起关掉），再带重试地 bind。
-    fn bind_listener(&self, rt: &tokio::runtime::Handle) -> Result<tokio::net::TcpListener, String> {
+    fn bind_listener(
+        &self,
+        rt: &tokio::runtime::Handle,
+    ) -> Result<tokio::net::TcpListener, String> {
         self.close_task(BIND_RELEASE_WAIT);
 
         let mut last_err = String::new();
@@ -191,7 +206,10 @@ impl UsbIpManager {
             }
         }
         let std_listener = bound.ok_or_else(|| {
-            format!("绑定 {} 失败: {last_err}（端口被其它程序占用？先关掉占用者再试）", self.bind)
+            format!(
+                "绑定 {} 失败: {last_err}（端口被其它程序占用？先关掉占用者再试）",
+                self.bind
+            )
         })?;
         std_listener
             .set_nonblocking(true)
@@ -284,7 +302,10 @@ mod tests {
         let settings = UsbIpSettings {
             enabled: true,
             bind: "127.0.0.1:3240".into(),
-            cables: vec![UsbIpCableSettings { number: 5, ..Default::default() }],
+            cables: vec![UsbIpCableSettings {
+                number: 5,
+                ..Default::default()
+            }],
         };
         let cfgs = cable_configs(&settings);
         let cable = Cable::new(cfgs[0].clone()).unwrap();
@@ -293,14 +314,23 @@ mod tests {
 
     #[test]
     fn bind_address_is_split() {
-        assert_eq!(split_host_port("127.0.0.1:3240"), ("127.0.0.1".into(), 3240));
-        assert_eq!(split_host_port("127.0.0.1:4000"), ("127.0.0.1".into(), 4000));
+        assert_eq!(
+            split_host_port("127.0.0.1:3240"),
+            ("127.0.0.1".into(), 3240)
+        );
+        assert_eq!(
+            split_host_port("127.0.0.1:4000"),
+            ("127.0.0.1".into(), 4000)
+        );
         assert_eq!(split_host_port("0.0.0.0:0"), ("0.0.0.0".into(), 0));
         assert_eq!(split_host_port("127.0.0.1"), ("127.0.0.1".into(), 3240));
     }
 
     fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -320,7 +350,9 @@ mod tests {
     fn duplicate_numbers_rejected() {
         let manager = UsbIpManager::new("127.0.0.1:0");
         let rt = runtime();
-        let err = manager.start(rt.handle(), vec![cfg(1), cfg(1)]).unwrap_err();
+        let err = manager
+            .start(rt.handle(), vec![cfg(1), cfg(1)])
+            .unwrap_err();
         assert!(err.contains("重复"));
         assert!(!manager.running());
     }
@@ -329,7 +361,10 @@ mod tests {
     fn bad_format_rejected() {
         let manager = UsbIpManager::new("127.0.0.1:0");
         let rt = runtime();
-        let bad = CableConfig { sample_rate: 8000, ..cfg(1) };
+        let bad = CableConfig {
+            sample_rate: 8000,
+            ..cfg(1)
+        };
         assert!(manager.start(rt.handle(), vec![bad]).is_err());
         assert!(!manager.running());
     }

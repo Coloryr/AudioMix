@@ -69,7 +69,9 @@ fn engine_sees_physical_and_usbip_devices() {
         assert_eq!(playback.kind, audiomix_core::DeviceKind::Input);
         assert!(playback.is_virtual);
         assert_eq!(playback.channels, 2);
-        assert!(playback.name.contains(&format!("Virtual Cable {number:02}")));
+        assert!(playback
+            .name
+            .contains(&format!("Virtual Cable {number:02}")));
 
         let capture = devices
             .iter()
@@ -80,9 +82,15 @@ fn engine_sees_physical_and_usbip_devices() {
     }
 
     // 格式随配置走（内置 UAC1：44.1–96kHz 的 16/24/32bit，176.4/192kHz 只 16bit）
-    let c1 = devices.iter().find(|d| d.id == "usbip://1/playback").unwrap();
+    let c1 = devices
+        .iter()
+        .find(|d| d.id == "usbip://1/playback")
+        .unwrap();
     assert_eq!(c1.sample_rate, 48_000);
-    let c3 = devices.iter().find(|d| d.id == "usbip://3/capture").unwrap();
+    let c3 = devices
+        .iter()
+        .find(|d| d.id == "usbip://3/capture")
+        .unwrap();
     assert_eq!(c3.sample_rate, 96_000);
 
     // 物理设备（若本机存在）与虚拟设备共存，且 id 不冲突
@@ -140,7 +148,9 @@ fn composite_backend_routes_streams_by_device_id() {
         Err(audiomix_core::Error::DeviceNotFound(_))
     ));
     // USB/IP 线缆不支持 loopback 采集（回环由线缆内部完成）
-    assert!(composite.start_loopback("usbip://1/capture", Box::new(|_| {})).is_err());
+    assert!(composite
+        .start_loopback("usbip://1/capture", Box::new(|_| {}))
+        .is_err());
 
     // 采集流能真正跑起来：往线缆回环写入后，源回调应收到数据
     let (tx, rx) = std::sync::mpsc::channel::<usize>();

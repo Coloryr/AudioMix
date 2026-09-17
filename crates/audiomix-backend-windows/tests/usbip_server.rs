@@ -135,16 +135,15 @@ impl Client {
 
     async fn op_reply(&mut self) -> (u16, u32) {
         let b = self.read_n(8).await;
-        (
-            u16::from_be_bytes([b[2], b[3]]),
-            be32(&b, 4),
-        )
+        (u16::from_be_bytes([b[2], b[3]]), be32(&b, 4))
     }
 
     async fn read_device(&mut self) -> UsbDevice {
         let b = self.read_n(DEVICE_LEN).await;
         let cstr = |r: std::ops::Range<usize>| {
-            String::from_utf8_lossy(&b[r]).trim_end_matches('\0').to_string()
+            String::from_utf8_lossy(&b[r])
+                .trim_end_matches('\0')
+                .to_string()
         };
         UsbDevice {
             path: cstr(0..256),
@@ -223,13 +222,27 @@ impl Client {
                 });
             }
         }
-        Reply { sequence, status, actual, packets, data }
+        Reply {
+            sequence,
+            status,
+            actual,
+            packets,
+            data,
+        }
     }
 
     /// EP0 控制传输
     async fn control(&mut self, seq: u32, setup: [u8; 8], out: &[u8], in_len: u32) -> Reply {
-        let dir = if setup[0] & 0x80 != 0 { DIR_IN } else { DIR_OUT };
-        let transfer_len = if dir == DIR_OUT { out.len() as u32 } else { in_len };
+        let dir = if setup[0] & 0x80 != 0 {
+            DIR_IN
+        } else {
+            DIR_OUT
+        };
+        let transfer_len = if dir == DIR_OUT {
+            out.len() as u32
+        } else {
+            in_len
+        };
         self.submit(&SubmitSpec {
             seq,
             ep: 0,
@@ -266,7 +279,14 @@ impl Client {
 }
 
 fn cable_config(number: u8, rate: u32, bits: u16) -> CableConfig {
-    CableConfig { number, name: String::new(), sample_rate: rate, bits, mode: CableMode::Loopback, buffer_ms: 250 }
+    CableConfig {
+        number,
+        name: String::new(),
+        sample_rate: rate,
+        bits,
+        mode: CableMode::Loopback,
+        buffer_ms: 250,
+    }
 }
 
 /// 探一个当前空闲的端口（绑定 :0 拿到端口号后立刻释放）
@@ -310,7 +330,10 @@ fn pcm_ramp(bytes: usize) -> Vec<u8> {
 
 #[tokio::test]
 async fn devlist_reports_full_speed_uac1_device() {
-    let (_m, addr) = start_server(vec![cable_config(1, 48_000, 16), cable_config(2, 96_000, 16)]);
+    let (_m, addr) = start_server(vec![
+        cable_config(1, 48_000, 16),
+        cable_config(2, 96_000, 16),
+    ]);
 
     let mut c = Client::connect(addr).await;
     c.op_request(OP_REQ_DEVLIST).await;
@@ -332,12 +355,20 @@ async fn devlist_reports_full_speed_uac1_device() {
     assert_eq!(first.config_value, 1);
     assert_eq!(first.num_configs, 1);
     assert_eq!(first.num_interfaces, 3, "AC + 播放 AS + 录音 AS");
-    assert!(first.path.contains("1-1"), "path 应包含 busid：{}", first.path);
+    assert!(
+        first.path.contains("1-1"),
+        "path 应包含 busid：{}",
+        first.path
+    );
     // 接口记录：AC + 2×AS（UAC1：class=AUDIO、subclass=AC/AS、proto=0）
     let expected = [[0x01u8, 0x01, 0x00], [0x01, 0x02, 0x00], [0x01, 0x02, 0x00]];
     for exp in expected.iter().take(first.num_interfaces as usize) {
         let iface = c.read_n(4).await;
-        assert_eq!(&iface[..3], &exp[..], "接口记录 class/subclass/proto：{iface:02x?}");
+        assert_eq!(
+            &iface[..3],
+            &exp[..],
+            "接口记录 class/subclass/proto：{iface:02x?}"
+        );
         assert_eq!(iface[3], 0, "padding 必须为 0");
     }
 
@@ -384,27 +415,44 @@ async fn full_session_control_then_iso_roundtrip() {
     let r = c.control(1, [0x00, 0x09, 1, 0, 0, 0, 0, 0], &[], 0).await;
     assert_eq!(r.status, STATUS_OK, "SET_CONFIGURATION(1)");
     for (seq, iface) in [(2u32, 1u8), (3, 2)] {
-        let r = c.control(seq, [0x01, 0x0B, 1, 0, iface, 0, 0, 0], &[], 0).await;
+        let r = c
+            .control(seq, [0x01, 0x0B, 1, 0, iface, 0, 0, 0], &[], 0)
+            .await;
         assert_eq!(r.status, STATUS_OK, "SET_INTERFACE({iface}, alt=1)");
     }
     // 设备描述符
-    let r = c.control(4, [0x80, 0x06, 0x00, 0x01, 0, 0, 18, 0], &[], 18).await;
+    let r = c
+        .control(4, [0x80, 0x06, 0x00, 0x01, 0, 0, 18, 0], &[], 18)
+        .await;
     assert_eq!(r.status, STATUS_OK);
     assert_eq!(r.data.len(), 18);
     assert_eq!(r.data[1], 0x01);
     assert_eq!(r.data[8], 0xFF, "idVendor = 0xFFFF");
 
     // UAC1 端点采样率：GET_CUR（真实 usbaudio.sys 发的 0xA2：class IN + endpoint recipient）
-    let r = c.control(5, [0xA2, 0x81, 0x00, 0x01, 0x01, 0x00, 3, 0], &[], 3).await;
+    let r = c
+        .control(5, [0xA2, 0x81, 0x00, 0x01, 0x01, 0x00, 3, 0], &[], 3)
+        .await;
     assert_eq!(r.status, STATUS_OK, "GET_CUR(采样率) 不能 STALL");
-    assert_eq!(r.data, vec![0x80, 0xBB, 0x00], "48000 = 0x00BB80 小端 3 字节");
+    assert_eq!(
+        r.data,
+        vec![0x80, 0xBB, 0x00],
+        "48000 = 0x00BB80 小端 3 字节"
+    );
     // GET_MIN / GET_MAX 也返回该离散值
-    let r = c.control(6, [0xA2, 0x83, 0x00, 0x01, 0x01, 0x00, 3, 0], &[], 3).await;
+    let r = c
+        .control(6, [0xA2, 0x83, 0x00, 0x01, 0x01, 0x00, 3, 0], &[], 3)
+        .await;
     assert_eq!(r.status, STATUS_OK, "GET_MAX(采样率) 不能 STALL");
     assert_eq!(r.data, vec![0x80, 0xBB, 0x00]);
     // 不支持的采样率 SET_CUR → STALL（EPIPE）
     let r = c
-        .control(7, [0x22, 0x01, 0x00, 0x01, 0x01, 0x00, 3, 0], &44_100u32.to_le_bytes()[0..3], 0)
+        .control(
+            7,
+            [0x22, 0x01, 0x00, 0x01, 0x01, 0x00, 3, 0],
+            &44_100u32.to_le_bytes()[0..3],
+            0,
+        )
         .await;
     assert_eq!(r.status, STATUS_PIPE, "未配置的采样率必须 STALL");
 
@@ -431,7 +479,9 @@ async fn full_session_control_then_iso_roundtrip() {
     assert_eq!(r.actual, pcm.len() as u32, "OUT 应接受全部字节");
     assert_eq!(r.packets.len(), frames as usize, "iso 应答包数 = 描述符数");
     assert!(
-        r.packets.iter().all(|p| p.status == STATUS_OK && p.actual_length == BYTES_PER_MS as u32),
+        r.packets
+            .iter()
+            .all(|p| p.status == STATUS_OK && p.actual_length == BYTES_PER_MS as u32),
         "每包 actual_length 应等于请求长度：{:?}",
         r.packets
     );
@@ -470,13 +520,18 @@ async fn full_session_control_then_iso_roundtrip() {
         packets: 200,
         setup: [0; 8],
         payload: Vec::new(),
-        descs: (0..200u32).map(|i| (i * BYTES_PER_MS as u32, BYTES_PER_MS as u32)).collect(),
+        descs: (0..200u32)
+            .map(|i| (i * BYTES_PER_MS as u32, BYTES_PER_MS as u32))
+            .collect(),
     })
     .await;
     c.unlink(14, 13).await;
     let (seq, status) = c.read_unlink_reply().await;
     assert_eq!(seq, 14);
-    assert_eq!(status, STATUS_CONN_RESET, "成功取消排队 iso 必须回 -ECONNRESET");
+    assert_eq!(
+        status, STATUS_CONN_RESET,
+        "成功取消排队 iso 必须回 -ECONNRESET"
+    );
     // 被取消的请求不应再有应答（其完成时刻在 200ms 之后）
     let mut probe = [0u8; HEADER_LEN];
     let early = tokio::time::timeout(Duration::from_millis(60), c.s.read_exact(&mut probe)).await;
@@ -589,7 +644,9 @@ async fn save_cables_while_attached_does_not_rebind_port() {
     let port = free_port();
     let manager = UsbIpManager::new(format!("127.0.0.1:{port}"));
     let rt = tokio::runtime::Handle::current();
-    manager.start(&rt, vec![cable_config(1, 48_000, 16)]).expect("服务器应能启动");
+    manager
+        .start(&rt, vec![cable_config(1, 48_000, 16)])
+        .expect("服务器应能启动");
     let addr = manager.local_addr().expect("应能查到监听地址");
 
     // 已接入的设备：长连接一直挂着
@@ -623,7 +680,9 @@ async fn stop_releases_port_with_live_session_then_restart_works() {
     let port = free_port();
     let manager = UsbIpManager::new(format!("127.0.0.1:{port}"));
     let rt = tokio::runtime::Handle::current();
-    manager.start(&rt, vec![cable_config(1, 48_000, 16)]).expect("服务器应能启动");
+    manager
+        .start(&rt, vec![cable_config(1, 48_000, 16)])
+        .expect("服务器应能启动");
     let addr = manager.local_addr().expect("应能查到监听地址");
 
     let mut c = Client::connect(addr).await;

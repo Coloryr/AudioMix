@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use audiomix_control_api::{spawn, ApiServer};
-use audiomix_core::Engine;
 use audiomix_core::model::{GraphConfig, Route, Sink, Source, SourceMode};
 use audiomix_core::testing::FakeBackend;
+use audiomix_core::Engine;
 
 /// 发送 HTTP 请求并读取完整响应文本。
 /// 不主动 shutdown 写端：hyper 会把客户端半关闭当作连接中止；
@@ -143,7 +143,10 @@ async fn graph_apply_starts_streams() {
 
     // status 应报告 fake 后端
     let resp = get(server.addr, "/api/status").await;
-    assert!(resp.contains("\"backend\":\"fake\""), "status 应含后端名: {resp}");
+    assert!(
+        resp.contains("\"backend\":\"fake\""),
+        "status 应含后端名: {resp}"
+    );
     assert!(resp.contains("\"levels\""), "status 应含电平表: {resp}");
     assert!(resp.contains("\"stats\""), "status 应含统计: {resp}");
 }
@@ -163,7 +166,9 @@ async fn sse_receives_graph_applied_event() {
     // 连上 SSE 后保持连接，触发 PUT，循环读直到收到事件
     let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
     stream
-        .write_all(b"GET /api/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n")
+        .write_all(
+            b"GET /api/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n",
+        )
         .await
         .unwrap();
 

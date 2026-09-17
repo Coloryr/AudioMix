@@ -14,8 +14,8 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
     SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiOpenDeviceInfoW,
     SetupDiSetDeviceRegistryPropertyW, DIF_REGISTERDEVICE, DIGCF_ALLCLASSES, DIGCF_PRESENT,
-    DIINSTALLDEVICE_FLAGS, HDEVINFO, SETUP_DI_DEVICE_CREATION_FLAGS, SP_DEVINFO_DATA,
-    SPDRP_HARDWAREID,
+    DIINSTALLDEVICE_FLAGS, HDEVINFO, SETUP_DI_DEVICE_CREATION_FLAGS, SPDRP_HARDWAREID,
+    SP_DEVINFO_DATA,
 };
 
 use audiomix_core::error::{Error, Result};
@@ -117,8 +117,15 @@ pub fn create_pair_node() -> Result<String> {
 
         // 安装最佳匹配驱动（已在驱动库中的签名包）
         let mut reboot = windows::core::BOOL::default();
-        DiInstallDevice(None, set, &data, None, DIINSTALLDEVICE_FLAGS(0), Some(&mut reboot))
-            .map_err(|e| err("DiInstallDevice", e))?;
+        DiInstallDevice(
+            None,
+            set,
+            &data,
+            None,
+            DIINSTALLDEVICE_FLAGS(0),
+            Some(&mut reboot),
+        )
+        .map_err(|e| err("DiInstallDevice", e))?;
 
         let id = instance_id_of(set, &data)?;
         let _ = SetupDiDestroyDeviceInfoList(set);
@@ -136,14 +143,8 @@ pub fn remove_pair_node(instance_id: &str) -> Result<()> {
             ..Default::default()
         };
         let id_h = windows::core::HSTRING::from(instance_id);
-        SetupDiOpenDeviceInfoW(
-            set,
-            PCWSTR(id_h.as_ptr()),
-            None,
-            0,
-            Some(&mut data),
-        )
-        .map_err(|e| err("SetupDiOpenDeviceInfo", e))?;
+        SetupDiOpenDeviceInfoW(set, PCWSTR(id_h.as_ptr()), None, 0, Some(&mut data))
+            .map_err(|e| err("SetupDiOpenDeviceInfo", e))?;
         let mut reboot = windows::core::BOOL::default();
         DiUninstallDevice(
             windows::Win32::Foundation::HWND::default(),
@@ -163,7 +164,9 @@ unsafe fn instance_id_of(set: HDEVINFO, data: &SP_DEVINFO_DATA) -> Result<String
     // 第一次调用返回缓冲区不足错误并同时写入所需长度
     let _ = SetupDiGetDeviceInstanceIdW(set, data, None, Some(&mut len));
     if len == 0 {
-        return Err(Error::Backend("GetDeviceInstanceId: 无法获取实例 id 长度".into()));
+        return Err(Error::Backend(
+            "GetDeviceInstanceId: 无法获取实例 id 长度".into(),
+        ));
     }
     let mut buf = vec![0u16; len as usize];
     SetupDiGetDeviceInstanceIdW(set, data, Some(&mut buf), Some(&mut len))

@@ -53,7 +53,12 @@ pub struct CallbackGap {
 impl CallbackGap {
     pub fn new(threshold: std::time::Duration) -> Self {
         let now = std::time::Instant::now();
-        Self { last: now, threshold, last_warn: now, max_gap: std::time::Duration::ZERO }
+        Self {
+            last: now,
+            threshold,
+            last_warn: now,
+            max_gap: std::time::Duration::ZERO,
+        }
     }
 
     /// 每次回调开头调用，返回本次与上次的间隔
@@ -64,7 +69,8 @@ impl CallbackGap {
         if gap > self.max_gap {
             self.max_gap = gap;
         }
-        if gap > self.threshold && now.duration_since(self.last_warn) > std::time::Duration::from_secs(1)
+        if gap > self.threshold
+            && now.duration_since(self.last_warn) > std::time::Duration::from_secs(1)
         {
             self.last_warn = now;
             tracing::warn!(

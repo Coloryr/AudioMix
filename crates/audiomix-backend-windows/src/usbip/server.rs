@@ -19,8 +19,8 @@ use tokio::task::AbortHandle;
 
 use super::device::{Cable, SetupPacket};
 use super::protocol::{
-    self, BasicHeader, IsoPacket, SubmitRequest, DIRECTION_IN, DIRECTION_OUT,
-    STATUS_CONN_RESET, STATUS_INVALID, STATUS_OK, STATUS_PIPE,
+    self, BasicHeader, IsoPacket, SubmitRequest, DIRECTION_IN, DIRECTION_OUT, STATUS_CONN_RESET,
+    STATUS_INVALID, STATUS_OK, STATUS_PIPE,
 };
 
 /// 管理连接握手超时
@@ -113,7 +113,11 @@ async fn handle_connection(stream: TcpStream, registry: Arc<super::CableRegistry
             if write_usb_device(&mut writer, &cable).await.is_err() {
                 return;
             }
-            tracing::info!("USB/IP import 接受: {} ({})", cable.bus_id, cable.product_name());
+            tracing::info!(
+                "USB/IP import 接受: {} ({})",
+                cable.bus_id,
+                cable.product_name()
+            );
             handle_urbs(reader, writer, cable).await;
         }
         _ => {
@@ -122,7 +126,10 @@ async fn handle_connection(stream: TcpStream, registry: Arc<super::CableRegistry
     }
 }
 
-async fn write_devlist(w: &mut tokio::net::tcp::OwnedWriteHalf, cables: &[Arc<Cable>]) -> std::io::Result<()> {
+async fn write_devlist(
+    w: &mut tokio::net::tcp::OwnedWriteHalf,
+    cables: &[Arc<Cable>],
+) -> std::io::Result<()> {
     protocol::write_op_header(w, protocol::OP_REP_DEVLIST, 0).await?;
     w.write_all(&(cables.len() as u32).to_be_bytes()).await?;
     for c in cables {
@@ -136,9 +143,15 @@ async fn write_devlist(w: &mut tokio::net::tcp::OwnedWriteHalf, cables: &[Arc<Ca
     Ok(())
 }
 
-async fn write_usb_device(w: &mut tokio::net::tcp::OwnedWriteHalf, c: &Cable) -> std::io::Result<()> {
+async fn write_usb_device(
+    w: &mut tokio::net::tcp::OwnedWriteHalf,
+    c: &Cable,
+) -> std::io::Result<()> {
     let mut path = [0u8; 256];
-    protocol::fixed_string(&mut path, &format!("/sys/devices/platform/audiomix/{}", c.bus_id));
+    protocol::fixed_string(
+        &mut path,
+        &format!("/sys/devices/platform/audiomix/{}", c.bus_id),
+    );
     let mut bus = [0u8; 32];
     protocol::fixed_string(&mut bus, &c.bus_id);
     w.write_all(&path).await?;
@@ -147,7 +160,7 @@ async fn write_usb_device(w: &mut tokio::net::tcp::OwnedWriteHalf, c: &Cable) ->
     let mut frame = Vec::with_capacity(32);
     frame.extend_from_slice(&1u32.to_be_bytes()); // busnum
     frame.extend_from_slice(&(c.cfg.number as u32).to_be_bytes()); // devnum
-    // UAC1（USB 1.1 全速）必须按全速上报，否则主机按高速的包/帧语义解析描述符会失败。
+                                                                   // UAC1（USB 1.1 全速）必须按全速上报，否则主机按高速的包/帧语义解析描述符会失败。
     let speed = protocol::SPEED_FULL;
     frame.extend_from_slice(&speed.to_be_bytes());
     // 描述符里的多字节字段本身是小端，按协议要求转大端写出
@@ -173,7 +186,10 @@ struct IsoTimeline {
 
 impl IsoTimeline {
     fn new(packet_micros: u64) -> Self {
-        Self { next: Mutex::new(HashMap::new()), packet_micros }
+        Self {
+            next: Mutex::new(HashMap::new()),
+            packet_micros,
+        }
     }
 
     /// 为一个 iso 批次预留完成时刻。每包 = 一个服务间隔（内置 UAC1 全速固定 1ms），
@@ -342,7 +358,10 @@ impl InStats {
                 100.0 * s.zero_samples as f64 / (s.samples_total.max(1)) as f64,
                 s.max_gap_ms
             );
-            *s = InStatsInner { since: Some(now), ..Default::default() };
+            *s = InStatsInner {
+                since: Some(now),
+                ..Default::default()
+            };
         }
     }
 }
@@ -522,8 +541,11 @@ async fn handle_urbs(
                     None
                 };
                 // iso：预留完成时刻后派发独立任务（节拍到点才回复）
-                let complete_at =
-                    state.timeline.reserve(basic.endpoint, submit.req.number_of_packets, Instant::now());
+                let complete_at = state.timeline.reserve(
+                    basic.endpoint,
+                    submit.req.number_of_packets,
+                    Instant::now(),
+                );
                 let task_state = state.clone();
                 let task_cable = cable.clone();
                 let seq = basic.sequence;
@@ -541,9 +563,16 @@ async fn handle_urbs(
                 }
                 let target = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 // 协议规定：成功 unlink 回 -ECONNRESET
-                let status = if state.pending.cancel(target) { STATUS_CONN_RESET } else { STATUS_OK };
+                let status = if state.pending.cancel(target) {
+                    STATUS_CONN_RESET
+                } else {
+                    STATUS_OK
+                };
                 let mut w = state.write.lock().await;
-                if protocol::write_ret_unlink(&mut *w, &basic, status).await.is_err() {
+                if protocol::write_ret_unlink(&mut *w, &basic, status)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -605,7 +634,8 @@ async fn process_submit(
             data
         };
         let mut w = state.write.lock().await;
-        return protocol::write_ret_submit(&mut *w, req, status, data.len() as u32, &data, &[], 0).await;
+        return protocol::write_ret_submit(&mut *w, req, status, data.len() as u32, &data, &[], 0)
+            .await;
     }
 
     let mut w = state.write.lock().await;
@@ -638,8 +668,16 @@ async fn process_submit(
             } else {
                 (submit.packets.clone(), 0)
             };
-            protocol::write_ret_submit(&mut *w, req, STATUS_OK, actual as u32, &[], &packets, error_count)
-                .await
+            protocol::write_ret_submit(
+                &mut *w,
+                req,
+                STATUS_OK,
+                actual as u32,
+                &[],
+                &packets,
+                error_count,
+            )
+            .await
         }
         // 录音：EP2 IN
         (2, DIRECTION_IN) => {
@@ -647,15 +685,25 @@ async fn process_submit(
             let mut data = vec![0u8; payload];
             let got = cable.read_capture(&mut data);
             if req.is_isochronous() {
-                state.in_stats.note(&cable.bus_id, &data[..got.min(data.len())], Instant::now());
+                state
+                    .in_stats
+                    .note(&cable.bus_id, &data[..got.min(data.len())], Instant::now());
             }
             let (packets, error_count) = if req.is_isochronous() {
                 (mark_iso_packets(&submit.packets, payload), 0)
             } else {
                 (submit.packets.clone(), 0)
             };
-            protocol::write_ret_submit(&mut *w, req, STATUS_OK, payload as u32, &data, &packets, error_count)
-                .await
+            protocol::write_ret_submit(
+                &mut *w,
+                req,
+                STATUS_OK,
+                payload as u32,
+                &data,
+                &packets,
+                error_count,
+            )
+            .await
         }
         // 控制变化通知：EP3 IN（AC 接口的中断端点）
         //
@@ -693,7 +741,11 @@ fn mark_iso_packets(packets: &[IsoPacket], actual_total: usize) -> Vec<IsoPacket
         .map(|p| {
             let want = (p.length as usize).min(remaining);
             remaining -= want;
-            IsoPacket { status: STATUS_OK, actual_length: want as u32, ..*p }
+            IsoPacket {
+                status: STATUS_OK,
+                actual_length: want as u32,
+                ..*p
+            }
         })
         .collect()
 }
@@ -701,14 +753,18 @@ fn mark_iso_packets(packets: &[IsoPacket], actual_total: usize) -> Vec<IsoPacket
 fn mark_iso_error(packets: &[IsoPacket], status: i32) -> Vec<IsoPacket> {
     packets
         .iter()
-        .map(|p| IsoPacket { status, actual_length: 0, ..*p })
+        .map(|p| IsoPacket {
+            status,
+            actual_length: 0,
+            ..*p
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::protocol::NO_ISO_PACKETS;
+    use super::*;
 
     /// 主机队列深度 1（拿到完成才提交下一条）且我们的完成固定迟到 1ms 时，
     /// 节拍**不能**变慢：100 条 10ms 的 URB 仍应覆盖约 1 秒音频。
@@ -742,7 +798,10 @@ mod tests {
         let d = timeline.reserve(1, 10, later);
         // 重新起拍：完成时刻落在「现在」之后的一个服务间隔内，而不是过去
         assert!(d >= later, "不应把完成时刻排在过去（会造成一次性追平）");
-        assert!(d <= later + Duration::from_millis(10), "应在重新起拍后的一个服务间隔内完成");
+        assert!(
+            d <= later + Duration::from_millis(10),
+            "应在重新起拍后的一个服务间隔内完成"
+        );
         // 之后每批仍严格相隔 10ms（速率精确）
         let d2 = timeline.reserve(1, 10, later + Duration::from_millis(10));
         assert_eq!((d2 - d).as_millis(), 10);
@@ -818,21 +877,39 @@ mod tests {
     #[test]
     fn mark_packets_distributes_actual() {
         let packets = vec![
-            IsoPacket { offset: 0, length: 192, actual_length: 0, status: 1 },
-            IsoPacket { offset: 192, length: 192, actual_length: 0, status: 1 },
+            IsoPacket {
+                offset: 0,
+                length: 192,
+                actual_length: 0,
+                status: 1,
+            },
+            IsoPacket {
+                offset: 192,
+                length: 192,
+                actual_length: 0,
+                status: 1,
+            },
         ];
         let marked = mark_iso_packets(&packets, 300);
         assert_eq!(marked[0].actual_length, 192);
         assert_eq!(marked[1].actual_length, 108);
         assert!(marked.iter().all(|p| p.status == STATUS_OK));
         let marked = mark_iso_packets(&packets, 0);
-        assert!(marked.iter().all(|p| p.actual_length == 0 && p.status == STATUS_OK));
+        assert!(marked
+            .iter()
+            .all(|p| p.actual_length == 0 && p.status == STATUS_OK));
     }
 
     #[test]
     fn payload_length_sums_packets() {
         let req = SubmitRequest {
-            basic: BasicHeader { command: 1, sequence: 1, device_id: 0, direction: DIRECTION_IN, endpoint: 2 },
+            basic: BasicHeader {
+                command: 1,
+                sequence: 1,
+                device_id: 0,
+                direction: DIRECTION_IN,
+                endpoint: 2,
+            },
             transfer_flags: 0,
             transfer_buffer_length: 5000,
             start_frame: 0,
@@ -841,8 +918,18 @@ mod tests {
             setup: [0; 8],
         };
         let packets = vec![
-            IsoPacket { offset: 0, length: 192, actual_length: 0, status: 0 },
-            IsoPacket { offset: 192, length: 192, actual_length: 0, status: 0 },
+            IsoPacket {
+                offset: 0,
+                length: 192,
+                actual_length: 0,
+                status: 0,
+            },
+            IsoPacket {
+                offset: 192,
+                length: 192,
+                actual_length: 0,
+                status: 0,
+            },
         ];
         assert_eq!(response_payload_length(&req, &packets), 384);
         assert_eq!(response_payload_length(&req, &[]), 5000);
