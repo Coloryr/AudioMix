@@ -259,7 +259,8 @@ onMounted(() => {
 </script>
 
 <template>
-  <n-card title="虚拟声卡（usbip-win2 + UAC1）" size="small">
+  <!-- 底部留白：滚到底时卡片不贴窗口底边（pane 本身不加 padding，只给内容根加） -->
+  <n-card title="虚拟声卡（usbip-win2 + UAC1）" size="small" style="margin-bottom: 12px">
     <!-- 传输驱动安装状态 -->
     <n-alert v-if="status && !driverReady" type="warning" title="未检测到 usbip.exe（USB/IP 传输驱动）" class="block">
       虚拟声卡由 <b>usbip-win2</b>（BSD-2，微软签名驱动，内存完整性 HVCI 兼容）把应用内置的
@@ -459,12 +460,45 @@ onMounted(() => {
 </template>
 
 <style scoped>
+/* 垂直节奏：块与块之间统一 12px（以前 8/10/12/14/16 混用，视觉忽紧忽松） */
+.block {
+  margin-bottom: 12px;
+}
+
+/* 分隔线自身不再带上边距：上一块的 margin-bottom 已是 12px，避免叠出 20+ 的大空隙 */
+.divider {
+  margin: 0 0 12px;
+}
+
+/* 命令原始输出：等宽字体 + 内嵌底色，可选中复制 */
+.log-box {
+  padding: 6px 10px;
+  border: 1px solid var(--border-weak);
+  border-radius: 8px;
+  background: var(--inset);
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  cursor: text;
+}
+
 /* 线路卡片两行布局：上面一行身份/格式/状态，下面一行拷贝方向接线图 */
 .cable-row {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   width: 100%;
+  /* 行间分隔：淡虚线比 n-list 默认分隔更轻 */
+  padding: 10px 0;
+  border-bottom: 1px dashed var(--border-weak);
+}
+
+.cable-row:last-child {
+  border-bottom: none;
+  padding-bottom: 2px;
 }
 
 .cable-row-line {
@@ -472,6 +506,11 @@ onMounted(() => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+/* 接线图整行缩进一点，与上面的名称/格式行在视觉上分层 */
+.cable-row-line:last-child {
+  padding-left: 4px;
 }
 
 .patch {
@@ -555,5 +594,4 @@ onMounted(() => {
   font-size: 10px;
   white-space: nowrap;
 }
-
 </style>

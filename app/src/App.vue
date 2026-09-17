@@ -61,7 +61,9 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <n-config-provider :theme="themeMode === 'dark' ? darkTheme : null" :locale="zhCN" :date-locale="dateZhCN">
+  <!-- height:100% 必须挂上：n-config-provider 渲染的包裹 div 默认没有高度，
+       断了 #app → 页签 pane 的高度传递链（pane 靠 style.css 的 flex 规则撑满剩余空间） -->
+  <n-config-provider style="height: 100%" :theme="themeMode === 'dark' ? darkTheme : null" :locale="zhCN" :date-locale="dateZhCN">
     <n-message-provider>
       <div style="height: 100%; display: flex; flex-direction: column">
         <div style="display: flex; align-items: center; gap: 10px; padding: 10px 16px 0">
@@ -76,10 +78,10 @@ onUnmounted(() => {
             {{ themeMode === "dark" ? "☀ 亮色模式" : "🌙 暗色模式" }}
           </n-button>
         </div>
-        <!-- 页签占满整行、横向 padding 收进 pane 内层：pane 的滚动条才会贴着窗口右缘，
-             而不是缩在页签留白里 -->
-        <n-tabs v-model:value="activeTab" type="line" style="flex: 1; padding: 0 16px"
-          pane-style="height: calc(100vh - 96px); overflow: auto; margin: 0 -16px; padding: 0 16px;">
+        <!-- 页签占满整行、横向 padding 收进 pane 内层：pane 的滚动条才会贴着窗口右缘。
+             pane 高度由 style.css 的 flex 规则撑满剩余空间（不写死「头部+页签栏」常数） -->
+        <n-tabs v-model:value="activeTab" type="line" style="flex: 1; min-height: 0; padding: 0 16px"
+          pane-style="overflow: auto; margin: 0 -16px; padding: 0 16px;">
           <n-tab-pane name="mixer" tab="混音">
             <MixerView />
           </n-tab-pane>

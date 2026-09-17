@@ -137,3 +137,11 @@ textarea,
   font-weight: 700;
   margin: 0 0 10px;
 }
+
+/* 页签 pane 撑满 n-tabs 的剩余高度：滚动区底边正好贴窗口底。
+   naive 非动画模式下 .n-tab-pane 是 .n-tabs（flex column 根）的直接子级，
+   以前 pane 用 calc(100vh - 96px) 写死，头部+页签栏不足 96px 时底部漏一截空白 */
+.n-tabs > .n-tab-pane {
+  flex: 1;
+  min-height: 0;
+}

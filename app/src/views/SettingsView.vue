@@ -447,6 +447,8 @@ onUnmounted(() => {
   grid-template-columns: minmax(340px, 1fr) minmax(420px, 1.15fr);
   gap: 14px;
   align-items: start;
+  /* 底部留白：滚到底时卡片不贴窗口底边（pane 本身不加 padding，只给内容根加） */
+  margin-bottom: 12px;
 }
 
 .log-card {
