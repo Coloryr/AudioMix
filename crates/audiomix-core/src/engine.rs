@@ -869,7 +869,7 @@ fn find_chain_path(config: &GraphConfig, source_id: &str, sink_id: &str) -> Opti
             if !frontier.iter().any(|s| *s == p.source_id) {
                 continue;
             }
-            if let Some(hop) = cable_loop_target(&p.sink_id) {
+            if let Some(hop) = cable_loop_source_id(config, &p.sink_id) {
                 if visited.insert(hop.clone()) {
                     next.push(hop);
                 }
@@ -883,15 +883,27 @@ fn find_chain_path(config: &GraphConfig, source_id: &str, sink_id: &str) -> Opti
     None
 }
 
-/// 线路输入 sink id（usbip://N/capture）→ 同线路的线路输出 source id
-/// （usbip://N/playback）。非线路 sink 返回 None。
-fn cable_loop_target(sink_id: &str) -> Option<String> {
-    let rest = sink_id.strip_prefix("usbip://")?;
+/// 线路输入 sink（device_id = usbip://N/capture）→ 同线路的线路输出 **源节点 id**
+/// （图里 device_id = usbip://N/playback 的那个 source）。非线路 sink 或图中
+/// 没有对应的播放端节点时返回 None。
+fn cable_loop_source_id(config: &GraphConfig, sink_id: &str) -> Option<String> {
+    // sink_id 是节点 id，要经 sinks 表查它的 device_id
+    let dev = config
+        .sinks
+        .iter()
+        .find(|s| s.id == sink_id)
+        .map(|s| s.device_id.as_str())?;
+    let rest = dev.strip_prefix("usbip://")?;
     let (n, side) = rest.split_once('/')?;
     if side != "capture" || n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    Some(format!("usbip://{n}/playback"))
+    let playback_dev = format!("usbip://{n}/playback");
+    config
+        .sources
+        .iter()
+        .find(|s| s.device_id == playback_dev)
+        .map(|s| s.id.clone())
 }
 
 fn find_device(devices: &[DeviceInfo], id: &str) -> Option<DeviceInfo> {
@@ -1229,5 +1241,49 @@ pub fn make_route(source_id: &str, sink_id: &str) -> Route {
         gain: 1.0,
         muted: false,
         nodes: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Sink, Source, SourceMode};
+
+    fn src(id: &str, dev: &str) -> Source {
+        Source {
+            id: id.into(),
+            name: id.into(),
+            device_id: dev.into(),
+            mode: SourceMode::DeviceInput,
+            enabled: true,
+        }
+    }
+
+    fn sink(id: &str, dev: &str) -> Sink {
+        Sink {
+            id: id.into(),
+            name: id.into(),
+            device_id: dev.into(),
+            volume: 1.0,
+            enabled: true,
+        }
+    }
+
+    /// 线路1 播放端 → 线路2 麦克风端（reverse 回灌）→ 线路2 播放端 → 耳机：整链可达
+    #[test]
+    fn chain_path_crosses_cable_loop() {
+        let mut cfg = GraphConfig::default();
+        cfg.sources = vec![src("s1", "usbip://1/playback"), src("s2", "usbip://2/playback")];
+        cfg.sinks = vec![sink("k1", "usbip://2/capture"), sink("k2", "out-phones")];
+        cfg.routes = vec![make_route("s1", "k1"), make_route("s2", "k2")];
+        // 直连段
+        let direct = find_chain_path(&cfg, "s2", "k2").expect("直接路径应可达");
+        assert_eq!(direct.source_id, "s2");
+        // 跨线缆：s1 → k1(usbip://2/capture) → 回灌 → s2 → k2
+        let chained = find_chain_path(&cfg, "s1", "k2").expect("跨线缆整链应可达");
+        assert_eq!(chained.source_id, "s2");
+        assert_eq!(chained.sink_id, "k2");
+        // 不可达的终点
+        assert!(find_chain_path(&cfg, "s1", "nope").is_none());
     }
 }
