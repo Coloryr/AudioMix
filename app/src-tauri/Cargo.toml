@@ -12,6 +12,7 @@ tauri-build = { version = "2", features = [] }
 audiomix-core.workspace = true
 audiomix-backend-windows.workspace = true
 audiomix-control-api.workspace = true
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true

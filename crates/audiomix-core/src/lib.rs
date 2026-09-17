@@ -7,6 +7,7 @@ pub mod backend;
 pub mod dsp;
 pub mod engine;
 pub mod error;
+pub mod fft;
 pub mod mixer;
 pub mod model;
 pub mod resample;

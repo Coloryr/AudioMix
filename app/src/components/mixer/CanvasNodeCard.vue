@@ -12,6 +12,8 @@ defineProps<{
   wiring: boolean;
   /** 电平条数值（父组件按 源/汇/处理器 取最大） */
   meter: number;
+  /** 20 段频谱 dB（频谱分析开启时传入，取代电平条显示；关闭时为 undefined） */
+  spectrum?: number[];
   /** DSP 方块的状态小字（非 DSP 传 null 不显示） */
   badge: { text: string; cls: string } | null;
   /** sink 节点对应的设备 id（渲染 Windows 系统音量条；非输出节点为 undefined） */
@@ -30,6 +32,14 @@ const emit = defineEmits<{
   (e: "wire-start", ev: PointerEvent, side: "in" | "out"): void;
   (e: "volume-change", v: number): void;
 }>();
+
+// ---------- 频谱条高度 ----------
+// 整像素取整：百分比高度（如 4.3px）会被浏览器逐柱取整，底边出现 1px 抖动/错位
+const SPEC_ROW_H = 15; // 与 .node-spectrum 的 height 保持一致
+function specPx(db: number): number {
+  const pct = Math.min(100, Math.max(0, ((db + 60) / 60) * 100));
+  return Math.max(2, Math.round((pct / 100) * SPEC_ROW_H));
+}
 </script>
 
 <template>
@@ -49,7 +59,11 @@ const emit = defineEmits<{
       <span class="node-close" @pointerdown.stop @click.stop="emit('remove')">×</span>
     </div>
     <div class="node-sub">{{ node.subtitle }}</div>
-    <MeterBar class="node-meter" :level="meter" />
+    <!-- 频谱分析开启：20 段 dB 频谱条取代电平条；关闭时照常显示电平条 -->
+    <div v-if="spectrum" class="node-meter node-spectrum" @pointerdown.stop @click.stop>
+      <i v-for="(db, i) in spectrum" :key="i" class="spec-bar" :style="{ height: specPx(db) + 'px' }" />
+    </div>
+    <MeterBar v-else class="node-meter" :level="meter" />
     <!-- DSP 方块：只显示启用状态（开关在悬浮弹窗里），开关节点关 = 静音、其它 = 旁路 -->
     <div v-if="badge" class="node-state" @pointerdown.stop @click.stop>
       <i class="state-dot" :class="badge.cls" />
@@ -153,6 +167,21 @@ const emit = defineEmits<{
 
 .node-meter {
   margin-top: 4px;
+}
+
+/* 频谱条：比电平条（8px）高近一倍，20 根细柱按 dB 高低起伏 */
+.node-spectrum {
+  height: 15px;
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+}
+
+.spec-bar {
+  flex: 1;
+  min-width: 1px;
+  background: var(--accent);
+  border-radius: 1px;
 }
 
 /* DSP 方块的启用状态小字（开关在悬浮弹窗里，方块只显示状态） */

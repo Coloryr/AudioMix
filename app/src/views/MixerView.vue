@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
-import { NAlert, NButton, NCard, NText, useMessage } from "naive-ui";
+import { NAlert, NButton, NCard, NSwitch, NText, useMessage } from "naive-ui";
 import {
   api,
   DeviceInfo,
@@ -274,7 +274,7 @@ const nodes = computed<GNode[]>(() => {
       kind,
       title: isCable ? `${lineName(k.device_id)} · 线路输入` : app.deviceName(k.device_id),
       subtitle: isCable
-        ? `系统录音端（麦克风） · 拷贝：${lineCopyOf(cs)} · ${lineStateOf(cs)}`
+        ? `系统录音端（麦克风）<br>${lineCopyOf(cs)} · ${lineStateOf(cs)}`
         : "输出设备",
       sinkId: k.id,
       deviceId: kind === "output" ? k.device_id : undefined,
@@ -1139,6 +1139,19 @@ watch(
 // 悬浮弹窗在 components/mixer/NodePopover.vue —— 这里只保留画布几何与交互。
 
 const level = (id?: string) => (id ? Math.min(1, app.levels[id] ?? 0) : 0);
+/** 频谱分析关闭时为 undefined，节点不渲染频谱条 */
+const spectrumOf = (id?: string) => (id ? app.spectra[id] : undefined);
+
+/** 频谱开关：写设置（后端 set_fft_enabled 即时生效），失败回滚 */
+async function toggleSpectrum(on: boolean) {
+  const old = !on;
+  try {
+    await api.updateSettings(app.settings);
+  } catch (e) {
+    app.settings.fft_enabled = old;
+    message.error(String(e));
+  }
+}
 
 // ---------- 系统音量（Windows 端点音量，影响该设备上所有声音） ----------
 const deviceVolumes = ref<Record<string, number>>({});
@@ -1376,6 +1389,10 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
       <n-card size="small" title="接线画布" class="canvas-card">
         <template #header-extra>
           <div style="display: flex; align-items: center; gap: 12px; font-size: 12px">
+            <n-switch v-model:value="app.settings.fft_enabled" size="small" @update:value="toggleSpectrum">
+              <template #checked>频谱 开</template>
+<template #unchecked>频谱 关</template>
+</n-switch>
             <span class="legend"><i class="legend-dot t-out" />输出端子（信号流出）</span>
             <span class="legend"><i class="legend-dot t-in" />输入端子（信号流入）</span>
             <span class="legend"><i class="legend-dot compat" />拖线时可接</span>
@@ -1408,6 +1425,7 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
             <CanvasNodeCard v-for="node in nodes" :key="node.key" :node="node" :selected="selectedNode === node.key"
               :wiring="!!wireSource"
               :meter="Math.max(level(node.sourceId), level(node.sinkId), level(node.processorId))"
+              :spectrum="spectrumOf(node.sourceId ?? node.sinkId)"
               :badge="node.processorId ? procStateBadge(node.processorId) : null" :device-id="sinkDeviceId(node)"
               :volume="volumeOf(sinkDeviceId(node))" :term-state-of="(side) => termState(node, side)"
               @drag-start="(e) => startNodeDrag(e, node)" @activate="onNodeClick(node)"

@@ -19,7 +19,6 @@ import { useApp } from "./store";
 
 const app = useApp();
 const activeTab = ref("mixer");
-let deviceTimer: number | undefined;
 
 /** 主题：深色＝naive-ui darkTheme + 默认变量；亮色＝naive 默认浅色 + html.light 变量覆盖。选择存 localStorage */
 const themeMode = ref<"dark" | "light">(localStorage.getItem("audiomix-theme") === "light" ? "light" : "dark");
@@ -42,20 +41,22 @@ async function syncLevelsStream() {
 }
 watch(activeTab, syncLevelsStream);
 
+/** 设备列表改用 Channel 推送：热插拔/看门狗枚举有变化才推；窗口隐藏时退订 */
+async function syncDevicesStream() {
+  if (document.hidden) await app.unwatchDevices();
+  else await app.watchDevices();
+}
+
 onMounted(async () => {
-  document.addEventListener("visibilitychange", syncLevelsStream);
+  document.addEventListener("visibilitychange", syncDevicesStream);
   await app.loadAll();
   syncLevelsStream();
-  // 窗口隐藏时设备列表轮询也暂停；热插拔由后端看门狗（3s）兜底
-  deviceTimer = window.setInterval(() => {
-    if (document.hidden) return;
-    app.pollDevices().catch(() => { });
-  }, 4000);
+  syncDevicesStream();
 });
 onUnmounted(() => {
-  document.removeEventListener("visibilitychange", syncLevelsStream);
-  window.clearInterval(deviceTimer);
+  document.removeEventListener("visibilitychange", syncDevicesStream);
   app.unwatchLevels();
+  app.unwatchDevices();
 });
 </script>
 

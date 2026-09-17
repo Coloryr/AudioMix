@@ -619,12 +619,34 @@ pub struct Settings {
     pub default_output: Option<String>,
     /// 用户选定的系统默认**录音**设备 id
     pub default_input: Option<String>,
+    /// 用户默认**输出**偏好是虚拟线路（意图标志：线路端点 id 每次重连都会变，记意图不记 id）
+    #[serde(default)]
+    pub default_output_virtual: bool,
+    /// 用户默认**输入**偏好是虚拟线路
+    #[serde(default)]
+    pub default_input_virtual: bool,
     /// 重采样质量档位（sinc 默认 / linear 低延迟）
     pub resample_quality: ResamplerQuality,
     /// 边环形缓冲容量（ms，钳制 50..=1000；加大更抗卡顿，不影响日常延迟）
     pub edge_buffer_ms: u32,
     /// 电平推送间隔（ms，钳制 20..=500）：后端向前端推电平的频率，越小电平条越顺滑、CPU 略高
     pub levels_interval_ms: u64,
+    /// 频谱分析开关（默认关闭：关闭时音频线程不采样、stats 不计算频段）
+    pub fft_enabled: bool,
+    /// FFT 窗口点数（1024/2048/4096，须为 2 的幂，非法值回退默认 4096）
+    #[serde(default = "default_fft_size")]
+    pub fft_size: u32,
+    /// 频段边界频率（Hz，升序；段数 = 边界数，band 0 含第一边界以下，高于末边界不显示）
+    #[serde(default = "default_fft_bands")]
+    pub fft_bands: Vec<f32>,
+}
+
+fn default_fft_size() -> u32 {
+    crate::fft::DEFAULT_FFT_SIZE as u32
+}
+
+fn default_fft_bands() -> Vec<f32> {
+    crate::fft::DEFAULT_BAND_EDGES.to_vec()
 }
 
 impl Default for Settings {
@@ -636,9 +658,14 @@ impl Default for Settings {
             close_to_tray: true,
             default_output: None,
             default_input: None,
+            default_output_virtual: false,
+            default_input_virtual: false,
             resample_quality: ResamplerQuality::default(),
             edge_buffer_ms: 250,
             levels_interval_ms: 50,
+            fft_enabled: false,
+            fft_size: crate::fft::DEFAULT_FFT_SIZE as u32,
+            fft_bands: crate::fft::DEFAULT_BAND_EDGES.to_vec(),
         }
     }
 }

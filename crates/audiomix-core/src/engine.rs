@@ -22,6 +22,9 @@ use tokio::sync::broadcast;
 
 use crate::backend::{AudioBackend, CaptureCallback, RenderCallback, StartedStream};
 use crate::dsp::DspChain;
+use crate::fft::{
+    DEFAULT_BAND_EDGES, DEFAULT_FFT_SIZE, MAX_FFT_SIZE, Spectra, SpectrumTap,
+};
 use crate::error::{Error, Result};
 use crate::mixer::{convert_channels, mix_into, peak_of, soft_clip};
 use crate::model::{
@@ -55,6 +58,8 @@ struct SourceHandle {
     info: crate::backend::StreamInfo,
     writers: Arc<ArcSwap<Vec<Arc<EdgeWriter>>>>,
     peak: Arc<AtomicU32>,
+    /// 频谱采样点（fft 关闭时音频线程零成本）
+    fft: Arc<SpectrumTap>,
     _stream: StartedStream,
 }
 
@@ -64,6 +69,8 @@ struct SinkHandle {
     info: crate::backend::StreamInfo,
     peak: Arc<AtomicU32>,
     underruns: Arc<AtomicU64>,
+    /// 频谱采样点（fft 关闭时音频线程零成本）
+    fft: Arc<SpectrumTap>,
     _stream: StartedStream,
 }
 
@@ -86,6 +93,12 @@ struct Inner {
     resample_quality: ResamplerQuality,
     /// 边环形缓冲容量（ms，按 source 采样率折算帧数）
     edge_capacity_ms: usize,
+    /// 频谱分析开关（默认关闭：关闭时音频线程不采样、stats 不计算）
+    fft_enabled: bool,
+    /// FFT 窗口点数（2 的幂 ≤ fft::MAX_FFT_SIZE，tap 缓冲按最大值分配、这里只管取窗口径）
+    fft_size: usize,
+    /// 频段边界频率（Hz，升序；段数 = 边界数）
+    fft_bands: Vec<f32>,
 }
 
 /// 音频线程读取的不可变运行时快照
@@ -124,6 +137,8 @@ pub struct EngineStats {
     pub source_dropped: HashMap<Id, u64>,
     /// sink id → 渲染欠载次数（每次欠载输出被补静音）
     pub sink_underruns: HashMap<Id, u64>,
+    /// source/sink id → 频段 dB 数组（fft 关闭时为空表，见 `Engine::set_fft_enabled`）
+    pub spectra: Spectra,
 }
 
 /// 混音引擎：持有全部采集/渲染流与路由边缓冲，接收图变更并 diff 应用。
@@ -150,6 +165,9 @@ impl Engine {
                 device_cache: devices,
                 resample_quality: ResamplerQuality::default(),
                 edge_capacity_ms: EDGE_CAPACITY_MS,
+                fft_enabled: false,
+                fft_size: DEFAULT_FFT_SIZE,
+                fft_bands: DEFAULT_BAND_EDGES.to_vec(),
             }),
             runtime: Arc::new(ArcSwap::from_pointee(GraphRuntime {
                 sink_volume: HashMap::new(),
@@ -355,8 +373,28 @@ impl Engine {
     }
 
     /// 运行统计快照（丢弃/欠载计数，见 [`EngineStats`]）。
+    /// fft 开启时同时计算各 source/sink 的频段 dB（一次 FFT/节点，20fps 下开销可忽略）。
     pub fn stats(&self) -> EngineStats {
         let inner = self.inner.lock();
+        let mut spectra: Spectra = HashMap::new();
+        if inner.fft_enabled {
+            for (id, h) in &inner.sources {
+                if h.fft.is_enabled() && h.info.sample_rate > 0 {
+                    spectra.insert(
+                        id.clone(),
+                        h.fft.bands(h.info.sample_rate, inner.fft_size, &inner.fft_bands),
+                    );
+                }
+            }
+            for (id, h) in &inner.sinks {
+                if h.fft.is_enabled() && h.info.sample_rate > 0 {
+                    spectra.insert(
+                        id.clone(),
+                        h.fft.bands(h.info.sample_rate, inner.fft_size, &inner.fft_bands),
+                    );
+                }
+            }
+        }
         EngineStats {
             source_dropped: inner
                 .sources
@@ -371,7 +409,53 @@ impl Engine {
                 .iter()
                 .map(|(id, h)| (id.clone(), h.underruns.load(Ordering::Relaxed)))
                 .collect(),
+            spectra,
         }
+    }
+
+    /// 开关频谱分析（默认关闭）。开启后音频线程开始向 tap 采样（下混 mono +
+    /// 写环形缓冲，每回调 O(len)），`stats()` 开始携带各节点频段。
+    pub fn set_fft_enabled(&self, on: bool) {
+        let mut inner = self.inner.lock();
+        if inner.fft_enabled == on {
+            return;
+        }
+        inner.fft_enabled = on;
+        for h in inner.sources.values() {
+            h.fft.set_enabled(on);
+        }
+        for h in inner.sinks.values() {
+            h.fft.set_enabled(on);
+        }
+        tracing::info!("频谱分析 {}", if on { "已开启" } else { "已关闭" });
+    }
+
+    /// 调整频谱参数（FFT 点数 / 频段边界）。tap 缓冲按最大点数分配，改参数无需重建 tap，
+    /// 下一次 `stats()` 即按新参数计算。非法值回退默认（点数须为 1024..=4096 的 2 的幂）。
+    pub fn set_fft_params(&self, fft_size: u32, fft_bands: Vec<f32>) {
+        let mut inner = self.inner.lock();
+        let size = fft_size as usize;
+        let size = if size.is_power_of_two() && (1024..=MAX_FFT_SIZE).contains(&size) {
+            size
+        } else {
+            DEFAULT_FFT_SIZE
+        };
+        // 边界：过滤非法值 → 升序去重；空表回退默认
+        let mut bands: Vec<f32> = fft_bands
+            .into_iter()
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .collect();
+        bands.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        bands.dedup();
+        if bands.is_empty() {
+            bands = DEFAULT_BAND_EDGES.to_vec();
+        }
+        if inner.fft_size == size && inner.fft_bands == bands {
+            return;
+        }
+        inner.fft_size = size;
+        inner.fft_bands = bands;
+        tracing::info!("频谱参数：{} 点 / {} 段", size, inner.fft_bands.len());
     }
 
     /// 停止全部流（退出前调用）
@@ -434,7 +518,14 @@ impl Engine {
             let writers: Arc<ArcSwap<Vec<Arc<EdgeWriter>>>> =
                 Arc::new(ArcSwap::from_pointee(Vec::new()));
             let peak = Arc::new(AtomicU32::new(0f32.to_bits()));
-            let cb = make_capture_callback(peak.clone(), writers.clone());
+            let fft = Arc::new(SpectrumTap::new(inner.fft_enabled));
+            let fft_ch = Arc::new(AtomicU32::new(0));
+            let cb = make_capture_callback(
+                peak.clone(),
+                writers.clone(),
+                fft.clone(),
+                fft_ch.clone(),
+            );
             let started = match src.mode {
                 SourceMode::DeviceInput => self.backend.start_capture(&src.device_id, cb),
                 SourceMode::Loopback => self.backend.start_loopback(&src.device_id, cb),
@@ -455,6 +546,7 @@ impl Engine {
                 started.info.channels,
                 src.mode
             );
+            fft_ch.store(started.info.channels as u32, Ordering::Release);
             keep_sources.insert(
                 src.id.clone(),
                 SourceHandle {
@@ -463,6 +555,7 @@ impl Engine {
                     info: started.info,
                     writers,
                     peak,
+                    fft,
                     _stream: started,
                 },
             );
@@ -496,6 +589,7 @@ impl Engine {
             }
             let peak = Arc::new(AtomicU32::new(0f32.to_bits()));
             let underruns = Arc::new(AtomicU64::new(0));
+            let fft = Arc::new(SpectrumTap::new(inner.fft_enabled));
             // 流格式在打开设备后注入（以 GetMixFormat 实际结果为准）
             let info_rate = Arc::new(AtomicU32::new(0));
             let info_ch = Arc::new(AtomicU32::new(0));
@@ -506,6 +600,7 @@ impl Engine {
                 info_ch.clone(),
                 peak.clone(),
                 underruns.clone(),
+                fft.clone(),
             );
             let started = self
                 .backend
@@ -534,6 +629,7 @@ impl Engine {
                     info: started.info,
                     peak,
                     underruns,
+                    fft,
                     _stream: started,
                 },
             );
@@ -773,11 +869,18 @@ fn resolve_paths(config: &GraphConfig) -> Vec<ResolvedPath> {
 fn make_capture_callback(
     peak: Arc<AtomicU32>,
     writers: Arc<ArcSwap<Vec<Arc<EdgeWriter>>>>,
+    fft: Arc<SpectrumTap>,
+    fft_ch: Arc<AtomicU32>,
 ) -> CaptureCallback {
     Box::new(move |data: &[f32]| {
         peak.store(peak_of(data).to_bits(), Ordering::Relaxed);
         for w in writers.load().iter() {
             w.push(data);
+        }
+        // 通道数在流启动后注入；未注入（0）时跳过频谱采样
+        let ch = fft_ch.load(Ordering::Relaxed) as usize;
+        if ch > 0 {
+            fft.push(data, ch);
         }
     })
 }
@@ -819,6 +922,7 @@ fn make_render_callback(
     info_ch: Arc<AtomicU32>,
     peak: Arc<AtomicU32>,
     underruns: Arc<AtomicU64>,
+    fft: Arc<SpectrumTap>,
 ) -> RenderCallback {
     let states: Arc<Mutex<HashMap<Id, SinkEdgeState>>> = Arc::new(Mutex::new(HashMap::new()));
     Box::new(move |out: &mut [f32]| {
@@ -910,6 +1014,7 @@ fn make_render_callback(
         // 4. 软限幅 + 电平
         soft_clip(out);
         peak.store(peak_of(out).to_bits(), Ordering::Relaxed);
+        fft.push(out, ch_out);
         if states.values().any(|s| s.resampler.underruns > 0) {
             // 简单上报：一次性清零后累加到 sink 级计数
             for s in states.values_mut() {

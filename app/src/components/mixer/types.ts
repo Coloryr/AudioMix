@@ -7,7 +7,7 @@ export type { NodePos };
 // ---------- 画布几何 ----------
 export const NODE_W = 236;
 // 96 → 108：副标题放开到两行后，内容（标题 + 两行副标题 + 电平条 + 音量条）需要更高一些
-export const NODE_H = 108;
+export const NODE_H = 116;
 /** 端子环半径：连线两端收在环外缘，线不进环、箭头贴着环不被环线穿过 */
 export const TERM_R = 8;
 

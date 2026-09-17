@@ -7,7 +7,7 @@ use audiomix_backend_windows::driver;
 use audiomix_backend_windows::usbip::{
     attach as usbip_attach, broker as usbip_broker, cable_configs,
 };
-use audiomix_core::engine::EngineStats;
+use audiomix_core::engine::{EngineEvent, EngineStats};
 use audiomix_core::model::NodePos;
 use audiomix_core::{
     DeviceInfo, DeviceKind, GraphConfig, Settings, UsbIpCableSettings, UsbIpSettings,
@@ -17,7 +17,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
 use crate::config;
-use crate::state::AppState;
+use crate::state::{AppState, LevelsPayload};
 use crate::tray;
 
 // ---------- 设备 ----------
@@ -38,6 +38,27 @@ pub fn refresh_devices(app: AppHandle, state: State<AppState>) -> Result<Vec<Dev
     Ok(devices)
 }
 
+/// 虚拟线路的 Windows 侧真实端点（is_virtual 且非合成 `usbip://` id —— 合成 id 系统不认）。
+fn real_virtual_endpoint<'a>(devices: &'a [DeviceInfo], kind: DeviceKind) -> Option<&'a DeviceInfo> {
+    devices
+        .iter()
+        .find(|d| d.kind == kind && d.is_virtual && !d.id.starts_with("usbip://"))
+}
+
+fn virtual_flag_mut(cfg: &mut audiomix_core::GraphSettings, kind: DeviceKind) -> &mut bool {
+    match kind {
+        DeviceKind::Output => &mut cfg.settings.default_output_virtual,
+        DeviceKind::Input => &mut cfg.settings.default_input_virtual,
+    }
+}
+
+fn virtual_flag(cfg: &audiomix_core::GraphSettings, kind: DeviceKind) -> bool {
+    match kind {
+        DeviceKind::Output => cfg.settings.default_output_virtual,
+        DeviceKind::Input => cfg.settings.default_input_virtual,
+    }
+}
+
 /// 枚举设备；若某个 flow 的默认设备被**虚拟线路**抢走，则恢复用户选择
 /// （没有历史选择时退回到第一个非虚拟设备）。
 /// `just_set` 是刚刚由用户显式指定的设备（用于把选择记进配置）。
@@ -49,7 +70,7 @@ fn refresh_and_guard_defaults(
     let devices = state.engine.refresh_devices().map_err(|e| e.to_string())?;
     let mut saved = false;
 
-    // 1) 用户刚选过：记住偏好
+    // 1) 用户刚选过：记住偏好（id + 是否虚拟线路的意图）
     if let Some(d) = just_set {
         let mut cfg = state.config.lock();
         let slot = match d.kind {
@@ -58,6 +79,11 @@ fn refresh_and_guard_defaults(
         };
         if slot.as_deref() != Some(d.id.as_str()) {
             *slot = Some(d.id.clone());
+            saved = true;
+        }
+        let flag = virtual_flag_mut(&mut cfg, d.kind);
+        if *flag != d.is_virtual {
+            *flag = d.is_virtual;
             saved = true;
         }
     }
@@ -74,8 +100,19 @@ fn refresh_and_guard_defaults(
             let Some(current) = devices.iter().find(|d| d.kind == kind && d.is_default) else {
                 continue;
             };
-            // 当前默认是物理设备：采纳它作为偏好（下次接入虚拟线路时用它恢复）
+            // 当前默认是物理设备：线缆在 Windows 侧有真实端点且用户偏好是虚拟线路 →
+            // 用户在 Windows 里改了主意，更新意图；线缆不在（未接入）时默认必然落在
+            // 物理设备上，虚拟偏好保持原样 —— 等线缆接入后由 restore_virtual_defaults 设回
             if !current.is_virtual {
+                if real_virtual_endpoint(&devices, kind).is_some()
+                    && *virtual_flag_mut(&mut cfg, kind)
+                {
+                    *virtual_flag_mut(&mut cfg, kind) = false;
+                    saved = true;
+                }
+                if virtual_flag(&cfg, kind) {
+                    continue;
+                }
                 if saved_id.as_deref() != Some(current.id.as_str()) {
                     let slot = match kind {
                         DeviceKind::Output => &mut cfg.settings.default_output,
@@ -86,11 +123,21 @@ fn refresh_and_guard_defaults(
                 }
                 continue;
             }
-            // 当前默认是虚拟线路：如果就是用户自己选的（= 保存的偏好），尊重选择不动
-            if saved_id.as_deref() == Some(current.id.as_str()) {
+            // 当前默认是虚拟线路（= 线缆的真实端点，is_default 只有 Windows 侧会标）
+            if *virtual_flag_mut(&mut cfg, kind) {
+                // 偏好就是虚拟线路：尊重现状，id 跟随当前端点（每次重连都会变）
+                if saved_id.as_deref() != Some(current.id.as_str()) {
+                    let slot = match kind {
+                        DeviceKind::Output => &mut cfg.settings.default_output,
+                        DeviceKind::Input => &mut cfg.settings.default_input,
+                    };
+                    *slot = Some(current.id.clone());
+                    saved = true;
+                }
                 continue;
             }
-            // 否则视为 Windows 抢过去的：优先回到记住的物理设备，没有就挑第一个非虚拟设备
+            // 偏好是物理设备：视为 Windows 抢过去的，优先回到记住的物理设备，
+            // 没有就挑第一个非虚拟设备
             let target = saved_id
                 .as_deref()
                 .and_then(|id| {
@@ -130,6 +177,62 @@ fn refresh_and_guard_defaults(
     } else {
         Ok((devices, saved))
     }
+}
+
+/// 用户偏好是虚拟线路、但当前默认不是：把默认恢复成该 flow 的虚拟线路
+/// （线缆接入时调用 —— 启动时线缆未接入，默认必然落在物理设备上，接入后要设回去）。
+/// 返回是否做了更改（需要落盘）。
+fn restore_virtual_defaults(state: &AppState) -> bool {
+    let devices = state.engine.list_devices();
+    // 先算好要恢复的目标（短暂持锁），恢复动作放在锁外
+    let mut targets: Vec<(DeviceKind, String)> = Vec::new();
+    {
+        let cfg = state.config.lock();
+        for kind in [DeviceKind::Output, DeviceKind::Input] {
+            let saved = match kind {
+                DeviceKind::Output => cfg.settings.default_output.as_deref(),
+                DeviceKind::Input => cfg.settings.default_input.as_deref(),
+            };
+            if !prefers_virtual(saved) {
+                continue;
+            }
+            // 目标：该 flow 的第一个虚拟设备（合成 id；线缆重连后编号可能变，跟随现实）
+            let Some(target) = devices.iter().find(|d| d.kind == kind && d.is_virtual) else {
+                continue;
+            };
+            let current = devices
+                .iter()
+                .find(|d| d.kind == kind && d.is_default)
+                .map(|d| d.id.clone());
+            if current.as_deref() != Some(target.id.as_str()) {
+                targets.push((kind, target.id.clone()));
+            }
+        }
+    }
+    if targets.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    for (kind, id) in &targets {
+        match audiomix_backend_windows::policy::set_default_endpoint(id) {
+            Ok(()) => {
+                changed = true;
+                tracing::info!("用户默认{kind:?}偏好为虚拟线路，线缆接入后已设回 {id}");
+                let mut cfg = state.config.lock();
+                let slot = match kind {
+                    DeviceKind::Output => &mut cfg.settings.default_output,
+                    DeviceKind::Input => &mut cfg.settings.default_input,
+                };
+                *slot = Some(id.clone());
+            }
+            Err(e) => tracing::warn!("恢复默认{kind:?}为虚拟线路失败: {e}"),
+        }
+    }
+    if changed {
+        // 重新枚举，把新的 is_default 刷进引擎缓存（前端会跟着设备推送刷新）
+        let _ = state.engine.refresh_devices();
+    }
+    changed
 }
 
 /// 常驻的「默认设备守护」。
@@ -280,6 +383,11 @@ pub fn spawn_default_device_guard(app: AppHandle) {
                 let state = app.state::<AppState>();
                 if let Err(e) = state.engine.refresh_devices() {
                     tracing::debug!("虚拟线路接入后刷新设备失败: {e}");
+                }
+                // 用户此前把虚拟线路设为默认输出的：启动时线缆未接入、默认落在物理设备上，
+                // 现在接入了要设回去（含「启动时线缆已在」的情形 —— known 初始为空，这里同样触发）
+                if restore_virtual_defaults(&state) {
+                    let _ = persist(&app, &state);
                 }
             }
             let in_window = guard_until.map(|t| Instant::now() < t).unwrap_or(false);
@@ -574,7 +682,7 @@ pub fn set_sink_volume(
 pub fn subscribe_levels(
     state: State<AppState>,
     app: AppHandle,
-    channel: Channel<HashMap<String, f32>>,
+    channel: Channel<LevelsPayload>,
 ) {
     *state.levels_channel.lock() = Some(channel);
     // 推送线程常驻（只起一次），循环里每 tick 检查是否真的要推送
@@ -596,7 +704,12 @@ pub fn subscribe_levels(
             if !visible {
                 continue;
             }
-            let _ = channel.send(engine.levels());
+            // 频谱分析关闭时 stats().spectra 为空表，照常推送电平
+            let stats = engine.stats();
+            let _ = channel.send(LevelsPayload {
+                levels: engine.levels(),
+                spectra: stats.spectra,
+            });
         });
     }
 }
@@ -605,6 +718,65 @@ pub fn subscribe_levels(
 #[tauri::command]
 pub fn unsubscribe_levels(state: State<AppState>) {
     *state.levels_channel.lock() = None;
+}
+
+/// 设备列表推送：订阅引擎事件广播（看门狗周期性枚举 → DevicesChanged），
+/// 列表内容有变化才推 —— 取代前端固定 4s 的 list_devices 轮询。
+#[tauri::command]
+pub fn subscribe_devices(
+    state: State<AppState>,
+    app: AppHandle,
+    channel: Channel<Vec<DeviceInfo>>,
+) {
+    // 注册即推一次当前列表，前端不必等下一次热插拔
+    let initial = state.engine.list_devices();
+    if channel.send(initial).is_ok() {
+        *state.devices_channel.lock() = Some(channel);
+    }
+    // 推送线程常驻（只起一次）
+    if !state.devices_thread_started.swap(true, Ordering::Relaxed) {
+        let engine = state.engine.clone();
+        std::thread::spawn(move || {
+            use tokio::sync::broadcast::error::RecvError;
+            let mut rx = engine.subscribe();
+            // 上次推送的列表（序列化后比对，避免每 3s 空推）
+            let mut last = String::new();
+            loop {
+                match rx.blocking_recv() {
+                    Ok(EngineEvent::DevicesChanged) => {}
+                    Ok(_) => continue, // 图应用/欠载等事件不关心
+                    Err(RecvError::Lagged(_)) => {} // 落后了就当作有变化
+                    Err(RecvError::Closed) => break,
+                }
+                let visible = app
+                    .get_webview_window(tray::MAIN_WINDOW)
+                    .map(|w| w.is_visible().unwrap_or(false))
+                    .unwrap_or(false);
+                if !visible {
+                    continue;
+                }
+                let devices = engine.list_devices();
+                let Ok(json) = serde_json::to_string(&devices) else {
+                    continue;
+                };
+                if json == last {
+                    continue;
+                }
+                let Some(channel) = app.state::<AppState>().devices_channel.lock().clone() else {
+                    continue;
+                };
+                if channel.send(devices).is_ok() {
+                    last = json;
+                }
+            }
+        });
+    }
+}
+
+/// 停止设备列表推送（前端切走页签/窗口隐藏时调用）
+#[tauri::command]
+pub fn unsubscribe_devices(state: State<AppState>) {
+    *state.devices_channel.lock() = None;
 }
 
 #[tauri::command]
@@ -637,6 +809,18 @@ pub fn update_settings(
     // 边缓冲容量变化 → 重建边缓冲（瞬时可能有一小段间隙）
     if settings.edge_buffer_ms != old_settings.edge_buffer_ms {
         state.engine.set_edge_buffer_ms(settings.edge_buffer_ms);
+    }
+    // 频谱分析开关 → 引擎音频线程开始/停止采样
+    if settings.fft_enabled != old_settings.fft_enabled {
+        state.engine.set_fft_enabled(settings.fft_enabled);
+    }
+    // 频谱参数（FFT 点数/频段边界）→ 引擎更新统计口径（无需重建流）
+    if settings.fft_size != old_settings.fft_size
+        || settings.fft_bands != old_settings.fft_bands
+    {
+        state
+            .engine
+            .set_fft_params(settings.fft_size, settings.fft_bands.clone());
     }
     // 控制 API 开关/端口变化 → 重启服务
     restart_control_api(&state)?;

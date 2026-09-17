@@ -5,6 +5,7 @@ import {
   NCard,
   NDivider,
   NSwitch,
+  NInput,
   NInputNumber,
   NFormItem,
   NSelect,
@@ -31,6 +32,31 @@ async function save() {
   } finally {
     busy.value = false;
   }
+}
+
+// ---------- 频段边界编辑 ----------
+const fftBandText = ref(app.settings.fft_bands.join(", "));
+// 设置整体加载/回滚后同步编辑框
+watch(
+  () => app.settings.fft_bands,
+  (v) => {
+    fftBandText.value = v.join(", ");
+  },
+);
+
+async function saveFftBands() {
+  const nums = fftBandText.value
+    .split(/[,，\s]+/)
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (!nums.length) {
+    message.error("频段边界无效：至少需要一个正数（Hz）");
+    return;
+  }
+  nums.sort((a, b) => a - b);
+  app.settings.fft_bands = [...new Set(nums)];
+  fftBandText.value = app.settings.fft_bands.join(", ");
+  await save();
 }
 
 async function toggleAutostart(enabled: boolean) {
@@ -200,6 +226,32 @@ onUnmounted(() => window.clearInterval(timer));
             style="width: 130px" @update:value="save">
             <template #suffix>ms</template>
           </n-input-number>
+        </div>
+        <n-divider />
+        <div class="item-row">
+          <div style="flex: 1">
+            <div class="item-title">FFT 点数</div>
+            <n-text depth="3" style="font-size: 12px">
+              频谱分析的窗口点数。越大低频分辨率越好、频谱变化越平滑；越小响应越快。
+            </n-text>
+          </div>
+          <n-select v-model:value="app.settings.fft_size" :options="[
+            { label: '1024（快）', value: 1024 },
+            { label: '2048', value: 2048 },
+            { label: '4096（细）', value: 4096 },
+          ]" style="width: 130px" @update:value="save" />
+        </div>
+        <n-divider />
+        <div class="item-row">
+          <div style="flex: 1">
+            <div class="item-title">频段边界频率</div>
+            <n-text depth="3" style="font-size: 12px">
+              逗号/空格分隔的边界（Hz），升序，段数 = 边界数；第一段含最低频，末段之上不显示。
+              输入后按回车或失焦保存。
+            </n-text>
+            <n-input v-model:value="fftBandText" size="small" style="margin-top: 8px" placeholder="50, 69, 94, …, 20000"
+              @blur="saveFftBands" @keydown.enter="($event.target as HTMLInputElement)?.blur()" />
+          </div>
         </div>
       </n-card>
 

@@ -88,11 +88,23 @@ export interface Settings {
   edge_buffer_ms: number;
   /** 电平推送间隔（ms，20..=500，越小电平条越顺滑、CPU 略高） */
   levels_interval_ms: number;
+  /** 频谱分析开关（默认关闭：关闭时音频线程不采样、无频谱数据） */
+  fft_enabled: boolean;
+  /** FFT 窗口点数（1024/2048/4096，须为 2 的幂） */
+  fft_size: number;
+  /** 频段边界频率（Hz，升序；段数 = 边界数，band 0 含第一边界以下） */
+  fft_bands: number[];
 }
 
 export interface ApiStatus {
   running: boolean;
   addr: string | null;
+}
+
+/** 电平推送载荷：节点电平 + 频段 dB（fft 关闭时 spectra 为空对象） */
+export interface LevelsPayload {
+  levels: Record<string, number>;
+  spectra: Record<string, number[]>;
 }
 
 // ---------- USB/IP 虚拟声卡（usbip-win2 + UAC2）----------
@@ -198,8 +210,7 @@ export const nodeKey = {
 };
 
 export const api = {
-  listDevices: () => invoke<DeviceInfo[]>("list_devices"),
-  refreshDevices: () => invoke<DeviceInfo[]>("refresh_devices"),
+  listDevices: () => invoke<DeviceInfo[]>("list_devices"),  refreshDevices: () => invoke<DeviceInfo[]>("refresh_devices"),
   /** 设为 Windows 默认设备（播放/录音均可），返回刷新后的设备列表 */
   setDefaultDevice: (deviceId: string) =>
     invoke<DeviceInfo[]>("set_default_device", { deviceId }),
@@ -225,12 +236,19 @@ export const api = {
   setSinkVolume: (sinkId: string, volume: number) =>
     invoke<void>("set_sink_volume", { sinkId, volume }),
   /** 电平推送：后端线程 ~20fps 主动推（取代轮询），返回 Promise 在订阅完成后 resolve */
-  subscribeLevels(onLevels: (levels: Record<string, number>) => void): Promise<void> {
-    const channel = new Channel<Record<string, number>>();
+  subscribeLevels(onLevels: (payload: LevelsPayload) => void): Promise<void> {
+    const channel = new Channel<LevelsPayload>();
     channel.onmessage = onLevels;
     return invoke("subscribe_levels", { channel });
   },
   unsubscribeLevels: () => invoke<void>("unsubscribe_levels"),
+  /** 设备列表推送：热插拔/看门狗枚举有变化才推（取代固定周期轮询） */
+  subscribeDevices(onDevices: (devices: DeviceInfo[]) => void): Promise<void> {
+    const channel = new Channel<DeviceInfo[]>();
+    channel.onmessage = onDevices;
+    return invoke("subscribe_devices", { channel });
+  },
+  unsubscribeDevices: () => invoke<void>("unsubscribe_devices"),
   getSettings: () => invoke<Settings>("get_settings"),
   updateSettings: (settings: Settings) => invoke<void>("update_settings", { settings }),
   getControlApiStatus: () => invoke<ApiStatus>("get_control_api_status"),

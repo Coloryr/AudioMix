@@ -13,7 +13,7 @@ pub fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
     WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("index.html".into()))
         .title("AudioMix")
         .inner_size(1100.0, 780.0)
-        .min_inner_size(880.0, 600.0)
+        .min_inner_size(1050.0, 700.0)
         // Windows 上 Tauri 默认拦截 HTML5 拖放（用于原生文件拖入），
         // 会让页面的 dragstart/drop 全部失效；本应用不用原生文件拖放，关掉它。
         .disable_drag_drop_handler()

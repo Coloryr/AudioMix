@@ -69,11 +69,16 @@ fn main() {
                 let graph = settings.graph.clone();
                 let resample_quality = settings.settings.resample_quality;
                 let edge_buffer_ms = settings.settings.edge_buffer_ms;
+                let fft_enabled = settings.settings.fft_enabled;
+                let fft_size = settings.settings.fft_size;
+                let fft_bands = settings.settings.fft_bands.clone();
                 std::thread::spawn(move || -> Result<_, String> {
                     let engine =
                         Engine::new(backend).map_err(|e| format!("音频引擎初始化失败: {e}"))?;
                     engine.set_resample_quality(resample_quality);
                     engine.set_edge_buffer_ms(edge_buffer_ms);
+                    engine.set_fft_params(fft_size, fft_bands);
+                    engine.set_fft_enabled(fft_enabled);
                     if let Err(e) = engine.apply_graph(graph) {
                         // 设备缺失等情况不阻断启动，引擎会跳过不可用项
                         tracing::warn!("应用已保存的混音图时出现问题: {e}");
@@ -160,6 +165,8 @@ fn main() {
             commands::set_sink_volume,
             commands::subscribe_levels,
             commands::unsubscribe_levels,
+            commands::subscribe_devices,
+            commands::unsubscribe_devices,
             commands::get_stats,
             commands::get_settings,
             commands::update_settings,
