@@ -720,9 +720,84 @@ function onNodeClick(node: GNode) {
     nodeDragMoved = false;
     return;
   }
+  // 延迟测试模式：点击 = 选起点/终点，不弹属性面板
+  if (latencyMode.value) {
+    pickLatencyNode(node);
+    return;
+  }
   if (hasInlineDspControl(node)) return;
   selectedNode.value = node.key;
   selectedRoute.value = null;
+}
+
+// ---------- 延迟测试模式：右键画布进入 → 依次点「源节点」「输出节点」→ 开始测试 ----------
+const latencyMode = ref(false);
+/** 已点选的节点 key（最多两个：一个带 sourceId 的源、一个带 sinkId 的输出） */
+const latencyPicks = ref<string[]>([]);
+const latencyMeasuring = ref(false);
+/** 测量结果（null = 还没测，浮条显示选择引导） */
+const latencyResult = ref<{ ok: boolean; text: string } | null>(null);
+
+function enterLatencyMode() {
+  latencyMode.value = true;
+  latencyPicks.value = [];
+  latencyMeasuring.value = false;
+  latencyResult.value = null;
+}
+
+function exitLatencyMode() {
+  latencyMode.value = false;
+  latencyPicks.value = [];
+  latencyMeasuring.value = false;
+  latencyResult.value = null;
+}
+
+/** 测试模式下点节点：已选的再点取消；第三个点击替换终点 */
+function pickLatencyNode(node: GNode) {
+  if (latencyMeasuring.value) return;
+  if (latencyPicks.value.includes(node.key)) {
+    latencyPicks.value = latencyPicks.value.filter((k) => k !== node.key);
+    return;
+  }
+  if (!node.sourceId && !node.sinkId) {
+    message.warning("起点/终点需要设备节点（源或输出），DSP 方块不能选");
+    return;
+  }
+  if (latencyPicks.value.length >= 2) latencyPicks.value = [latencyPicks.value[1]];
+  latencyPicks.value = [...latencyPicks.value, node.key];
+}
+
+const latencyPickedNodes = computed(() =>
+  latencyPicks.value.map((k) => nodeByKey.value.get(k)).filter((n): n is GNode => !!n),
+);
+/** 两端齐了：一个源节点 + 一个输出节点 */
+const latencyReady = computed(
+  () =>
+    latencyPickedNodes.value.some((n) => n.sourceId) && latencyPickedNodes.value.some((n) => n.sinkId),
+);
+const latencyHint = computed(() => {
+  const hasSrc = latencyPickedNodes.value.some((n) => n.sourceId);
+  const hasDst = latencyPickedNodes.value.some((n) => n.sinkId);
+  if (hasSrc && hasDst) return "已选好两端";
+  if (!latencyPickedNodes.value.length || (!hasSrc && !hasDst))
+    return "延迟测试：先点一个源节点（线路 / 输入 / 系统回声）";
+  return hasSrc ? "再点一个输出节点（耳机 / 扬声器 / 线路输入）" : "先点一个源节点（线路 / 输入 / 系统回声）";
+});
+
+async function startLatencyTest() {
+  const src = latencyPickedNodes.value.find((n) => n.sourceId);
+  const dst = latencyPickedNodes.value.find((n) => n.sinkId);
+  if (!src?.sourceId || !dst?.sinkId) return;
+  latencyMeasuring.value = true;
+  latencyResult.value = null;
+  try {
+    const ms = await api.measureNodesLatency(src.sourceId, dst.sinkId);
+    latencyResult.value = { ok: true, text: `${src.title} → ${dst.title} ≈ ${ms.toFixed(1)} ms` };
+  } catch (e) {
+    latencyResult.value = { ok: false, text: String(e) };
+  } finally {
+    latencyMeasuring.value = false;
+  }
 }
 
 /** 该节点的 DSP 控件是否已内联到方块上（悬浮窗不再弹出） */
@@ -1256,7 +1331,13 @@ function flushPendingVolumes() {
 }
 
 // ---------- 右键菜单 / 键盘删除 ----------
-const ctxMenu = ref<{ x: number; y: number; kind: "wire" | "node"; id: string; title: string } | null>(null);
+const ctxMenu = ref<{
+  x: number;
+  y: number;
+  kind: "wire" | "node" | "canvas";
+  id: string;
+  title: string;
+} | null>(null);
 
 function openWireMenu(e: MouseEvent, w: Wire) {
   selectedRoute.value = w.id;
@@ -1285,6 +1366,27 @@ function closeMenu() {
   ctxMenu.value = null;
 }
 
+/** 右键画布空白：延迟测试入口 */
+function openCanvasMenu(e: MouseEvent) {
+  ctxMenu.value = {
+    x: Math.min(e.clientX, window.innerWidth - 220),
+    y: Math.min(e.clientY, window.innerHeight - 130),
+    kind: "canvas",
+    id: "",
+    title: "接线画布",
+  };
+}
+
+function openCanvasMenuDeferred(e: MouseEvent) {
+  // pointerdown（关闭旧菜单）先于 contextmenu 触发，用宏任务确保菜单不被立刻关掉
+  setTimeout(() => openCanvasMenu(e), 0);
+}
+
+function menuLatencyTest() {
+  closeMenu();
+  enterLatencyMode();
+}
+
 async function menuDisconnect() {
   const m = ctxMenu.value;
   closeMenu();
@@ -1306,6 +1408,10 @@ function onWindowResize() {
 }
 
 function onKeyDown(e: KeyboardEvent) {
+  if (e.key === "Escape" && latencyMode.value) {
+    exitLatencyMode();
+    return;
+  }
   if (e.key === "Escape" && (clickPending.value || drag.value)) {
     setClickPending(null);
     drag.value = null;
@@ -1454,7 +1560,7 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
              它 inset:0 铺满画布，空白处的 pointerdown 落在这层而不是 .canvas 上，
              平移入口必须挂在这里（挂 .canvas 上的 .self 永远不命中，画布就拖不动） -->
           <div class="canvas-world" :style="{ transform: `translate(${pan.x}px, ${pan.y}px)` }"
-            @pointerdown.self="startCanvasPan">
+            @pointerdown.self="startCanvasPan" @contextmenu.self.prevent="openCanvasMenuDeferred">
             <!-- 连线层：SVG 画在 CanvasWires 里（比画布外扩一圈，viewBox 平移到负区） -->
             <CanvasWires :wires="wires" :selected-id="selectedRoute" :pending="pendingWire" :guides="nodeGuides"
               :size="canvasSize" @select="(id) => { selectedRoute = id; selectedNode = null; }"
@@ -1470,8 +1576,8 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
               <span>{{ dropPreview.title }}</span>
             </div>
 
-            <CanvasNodeCard v-for="node in nodes" :key="node.key" :node="node" :selected="selectedNode === node.key"
-              :wiring="!!wireSource"
+            <CanvasNodeCard v-for="node in nodes" :key="node.key" :node="node"
+              :selected="selectedNode === node.key || latencyPicks.includes(node.key)" :wiring="!!wireSource"
               :meter="Math.max(level(node.sourceId), level(node.sinkId), level(node.processorId))"
               :spectrum="spectrumOf(node.sourceId ?? node.sinkId)"
               :badge="node.processorId ? procStateBadge(node.processorId) : null" :dsp="dspOf(node)"
@@ -1495,6 +1601,22 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
             :device-volume="selectedNodeData?.sinkId ? volumeOf(sinkDeviceId(selectedNodeData)) : 1" :style="popStyle"
             @close="closePop" @disconnect="disconnect" @volume-change="(id, v) => onDeviceVolume(id, v)"
             @remove="removeNode" />
+
+          <!-- 延迟测试模式浮条：置顶居中、absolute 不参与布局（不影响 fitCanvas） -->
+          <div v-if="latencyMode" class="latency-bar" @pointerdown.stop @click.stop @contextmenu.prevent.stop>
+            <span v-if="latencyMeasuring">测量中，约 3 秒（会听到轻微脉冲声）…</span>
+            <template v-else>
+              <span>{{ latencyHint }}</span>
+              <span v-for="n in latencyPickedNodes" :key="n.key" class="latency-pick">{{ n.title }}</span>
+              <span v-if="latencyResult" :class="latencyResult.ok ? 'latency-val' : 'latency-err'"
+                :title="latencyResult.text">{{ latencyResult.text }}</span>
+            </template>
+            <n-button size="tiny" type="primary" :disabled="!latencyReady || latencyMeasuring"
+              @click="startLatencyTest">
+              开始测试
+            </n-button>
+            <n-button size="tiny" quaternary :disabled="latencyMeasuring" @click="exitLatencyMode">退出</n-button>
+          </div>
         </div>
       </n-card>
     </div>
@@ -1512,7 +1634,10 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
     <div v-if="ctxMenu" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @pointerdown.stop
       @contextmenu.prevent>
       <div class="ctx-title">{{ ctxMenu.title }}</div>
-      <template v-if="ctxMenu.kind === 'wire'">
+      <template v-if="ctxMenu.kind === 'canvas'">
+        <div class="ctx-item" @click="menuLatencyTest">延迟测试（选两个节点）</div>
+      </template>
+      <template v-else-if="ctxMenu.kind === 'wire'">
         <div class="ctx-item danger" @click="menuDisconnect">断开这条连线（Delete）</div>
       </template>
       <template v-else>
@@ -1635,6 +1760,48 @@ function openNodeMenuDeferred(e: MouseEvent, node: GNode) {
   color: #fff;
   font-size: 12px;
   white-space: nowrap;
+}
+
+/* 延迟测试模式浮条：画布内置顶居中；absolute 不参与布局，不影响 fitCanvas 的高度调平 */
+.latency-bar {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 7;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.latency-pick {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--hover-chip);
+}
+
+.latency-val {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.latency-err {
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--err-text);
+  font-size: 11px;
 }
 
 .ctx-menu {

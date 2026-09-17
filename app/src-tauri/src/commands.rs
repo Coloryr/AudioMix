@@ -730,6 +730,40 @@ pub fn set_sink_volume(
     persist(&app, &state)
 }
 
+/// 实测一条连线路径的延迟（ms）：向源节点的采集流注入扫频脉冲（每 400ms 一次，
+/// 共 5 次），在路径信号里做相关检测取中位数。整段阻塞约 2.5~4s，放 blocking 线程跑。
+#[tauri::command]
+pub async fn measure_route_latency(
+    state: State<'_, AppState>,
+    route_id: String,
+) -> Result<f64, String> {
+    let engine = state.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .measure_path_latency(&route_id)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("测量任务失败: {e}"))?
+}
+
+/// 实测「源节点 → 输出节点」之间路径的延迟（ms）。同上，注入扫频脉冲阻塞约 3s。
+#[tauri::command]
+pub async fn measure_nodes_latency(
+    state: State<'_, AppState>,
+    source_id: String,
+    sink_id: String,
+) -> Result<f64, String> {
+    let engine = state.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .measure_latency_between(&source_id, &sink_id)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("测量任务失败: {e}"))?
+}
+
 /// 电平推送：前端用 Tauri Channel 订阅，后端线程按 20fps 主动推 ——
 /// 取代旧的前端 setInterval + get_levels 轮询（每 tick 一次完整 IPC 往返）。
 /// 不可见（最小化/托盘）或未订阅时线程只做空读，开销可忽略。

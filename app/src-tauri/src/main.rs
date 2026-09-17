@@ -161,6 +161,8 @@ fn main() {
             commands::set_mixer_layout,
             commands::set_route_gain,
             commands::set_route_muted,
+            commands::measure_route_latency,
+            commands::measure_nodes_latency,
             commands::set_processor_params,
             commands::set_sink_volume,
             commands::subscribe_levels,

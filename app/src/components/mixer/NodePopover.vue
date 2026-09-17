@@ -2,7 +2,7 @@
 // 画布内悬浮属性面板（点击节点 / 连线后弹出）：连线的断开、采集开关、
 // 混音音量、系统音量、DSP 参数（内嵌 DspParamPanel）、移除节点。
 // 定位（popStyle）与关闭时机（点外部关闭）仍由 MixerView 控制 —— 这里只负责内容。
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 import { NButton, NSlider, NSwitch, NTag, useMessage } from "naive-ui";
 import { api, type Route } from "../../api";
 import { useApp } from "../../store";
@@ -49,6 +49,35 @@ const processor = computed(() =>
 const deviceId = computed(() => (props.node ? (sinkDeviceIdOf(props.node, app.graph.sinks) ?? null) : null));
 const showDeviceVolume = computed(() => !!deviceId.value && !deviceId.value.startsWith("usbip://"));
 
+// ---------- 路径延迟测量（注入扫频脉冲 + 相关检测，后端阻塞约 3s） ----------
+const measuring = ref(false);
+const latencyMs = ref<number | null>(null);
+const latencyErr = ref("");
+/** 只有从真实源节点出发的连线可测：注入点在源的采集流里，从 DSP 方块出发的连线没有注入点 */
+const canMeasure = computed(
+  () => !!props.route && app.graph.sources.some((s) => s.id === props.route!.source_id),
+);
+watch(
+  () => props.route?.id,
+  () => {
+    latencyMs.value = null;
+    latencyErr.value = "";
+  },
+);
+async function measureLatency() {
+  if (!props.route || measuring.value) return;
+  measuring.value = true;
+  latencyMs.value = null;
+  latencyErr.value = "";
+  try {
+    latencyMs.value = await api.measureRouteLatency(props.route.id);
+  } catch (e) {
+    latencyErr.value = String(e);
+  } finally {
+    measuring.value = false;
+  }
+}
+
 async function save() {
   try {
     await app.saveGraph();
@@ -87,9 +116,16 @@ function onSinkEnabled(sinkId: string, enabled: boolean) {
       <span class="node-close" @pointerdown.stop @click.stop="emit('close')">×</span>
     </div>
 
-    <!-- 连线：只代表连接关系，唯一操作是断开 -->
+    <!-- 连线：测量路径延迟 + 断开 -->
     <template v-if="route">
       <div class="canvas-pop-row">
+        <n-button size="tiny" :loading="measuring" :disabled="!canMeasure"
+          :title="canMeasure ? '向源节点注入测试脉冲，实测该路径延迟（约 3 秒）' : '只有从源节点出发的连线可以测量（DSP 出发的连线没有注入点）'"
+          @click="measureLatency">
+          测量延迟
+        </n-button>
+        <span v-if="latencyMs !== null" class="latency-val">≈ {{ latencyMs.toFixed(1) }} ms</span>
+        <span v-else-if="latencyErr" class="latency-err" :title="latencyErr">{{ latencyErr }}</span>
         <n-button size="tiny" quaternary type="error" style="margin-left: auto" @click="emit('disconnect', route.id)">
           断开
         </n-button>
@@ -166,6 +202,22 @@ function onSinkEnabled(sinkId: string, enabled: boolean) {
   align-items: center;
   gap: 8px;
   margin-top: 6px;
+}
+
+/* 延迟测量结果 / 错误 */
+.latency-val {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.latency-err {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--err-text);
+  font-size: 11px;
 }
 
 .node-close {

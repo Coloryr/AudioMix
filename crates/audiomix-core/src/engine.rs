@@ -30,6 +30,7 @@ use crate::mixer::{convert_channels, mix_into, peak_of, soft_clip};
 use crate::model::{
     DeviceInfo, DeviceKind, DspNode, GraphConfig, Id, Processor, Route, Sink, Source, SourceMode,
 };
+use crate::probe::LatencyProbe;
 use crate::resample::{PullResampler, ResamplerQuality};
 use crate::ring::{new_edge_ring, EdgeReader, EdgeRing, EdgeWriter};
 
@@ -65,7 +66,7 @@ struct SourceHandle {
 
 struct SinkHandle {
     device_id: String,
-    #[allow(dead_code)] // 保留：未来统计/展示 sink 实际流格式
+    /// 实际流格式（GetMixFormat 结果；延迟测量按它换算检出时刻）
     info: crate::backend::StreamInfo,
     peak: Arc<AtomicU32>,
     underruns: Arc<AtomicU64>,
@@ -147,6 +148,8 @@ pub struct Engine {
     inner: Mutex<Inner>,
     runtime: Arc<ArcSwap<GraphRuntime>>,
     events: broadcast::Sender<EngineEvent>,
+    /// 路径延迟测量（`measure_path_latency`；回调里 armed 才有开销）
+    probe: Arc<LatencyProbe>,
 }
 
 impl Engine {
@@ -175,6 +178,7 @@ impl Engine {
                 resample_quality: ResamplerQuality::default(),
             })),
             events,
+            probe: Arc::new(LatencyProbe::default()),
         });
         engine.spawn_device_watchdog();
         Ok(engine)
@@ -525,6 +529,8 @@ impl Engine {
                 writers.clone(),
                 fft.clone(),
                 fft_ch.clone(),
+                self.probe.clone(),
+                src.id.clone(),
             );
             let started = match src.mode {
                 SourceMode::DeviceInput => self.backend.start_capture(&src.device_id, cb),
@@ -601,6 +607,7 @@ impl Engine {
                 peak.clone(),
                 underruns.clone(),
                 fft.clone(),
+                self.probe.clone(),
             );
             let started = self
                 .backend
@@ -749,6 +756,142 @@ impl Engine {
         let _ = self.sync_streams_locked(&mut inner);
         tracing::info!("边缓冲容量调整为 {ms}ms，已按新容量重建路由边缓冲");
     }
+
+    /// 实测一条连线路径的延迟（ms）：向路径源头的采集流注入扫频脉冲，
+    /// 在该路径（source → …DSP… → sink）经 DSP 后的信号里做相关检测。
+    /// 覆盖边缓冲排队 + 重采样 + DSP 链（延迟节点如实计入），不含两端设备缓冲。
+    /// 阻塞约 2.5~4s（5 个脉冲取中位数）。注意：引擎 inner 锁不能跨测量持有
+    /// （测量要等音频线程跑），先取出所需参数再放锁。
+    pub fn measure_path_latency(&self, route_id: &str) -> Result<f64> {
+        let (src_id, src_rate, src_ch, edge_key, dst_rate) = {
+            let inner = self.inner.lock();
+            let prefix = format!("{route_id}#");
+            let path = resolve_paths(&inner.config)
+                .into_iter()
+                .find(|p| p.key.starts_with(&prefix))
+                .ok_or_else(|| {
+                    Error::InvalidGraph(format!("连线 {route_id} 没有有效路径（两端设备是否在线/启用？）"))
+                })?;
+            path_probe_params(&inner, &path)?
+        };
+        self.probe_measure(src_id, src_rate, src_ch, edge_key, dst_rate)
+    }
+
+    /// 实测「源节点 → 输出节点」之间有效路径的延迟（ms）。两节点间有多条
+    /// 并行路径时取第一条；**跨线缆的整链也能测**——同一虚拟线路
+    /// 「线路输入 sink → 线路输出 source」（回灌/Reverse 模式）视作一段线缆内部
+    /// 回环边，信号经 cap_ring → ISO IN → 回灌 → play_ring 回到引擎继续走。
+    /// 其余同 [`Self::measure_path_latency`]。
+    pub fn measure_latency_between(&self, source_id: &str, sink_id: &str) -> Result<f64> {
+        let (src_rate, src_ch, edge_key, dst_rate) = {
+            let inner = self.inner.lock();
+            let path = find_chain_path(&inner.config, source_id, sink_id).ok_or_else(|| {
+                Error::InvalidGraph(
+                    "两个节点之间没有有效路径（先连线，且两端设备在线/启用；跨线缆需线路为「回灌 reverse」模式）"
+                        .to_string(),
+                )
+            })?;
+            let src = inner.sources.get(source_id).ok_or_else(|| {
+                Error::InvalidGraph("起点设备的采集流未运行（节点是否被停用？）".to_string())
+            })?;
+            let dst_rate = inner
+                .sinks
+                .get(&path.sink_id)
+                .map(|s| s.info.sample_rate)
+                .ok_or_else(|| Error::InvalidGraph("终点设备的渲染流未运行".to_string()))?;
+            (
+                src.info.sample_rate,
+                src.info.channels as usize,
+                path.key.clone(),
+                dst_rate,
+            )
+        };
+        self.probe_measure(source_id.to_string(), src_rate, src_ch, edge_key, dst_rate)
+    }
+
+    fn probe_measure(
+        &self,
+        src_id: Id,
+        src_rate: u32,
+        src_ch: usize,
+        edge_key: String,
+        dst_rate: u32,
+    ) -> Result<f64> {
+        let ms = self
+            .probe
+            .measure(&src_id, src_rate, src_ch, &edge_key, dst_rate)
+            .map_err(Error::InvalidGraph)?;
+        tracing::info!("路径 {edge_key} 实测延迟 ≈ {ms:.1}ms");
+        Ok(ms)
+    }
+}
+
+/// 从路径取出探测所需的参数（源头流格式 / 终点采样率 / 边 key）。
+fn path_probe_params(inner: &Inner, path: &ResolvedPath) -> Result<(Id, u32, usize, String, u32)> {
+    let src = inner.sources.get(&path.source_id).ok_or_else(|| {
+        Error::InvalidGraph("路径源头设备的采集流未运行（节点是否被停用？）".to_string())
+    })?;
+    let dst_rate = inner
+        .sinks
+        .get(&path.sink_id)
+        .map(|s| s.info.sample_rate)
+        .ok_or_else(|| Error::InvalidGraph("路径终点设备的渲染流未运行".to_string()))?;
+    Ok((
+        path.source_id.clone(),
+        src.info.sample_rate,
+        src.info.channels as usize,
+        path.key.clone(),
+        dst_rate,
+    ))
+}
+
+/// 跨线缆整链查找：在图内路径之外，把同一虚拟线路的
+/// 「线路输入 sink（usbip://N/capture）→ 线路输出 source（usbip://N/playback）」
+/// 当作一段线缆内部回环边（Reverse 回灌模式：写进麦克风端的数据回灌到扬声器端），
+/// 从而支持 线路1 → [线缆回环] → 线路2 → 耳机 这类多段整链测量。
+/// 返回最终一段的路径（注入点 = 起始 source，检测点 = 该路径的边）。
+/// 最多穿 3 次回环，防环形拓扑死循环。
+fn find_chain_path(config: &GraphConfig, source_id: &str, sink_id: &str) -> Option<ResolvedPath> {
+    let mut frontier = vec![source_id.to_string()];
+    let mut visited: std::collections::HashSet<String> =
+        [source_id.to_string()].into_iter().collect();
+    for _hop in 0..4 {
+        let paths = resolve_paths(config);
+        // 本层是否直达终点
+        for p in &paths {
+            if p.sink_id.as_str() == sink_id && frontier.iter().any(|s| *s == p.source_id) {
+                return Some(p.clone());
+            }
+        }
+        // 收集下一层：途经线路输入 sink 的，穿回环到同线路的线路输出 source
+        let mut next = Vec::new();
+        for p in &paths {
+            if !frontier.iter().any(|s| *s == p.source_id) {
+                continue;
+            }
+            if let Some(hop) = cable_loop_target(&p.sink_id) {
+                if visited.insert(hop.clone()) {
+                    next.push(hop);
+                }
+            }
+        }
+        if next.is_empty() {
+            return None;
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// 线路输入 sink id（usbip://N/capture）→ 同线路的线路输出 source id
+/// （usbip://N/playback）。非线路 sink 返回 None。
+fn cable_loop_target(sink_id: &str) -> Option<String> {
+    let rest = sink_id.strip_prefix("usbip://")?;
+    let (n, side) = rest.split_once('/')?;
+    if side != "capture" || n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("usbip://{n}/playback"))
 }
 
 fn find_device(devices: &[DeviceInfo], id: &str) -> Option<DeviceInfo> {
@@ -756,6 +899,7 @@ fn find_device(devices: &[DeviceInfo], id: &str) -> Option<DeviceInfo> {
 }
 
 /// 一条解析完成的有效路径：source →（途经 0..n 个 processor）→ sink。
+#[derive(Clone)]
 struct ResolvedPath {
     /// 唯一键（= 终点连线 id + 分支序号），边缓冲按它复用
     key: String,
@@ -871,16 +1015,26 @@ fn make_capture_callback(
     writers: Arc<ArcSwap<Vec<Arc<EdgeWriter>>>>,
     fft: Arc<SpectrumTap>,
     fft_ch: Arc<AtomicU32>,
+    probe: Arc<LatencyProbe>,
+    src_id: Id,
 ) -> CaptureCallback {
     Box::new(move |data: &[f32]| {
+        // 电平/频谱用原始数据（测量脉冲不污染显示）
         peak.store(peak_of(data).to_bits(), Ordering::Relaxed);
-        for w in writers.load().iter() {
-            w.push(data);
-        }
         // 通道数在流启动后注入；未注入（0）时跳过频谱采样
         let ch = fft_ch.load(Ordering::Relaxed) as usize;
         if ch > 0 {
             fft.push(data, ch);
+        }
+        // 延迟测量布防时叠加测试脉冲（只对目标 source；空闲时一次原子读返回，不复制）
+        if let Some(injected) = probe.capture_inject(&src_id, data) {
+            for w in writers.load().iter() {
+                w.push(&injected);
+            }
+        } else {
+            for w in writers.load().iter() {
+                w.push(data);
+            }
         }
     })
 }
@@ -923,6 +1077,7 @@ fn make_render_callback(
     peak: Arc<AtomicU32>,
     underruns: Arc<AtomicU64>,
     fft: Arc<SpectrumTap>,
+    probe: Arc<LatencyProbe>,
 ) -> RenderCallback {
     let states: Arc<Mutex<HashMap<Id, SinkEdgeState>>> = Arc::new(Mutex::new(HashMap::new()));
     Box::new(move |out: &mut [f32]| {
@@ -994,6 +1149,8 @@ fn make_render_callback(
                     st.dsp.process(&mut gen);
                 }
                 let slice = &gen[..gen.len().min(out.len())];
+                // 延迟测量：DSP 处理后、增益/混合前的信号送进 tap（只对目标边生效）
+                probe.render_tap(&e.route_id, slice, ch_out);
                 e.peak.store(peak_of(slice).to_bits(), Ordering::Relaxed);
                 mix_into(out, slice, gain);
             } else {
@@ -1004,6 +1161,7 @@ fn make_render_callback(
                 if !st.dsp.is_empty() {
                     st.dsp.process(&mut converted);
                 }
+                probe.render_tap(&e.route_id, &converted, ch_out);
                 e.peak
                     .store(peak_of(&converted).to_bits(), Ordering::Relaxed);
                 mix_into(out, &converted, gain);

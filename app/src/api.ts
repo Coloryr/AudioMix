@@ -231,6 +231,12 @@ export const api = {
     invoke<void>("set_route_gain", { routeId, gain }),
   setRouteMuted: (routeId: string, muted: boolean) =>
     invoke<void>("set_route_muted", { routeId, muted }),
+  /** 实测一条连线路径的延迟（ms）：注入扫频脉冲 + 相关检测，阻塞约 2.5~4s */
+  measureRouteLatency: (routeId: string) =>
+    invoke<number>("measure_route_latency", { routeId }),
+  /** 实测「源节点 → 输出节点」之间路径的延迟（ms） */
+  measureNodesLatency: (sourceId: string, sinkId: string) =>
+    invoke<number>("measure_nodes_latency", { sourceId, sinkId }),
   setProcessorParams: (processorId: string, node: DspNode) =>
     invoke<void>("set_processor_params", { processorId, node }),
   setSinkVolume: (sinkId: string, volume: number) =>

@@ -17,7 +17,7 @@ defineProps<{
   spectrum?: number[];
   /** DSP 方块的状态小字（非 DSP 传 null 不显示） */
   badge: { text: string; cls: string } | null;
-  /** 方块对应的 DSP 处理器（增益/开关/延迟直接在方块上控制，其余走悬浮窗） */
+  /** 方块对应的 DSP 处理器（所有类型都在方块上放旁路开关；详细参数走悬浮窗） */
   dsp?: DspNode | null;
   /** 系统音量条对应的设备 id（Windows 端点音量；线路端点/无 sink 为 undefined 不显示） */
   volumeId?: string;
@@ -69,20 +69,12 @@ function specPx(db: number): number {
       <i v-for="(db, i) in spectrum" :key="i" class="spec-bar" :style="{ height: specPx(db) + 'px' }" />
     </div>
     <MeterBar v-else class="node-meter" :level="meter" />
-    <!-- DSP 方块状态行：开关＝滑块开关直接放方块上；增益/延迟＝状态小字可点切换旁路；
-         其余 DSP 维持原样（控制仍在悬浮弹窗） -->
-    <div v-if="dsp && dsp.type === 'switch'" class="node-state" @pointerdown.stop @click.stop>
-      <n-switch :value="dsp.enabled" size="small" @update:value="(v: boolean) => emit('dsp-toggle', v)" />
-      <span>{{ dsp.enabled ? "开 · 直通" : "关 · 静音" }}</span>
-    </div>
-    <div v-else-if="badge" class="node-state" @pointerdown.stop @click.stop>
-      <i class="state-dot" :class="badge.cls" />
-      <!-- 增益/延迟：点状态小字切换 旁路/启用（悬浮窗已去掉） -->
-      <span v-if="dsp && (dsp.type === 'gain' || dsp.type === 'delay')" class="node-state-btn"
-        :title="dsp.enabled ? '点击旁路' : '点击启用'" @click="emit('dsp-toggle', !dsp.enabled)">
-        {{ badge.text }}
-      </span>
-      <template v-else>{{ badge.text }}</template>
+    <!-- DSP 方块状态行：所有 DSP 类型都直接在方块上放旁路开关（状态点 + 状态小字 + 开关） -->
+    <div v-if="dsp" class="node-state" @pointerdown.stop @click.stop>
+      <i class="state-dot" :class="badge?.cls" />
+      <span>{{ badge?.text }}</span>
+      <n-switch :value="dsp.enabled" size="small" style="margin-left: auto"
+        @update:value="(v: boolean) => emit('dsp-toggle', v)" />
     </div>
 
     <!-- 增益 / 延迟：参数滑杆直接在方块上（改动即下发引擎） -->
@@ -238,16 +230,6 @@ function specPx(db: number): number {
 
 .state-dot.off {
   background: #8a8a8a;
-}
-
-/* 增益/延迟的状态小字可点击切换旁路 */
-.node-state-btn {
-  cursor: pointer;
-}
-
-.node-state-btn:hover {
-  text-decoration: underline;
-  opacity: 1;
 }
 
 /* 增益/延迟的方块内参数滑杆（值右对齐，滑杆吃剩余宽度） */

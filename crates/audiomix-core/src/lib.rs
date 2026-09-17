@@ -10,6 +10,7 @@ pub mod error;
 pub mod fft;
 pub mod mixer;
 pub mod model;
+pub mod probe;
 pub mod resample;
 pub mod ring;
 #[doc(hidden)]
