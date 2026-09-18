@@ -461,7 +461,9 @@ impl OutStats {
         if elapsed >= Duration::from_secs(2) {
             let secs = elapsed.as_secs_f64();
             let hold_ms = s.hold_samples as f64 / 48.0; // 48 样本/ms（48k 立体声）
-            tracing::debug!(
+            // 每 2 秒一条、流式期间持续输出，太刷屏：降为 trace，需要流质量诊断时
+            // 用 RUST_LOG="audiomix_backend_windows::usbip::server=trace" 单独打开
+            tracing::trace!(
                 "{bus} ISO OUT：{:.0} URB/s、{:.1} KB/s、全零 {:.1}%、重复批 {:.1}%、保持 {:.1}ms/s、包 offset 不连续 {:.1}%、最大到达间隔 {}ms",
                 s.urbs as f64 / secs,
                 s.bytes as f64 / 1024.0 / secs,

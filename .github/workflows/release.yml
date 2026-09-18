@@ -1,0 +1,46 @@
+# 构建 Windows 可执行文件并发布到 GitHub Release。
+# 触发：推送 v* 标签（发布），或手动 workflow_dispatch（仅构建验证，不发布）。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # generate_context! 编译期需要 ../dist 里的前端产物，先构建前端
+      - name: 构建前端
+        working-directory: app
+        run: |
+          npm ci
+          npm run build
+
+      - name: 构建可执行文件
+        run: cargo build --release -p audiomix-app
+
+      - name: 整理产物名
+        shell: bash
+        run: cp target/release/audiomix-app.exe "AudioMix-${GITHUB_REF_NAME#v}-x64.exe"
+
+      - name: 发布到 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AudioMix-*-x64.exe
+          generate_release_notes: true

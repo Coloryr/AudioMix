@@ -510,10 +510,21 @@ pub fn ports() -> Result<Vec<AttachedPort>, String> {
     Ok(parse_ports(&out.output))
 }
 
-/// 安装随包捆绑的 usbip-win2（提权静默安装）。返回安装程序输出。
-pub fn install_bundled() -> Result<String, String> {
-    let installer =
-        bundled_installer().ok_or("未找到随包安装包（resources/drivers/usbip/USBip-*-x64.exe）")?;
+/// 安装 usbip-win2（提权静默安装）。返回安装程序输出。
+///
+/// 安装包来源（按序）：
+/// ① exe 旁边的捆绑文件（`drivers/usbip/USBip-*-x64.exe`，NSIS/开发目录布局）；
+/// ② `embedded`——编译进 exe 的安装包（name + 字节），写到本地缓存目录后运行，
+///    保证单文件分发（便携版）也能装驱动。
+pub fn install_bundled(embedded: Option<(&str, &[u8])>) -> Result<String, String> {
+    let installer = match bundled_installer() {
+        Some(p) => p,
+        None => {
+            let (name, bytes) =
+                embedded.ok_or("未找到随包安装包（drivers/usbip/USBip-*-x64.exe）")?;
+            extract_installer(name, bytes)?
+        }
+    };
     tracing::info!("开始安装 USB/IP 驱动: {}", installer.display());
     let args: Vec<String> = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"]
         .iter()
@@ -542,6 +553,28 @@ pub fn install_bundled() -> Result<String, String> {
             Err(msg)
         }
     }
+}
+
+/// 把内嵌的安装包写到本地缓存目录（%LOCALAPPDATA%\com.audiomix.app\drivers\usbip）。
+/// 已存在且大小一致就复用，不重复写 26MB。
+fn extract_installer(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .map(|d| {
+            PathBuf::from(d)
+                .join("com.audiomix.app")
+                .join("drivers")
+                .join("usbip")
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建驱动缓存目录失败: {e}"))?;
+    let path = dir.join(name);
+    let stale = std::fs::metadata(&path)
+        .map(|m| m.len() != bytes.len() as u64)
+        .unwrap_or(true);
+    if stale {
+        std::fs::write(&path, bytes).map_err(|e| format!("写出内嵌安装包失败: {e}"))?;
+    }
+    Ok(path)
 }
 
 pub(crate) fn attach_args(host: &str, tcp_port: u16, bus_id: &str) -> Vec<String> {

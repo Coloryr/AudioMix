@@ -1355,7 +1355,13 @@ pub async fn usbip_detach_all(
 /// 安装随包捆绑的 usbip-win2（提权静默安装，需要 UAC）
 #[tauri::command]
 pub async fn usbip_install_driver() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(usbip_attach::install_bundled)
+    // exe 旁边没找到捆绑安装包时，用编译进 exe 的那份（单文件分发也能装驱动）。
+    // 换驱动版本时同步更新 drivers/usbip/ 下的文件名。
+    const EMBEDDED: (&str, &[u8]) = (
+        "USBip-0.9.8.0-x64.exe",
+        include_bytes!("../drivers/usbip/USBip-0.9.8.0-x64.exe"),
+    );
+    tauri::async_runtime::spawn_blocking(move || usbip_attach::install_bundled(Some(EMBEDDED)))
         .await
         .map_err(|e| format!("安装任务失败: {e}"))?
 }

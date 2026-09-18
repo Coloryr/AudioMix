@@ -194,6 +194,15 @@ fn main() {
             commands::open_main_window,
             commands::quit_app,
         ])
-        .run(tauri::generate_context!())
-        .expect("AudioMix 启动失败");
+        .build(tauri::generate_context!())
+        .expect("AudioMix 启动失败")
+        .run(|_app, event| {
+            // 关闭窗口（销毁到托盘）后应用里就没有窗口了，事件循环默认会请求退出——
+            // 拦下它，引擎/USB/IP 继续驻留；托盘「退出」走 app.exit(0)（带退出码），不拦
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                if code.is_none() {
+                    api.prevent_exit();
+                }
+            }
+        });
 }

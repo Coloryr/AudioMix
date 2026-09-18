@@ -98,8 +98,10 @@ pub struct TeeWriter {
     buf: Arc<LogBuffer>,
 }
 
-/// 日志文件上限（超过就截断重写，避免无限增长）
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// 日志文件大小上限（单个）。超过就轮转成 `audiomix.log.old`（只保留一代），
+/// 磁盘占用上限 ≈ 2 × 上限。注意：每条 DEBUG 都落盘时 2MB 也很快写满，
+/// 大头的治理是把周期性统计日志降到合适级别（见各日志点的注释）。
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// 日志文件路径：%APPDATA%\com.audiomix.app\audiomix.log
 fn log_file_path() -> Option<std::path::PathBuf> {
@@ -111,24 +113,55 @@ fn log_file_path() -> Option<std::path::PathBuf> {
     )
 }
 
+/// 持久打开的日志文件句柄 + 已写入字节数（避免每行都重新 open + stat）
+struct FileState {
+    file: Option<std::fs::File>,
+    written: u64,
+}
+
+static FILE_STATE: std::sync::Mutex<FileState> = std::sync::Mutex::new(FileState {
+    file: None,
+    written: 0,
+});
+
 fn append_to_file(text: &str) {
     let Some(path) = log_file_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let Ok(mut st) = FILE_STATE.lock() else { return };
+
+    // 超限轮转：Windows 不允许重命名打开中的文件，先放掉句柄
+    if st.written > MAX_FILE_BYTES && st.file.is_some() {
+        st.file = None;
     }
-    if std::fs::metadata(&path)
-        .map(|m| m.len() > MAX_FILE_BYTES)
-        .unwrap_or(false)
-    {
-        let _ = std::fs::remove_file(&path);
+    if st.written > MAX_FILE_BYTES {
+        let old = path.with_extension("log.old");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&path, &old);
+        st.written = 0;
     }
+
+    if st.file.is_none() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(f) => {
+                // 接上已存在文件的大小（比如上次运行留下的），轮转判断才准确
+                st.written = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                st.file = Some(f);
+            }
+            Err(_) => return,
+        }
+    }
+
     use std::io::Write as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{text}");
+    if let Some(f) = st.file.as_mut() {
+        if writeln!(f, "{text}").is_ok() {
+            st.written += text.len() as u64 + 1;
+        }
     }
 }
 
