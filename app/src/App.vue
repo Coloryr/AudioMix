@@ -52,6 +52,8 @@ onMounted(async () => {
   await app.loadAll();
   syncLevelsStream();
   syncDevicesStream();
+  // 控制 API（或脚本）改动混音图时把新图拉回来，避免界面旧副本覆盖改动
+  await app.watchGraphChanges();
 });
 onUnmounted(() => {
   document.removeEventListener("visibilitychange", syncDevicesStream);

@@ -25,7 +25,7 @@ Tauri 2 + Vue 3 音频混合软件：把多个音频源（物理输入设备 / �
 - **无 GUI 后台运行**：关闭窗口 = 销毁 WebView 释放资源（引擎继续混音），点托盘重新打开时重建窗口；`--headless` 完全无窗口启动
 - **单实例**：重复启动唤醒已有窗口
 - **开机自启**：写入当前用户注册表 Run 键，可选自启即 headless
-- **远程控制 API**：本地 REST + SSE（默认关闭，UI 中开启），headless 下也可控制
+- **远程控制 API**：本地 REST + SSE（默认关闭，UI 中开启），headless 下也可控制。40+ 端点覆盖设备/混音图（含节点增删改）/电平/延迟实测/设置/虚拟声卡/日志；可选访问令牌鉴权、可选 CORS；`GET /api` 自带端点索引
 
 ## 构建
 
@@ -68,7 +68,7 @@ crates/audiomix-backend-windows WASAPI 实现 + Windows 策略 + USB/IP 虚拟�
       ├─ ring.rs        drop-oldest / silence-fill 环形缓冲
       ├─ backend.rs     线缆 ↔ 引擎设备（usbip://N/playback|capture）
       └─ attach.rs      usbip.exe 调用（install/attach/detach/port）
-crates/audiomix-control-api     axum REST + SSE 控制服务
+crates/audiomix-control-api     axum REST + SSE 控制服务（ApiHost 钩子把 App 侧能力注入进来）
 app/src-tauri                   Tauri 壳（托盘/关窗销毁 WebView/命令/配置/日志缓冲）
 app/src                         Vue 3 + Naive UI 前端（混音 / 虚拟声卡 / 设置）
 ```
@@ -106,16 +106,48 @@ USB/IP 服务器默认监听 `127.0.0.1:3240`，端口可在「设置」页修�
 
 ## 控制 API
 
-设置页开启后监听 `127.0.0.1:17643`（可改端口）：
+设置页开启后监听 `127.0.0.1:17643`（可改地址与端口），REST + SSE，headless 下同样可用。
+**`GET /api` 返回完整的端点清单**（方法/路径/说明 + 鉴权状态），是这份文档的权威版本：
 
-| 端点 | 说明 |
+```bash
+curl -s http://127.0.0.1:17643/api | jq .endpoints
+```
+
+### 鉴权与安全
+
+- **访问令牌**（设置页可一键生成）：非空时所有 `/api/*` 都要带令牌，三种任选：
+  `Authorization: Bearer <令牌>` / `X-Api-Token: <令牌>` / `?token=<令牌>`（SSE 用 query，
+  因为浏览器 `EventSource` 不能自定义请求头）。`/` 与 `/api`（端点索引）始终公开，便于客户端自描述。
+- **监听地址**默认 `127.0.0.1`（仅本机）。改成 `0.0.0.0` 且未设令牌时设置页会红字警告。
+- **CORS 默认关闭**：开启后任意网页都能调用本机 API（CSRF 面），只在确有浏览器客户端时才开，并同时设令牌。
+- 令牌与其它设置一起明文存在 `%APPDATA%\com.audiomix.app\config.json`（该目录仅本用户可读）。
+- 错误统一是 `{"error": {"kind": "...", "message": "..."}}` + 恰当状态码：
+  `400 bad_request` / `401 unauthorized` / `404 not_found` / `409 conflict` / `501 unsupported` / `500 internal`。
+
+### 端点
+
+📖 **完整文档：[docs/API.md](docs/API.md)**（每个端点的字段、示例、状态码、配方与客户端代码）
+
+| 分组 | 端点 |
 |---|---|
-| `GET /api/health` | 健康检查 |
-| `GET /api/devices` | 刷新并返回设备列表 |
-| `GET /api/graph` | 当前混音图 |
-| `PUT /api/graph` | 整体应用混音图（body 为 GraphConfig JSON） |
-| `GET /api/status` | 后端名、各节点电平、欠载/丢帧统计 |
-| `GET /api/events` | SSE：`graph_applied` / `devices_changed` / `underrun` |
+| 服务 | `GET /api`（索引）· `GET /api/health` · `GET /api/status` · `GET /api/levels` |
+| 事件 | `GET /api/events`（SSE）· `GET /api/stream/levels`（SSE 电平流） |
+| 设备 | `GET /api/devices` · `POST /api/devices/refresh` · `POST /api/devices/default` · `GET\|PUT /api/devices/{volume,mute}?device_id=` |
+| 混音图 | `GET\|PUT /api/graph` · `sources` / `sinks` / `routes` / `processors` 各自的 `GET\|POST` 与 `GET\|PATCH\|DELETE /{id}`（processor 用 `PUT` 换参数） |
+| 测量 | `POST /api/latency`（实测 source → DSP → sink，阻塞 2.5–4s） |
+| 应用 | `GET\|PATCH\|PUT /api/settings` · `GET /api/usbip` · `PUT /api/usbip/cables` · `POST /api/usbip/{attach,detach,driver}` · `GET /api/logs` |
+
+> 设备 id 可能含 `/`（如 `usbip://1/playback`），涉及设备的端点统一用 `?device_id=` 查询参数。
+
+### 与界面的一致性
+
+- 界面（或 API）改动混音图 → 引擎广播 `graph_applied`，SSE 订阅者据此刷新；
+- **反过来**：API 改了图后，后端会把新图落盘并通知界面重新拉取（否则界面手里的旧副本
+  会在下次保存时覆盖掉 API 的改动）；
+- SSE 的事件通道满时会丢旧事件（收到的是「发生过」而非完整序列）：重连后用
+  `GET /api/graph` + `GET /api/status` 重新对齐状态；
+- 从 API 改 `control_api` 自身的开关/端口/令牌会重启服务，本次响应可能被掐断（重启延后约 0.4 秒执行），
+  客户端应重连后重试。
 
 ## 配置
 

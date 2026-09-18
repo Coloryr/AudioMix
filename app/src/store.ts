@@ -1,3 +1,4 @@
+import { listen } from "@tauri-apps/api/event";
 import { defineStore } from "pinia";
 import { api, type DeviceInfo, type GraphConfig, type Settings, type ApiStatus, type LevelsPayload } from "./api";
 
@@ -15,8 +16,18 @@ export const useApp = defineStore("app", {
     levelsWatching: false,
     /** 是否已向后端订阅设备列表推送 */
     devicesWatching: false,
+    /** 是否已监听「混音图被外部改动」（控制 API）事件 */
+    graphWatching: false,
     settings: {
-      control_api: { enabled: false, bind: "127.0.0.1", port: 17643 },
+      control_api: {
+        enabled: false,
+        bind: "127.0.0.1",
+        port: 17643,
+        /** 访问令牌（空 = 不鉴权） */
+        token: "",
+        /** 允许浏览器跨域调用（默认关闭） */
+        cors: false,
+      },
       usbip: { enabled: false, bind: "127.0.0.1:3240", cables: [] },
       autostart_headless: true,
       close_to_tray: true,
@@ -95,6 +106,24 @@ export const useApp = defineStore("app", {
       if (!this.devicesWatching) return;
       this.devicesWatching = false;
       await api.unsubscribeDevices().catch(() => { });
+    },
+    /**
+     * 监听「混音图被外部（控制 API / 脚本）改动」事件 → 重新拉取整图。
+     *
+     * 界面自己保存的图不会触发该事件（后端只在 API 改动后广播），因此不会
+     * 出现「边编辑边被回灌」的抖动；但外部改动必须拉回来，否则界面的旧副本
+     * 会在下次保存时把改动覆盖掉。
+     */
+    async watchGraphChanges() {
+      if (this.graphWatching) return;
+      this.graphWatching = true;
+      await listen("graph-changed", async () => {
+        try {
+          this.graph = await api.getGraph();
+        } catch (e) {
+          console.error("拉取外部改动的混音图失败", e);
+        }
+      });
     },
     deviceName(id: string): string {
       const d = this.devices.find((x) => x.id === id);

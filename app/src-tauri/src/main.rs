@@ -6,6 +6,7 @@
 // 桌面应用：启动时不要弹出命令行窗口（日志走「设置」页右侧面板 + 落盘文件）
 #![windows_subsystem = "windows"]
 
+mod api_host;
 mod autostart;
 mod commands;
 mod config;
@@ -107,9 +108,15 @@ fn main() {
             }
 
             // 控制 API
-            let state: State<state::AppState> = handle.state();
-            if state.config.lock().settings.control_api.enabled {
-                if let Err(e) = commands::restart_control_api(&state) {
+            if handle
+                .state::<state::AppState>()
+                .config
+                .lock()
+                .settings
+                .control_api
+                .enabled
+            {
+                if let Err(e) = commands::restart_control_api(&handle) {
                     tracing::warn!("控制 API 启动失败: {e}");
                 }
             }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   NButton,
   NCard,
@@ -11,6 +11,7 @@ import {
   NSelect,
   NTag,
   NText,
+  NAlert,
   NPopconfirm,
   useMessage,
 } from "naive-ui";
@@ -123,8 +124,32 @@ async function toggleAutostart(enabled: boolean) {
 }
 
 function copyAddr() {
-  if (app.apiStatus.addr) navigator.clipboard?.writeText(app.apiStatus.addr);
+  const url = app.apiStatus.base_url || app.apiStatus.addr;
+  if (url) navigator.clipboard?.writeText(url);
 }
+
+// ---------- 控制 API：令牌 / CORS ----------
+
+/** 生成 32 位十六进制令牌（与后端 ControlApiSettings::generate_token 同格式） */
+function generateToken() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  app.settings.control_api.token = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  save();
+}
+
+function clearToken() {
+  app.settings.control_api.token = "";
+  save();
+}
+
+/** 非回环监听且没令牌 = 同网段任何人都能控制混音器 */
+const apiInsecure = computed(
+  () =>
+    app.settings.control_api.enabled &&
+    !["127.0.0.1", "localhost", "::1", "[::1]"].includes(app.settings.control_api.bind) &&
+    !app.settings.control_api.token.trim(),
+);
 
 // ---------- 运行日志 ----------
 const logs = ref<LogLine[]>([]);
@@ -379,20 +404,77 @@ onUnmounted(() => {
           </div>
           <n-switch v-model:value="app.settings.control_api.enabled" @update:value="save" />
         </div>
-        <n-form-item label="端口" label-placement="left" style="margin-top: 12px; max-width: 220px">
-          <n-input-number v-model:value="app.settings.control_api.port" :min="1024" :max="65535" @update:value="save" />
+        <div class="item-row" style="gap: 16px">
+          <n-form-item label="监听地址" label-placement="left" style="max-width: 260px">
+            <n-select
+              v-model:value="app.settings.control_api.bind"
+              :options="[
+                { label: '127.0.0.1（仅本机）', value: '127.0.0.1' },
+                { label: '0.0.0.0（同网段可访问）', value: '0.0.0.0' },
+              ]"
+              @update:value="save"
+            />
+          </n-form-item>
+          <n-form-item label="端口" label-placement="left" style="max-width: 200px">
+            <n-input-number v-model:value="app.settings.control_api.port" :min="1024" :max="65535" @update:value="save" />
+          </n-form-item>
+        </div>
+
+        <n-form-item label="访问令牌" label-placement="left" style="margin-top: 4px">
+          <n-input
+            v-model:value="app.settings.control_api.token"
+            placeholder="留空 = 不鉴权（仅本机监听时可用）"
+            @blur="save"
+            @keyup.enter="save"
+          >
+            <template #suffix>
+              <n-button size="tiny" text @click="generateToken">生成</n-button>
+              <n-button v-if="app.settings.control_api.token" size="tiny" text @click="clearToken">清除</n-button>
+            </template>
+          </n-input>
         </n-form-item>
+        <n-text depth="3" style="font-size: 12px; line-height: 1.8; display: block; margin-bottom: 10px">
+          设置令牌后所有 <code>/api/*</code> 请求都要带
+          <code>Authorization: Bearer &lt;令牌&gt;</code>（SSE 可用 <code>?token=</code>）。
+        </n-text>
+
         <div class="item-row">
+          <div style="flex: 1">
+            <div class="item-title">允许浏览器跨域调用（CORS）</div>
+            <n-text depth="3" style="font-size: 12px">
+              默认关闭。开启后任意网页都能读取/控制本机混音器，请同时设置令牌。
+            </n-text>
+          </div>
+          <n-switch v-model:value="app.settings.control_api.cors" @update:value="save" />
+        </div>
+
+        <div class="item-row" style="margin-top: 12px">
           <n-tag size="small" :type="app.apiStatus.running ? 'success' : 'default'" :bordered="false">
             {{ app.apiStatus.running ? `运行中 ${app.apiStatus.addr}` : "未运行" }}
           </n-tag>
+          <n-tag v-if="app.apiStatus.running" size="small" :type="app.apiStatus.auth_enabled ? 'info' : 'warning'" :bordered="false">
+            {{ app.apiStatus.auth_enabled ? "已启用令牌" : "未鉴权" }}
+          </n-tag>
           <n-button v-if="app.apiStatus.addr" size="tiny" @click="copyAddr">复制地址</n-button>
         </div>
+
+        <n-alert v-if="apiInsecure" type="error" :bordered="false" style="margin-top: 10px">
+          当前监听 {{ app.settings.control_api.bind }} 且未设令牌：同网段的任何人都能控制本机混音器。
+          请改回 127.0.0.1，或先设置访问令牌。
+        </n-alert>
+
         <n-divider />
         <n-text depth="3" style="font-size: 12px; line-height: 1.9">
-          示例：
-          <code>GET /api/devices</code>、<code>GET /api/graph</code>、<code>PUT /api/graph</code>、
-          <code>GET /api/status</code>、<code>GET /api/events</code>（SSE）
+          设备：<code>GET /api/devices</code>、<code>POST /api/devices/refresh</code>、<code>POST /api/devices/default</code>、
+          <code>GET|PUT /api/devices/volume</code><br />
+          混音图：<code>GET|PUT /api/graph</code>、<code>POST /api/sources</code>、<code>PATCH /api/routes/&lt;id&gt;</code>、
+          <code>DELETE /api/sinks/&lt;id&gt;</code>、<code>POST /api/processors</code>、<code>POST /api/latency</code><br />
+          状态/事件：<code>GET /api/status</code>、<code>GET /api/levels</code>、<code>GET /api/stream/levels</code>（SSE）、
+          <code>GET /api/events</code>（SSE）<br />
+          虚拟声卡：<code>GET /api/usbip</code>、<code>PUT /api/usbip/cables</code>、<code>POST /api/usbip/attach</code><br />
+          <n-text depth="2" style="font-size: 12px">
+            完整端点表（含参数与状态码）就在 <code>GET {{ app.apiStatus.base_url || "http://127.0.0.1:17643" }}/api</code>。
+          </n-text>
         </n-text>
       </n-card>
 

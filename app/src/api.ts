@@ -78,7 +78,15 @@ export interface GraphConfig {
 }
 
 export interface Settings {
-  control_api: { enabled: boolean; bind: string; port: number };
+  control_api: {
+    enabled: boolean;
+    bind: string;
+    port: number;
+    /** 访问令牌：非空时 /api/* 需带 `Authorization: Bearer <令牌>`（空 = 不鉴权） */
+    token: string;
+    /** 允许浏览器跨域调用（默认关闭：开了之后任意网页都能操控本机混音器） */
+    cors: boolean;
+  };
   usbip: { enabled: boolean; bind: string; cables: UsbIpCable[] };
   autostart_headless: boolean;
   close_to_tray: boolean;
@@ -99,6 +107,13 @@ export interface Settings {
 export interface ApiStatus {
   running: boolean;
   addr: string | null;
+  /** 可直接拼端点用，如 `${base_url}/api/graph` */
+  base_url: string | null;
+  /** 运行中的服务是否启用了令牌鉴权 */
+  auth_enabled: boolean;
+  /** 设置里是否有令牌（保存后生效） */
+  token_set: boolean;
+  cors: boolean;
 }
 
 /** 电平推送载荷：节点电平 + 频段 dB（fft 关闭时 spectra 为空对象） */

@@ -90,6 +90,16 @@ function formatHint(c: UsbIpCable): string {
 const driverReady = computed(() => status.value?.driver.installed === true);
 const attachedCount = computed(() => status.value?.cables.filter((c) => c.attached).length ?? 0);
 
+/**
+ * 系统里还挂着的、不属于当前线路表的 vhci 端口：已删除线缆的设备（拆卸失败 /
+ * 上次取消过 UAC 授权时会残留）。它们不在 `cables` 里，所以「已接入」计数看不到，
+ * 得单独提示 + 提供清理入口。
+ */
+const stalePorts = computed(() => {
+  const known = new Set(cables.value.map((c) => `1-${c.number}`));
+  return (status.value?.ports ?? []).filter((p) => p.in_use && !!p.bus_id && !known.has(p.bus_id));
+});
+
 async function load() {
   const s = await api.usbipStatus();
   status.value = s;
@@ -186,6 +196,24 @@ async function saveCables() {
       );
       return;
     }
+    // 保存前的状态：用来区分「新增/改了线路」和「只是删了线路」——
+    // 前者描述符变了必须重新附加；后者不该再 detach --all 重来（会掐断其它线路的
+    // 正常音频、白弹一次 UAC），删除的线路由后端就地拆掉它的端口收走。
+    const before = status.value?.cables ?? [];
+    const beforeByNumber = new Map(before.map((c) => [c.number, c]));
+    const changed = cables.value.some((c) => {
+      const old = beforeByNumber.get(c.number);
+      return (
+        !old ||
+        old.sample_rate !== c.sample_rate ||
+        old.bits !== c.bits ||
+        old.mode !== c.mode ||
+        old.buffer_ms !== c.buffer_ms ||
+        old.name !== c.name
+      );
+    });
+    const removed = before.filter((c) => !cables.value.some((n) => n.number === c.number));
+
     const s = await api.usbipSetCables(enabled.value, cables.value);
     status.value = s;
     enabled.value = s.enabled;
@@ -193,14 +221,23 @@ async function saveCables() {
     app.settings.usbip = { enabled: s.enabled, bind: s.bind, cables: cables.value };
     await app.refreshDevices();
 
-    const shouldAttach = s.enabled && cables.value.length > 0 && s.driver.installed;
+    const unattached = s.cables.filter((c) => !c.attached).length;
+    const shouldAttach =
+      s.enabled && s.cables.length > 0 && s.driver.installed && (changed || unattached > 0);
     if (!shouldAttach) {
-      needsReattach.value = s.enabled && cables.value.length > 0;
-      message.success(
-        s.enabled
-          ? `已保存 ${cables.value.length} 条线路（安装驱动后点「附加全部」）`
-          : "已保存（虚拟声卡服务器停止）",
-      );
+      // 只有「删除线路 / 停用服务器 / 没装驱动」会走到这里，都不需要再附加
+      needsReattach.value = s.enabled && s.cables.length > 0 && !s.driver.installed;
+      if (!s.enabled) {
+        message.success("已保存（虚拟声卡服务器已停用，线路已从系统断开）");
+      } else if (!s.cables.length) {
+        message.success(`已删除全部线路${removed.length ? `（${removed.length} 条）` : ""}，并从系统断开`);
+      } else if (!s.driver.installed) {
+        message.success(`已保存 ${s.cables.length} 条线路（安装驱动后点「附加全部」）`);
+      } else if (removed.length) {
+        message.success(`已删除 ${removed.length} 条线路并从系统断开，其余线路未受影响`);
+      } else {
+        message.success(`已保存 ${s.cables.length} 条线路`);
+      }
       return;
     }
 
@@ -296,7 +333,8 @@ onMounted(() => {
       <div style="flex: 1">
         <div class="item-title">启用虚拟声卡服务器</div>
         <n-text depth="3" style="font-size: 12px">
-          监听 {{ status?.bind ?? "127.0.0.1:3240" }}（仅本机）；保存线路/格式/接线时服务器保持监听（不断开已接入设备），改完会自动重新附加。
+          监听 {{ status?.bind ?? "127.0.0.1:3240" }}（仅本机）；保存线路/格式/接线时服务器保持监听（不断开已接入设备）：
+          新增或改格式的线路会自动重新附加，删除的线路只断开它自己。停用服务器会把所有线路从系统断开。
         </n-text>
       </div>
       <n-switch :value="enabled" :loading="busy" @update:value="toggleEnabled" />
@@ -350,7 +388,7 @@ onMounted(() => {
               <template #trigger>
                 <n-button size="tiny" quaternary type="error">删除</n-button>
               </template>
-              删除该线路后需要重新保存并附加，确定？
+              删除后点「保存」即生效：该线路的设备会从系统断开，其它线路不受影响。
             </n-popconfirm>
           </div>
 
@@ -415,7 +453,7 @@ onMounted(() => {
         保存
       </n-button>
       <n-text v-if="dirty" depth="3" style="font-size: 12px">
-        有未保存的改动 —— 点「保存」后立即生效（会自动重新附加，弹一次 UAC）
+        有未保存的改动 —— 点「保存」后立即生效（新增/改格式会自动重新附加，弹一次 UAC；删除线路只断开那一条）
       </n-text>
       <n-text v-else depth="3" style="font-size: 12px">
         当前：{{cables.map((c) => cableLabel(c)).join("、") || "无线路"}}
@@ -435,10 +473,17 @@ onMounted(() => {
         :disabled="!driverReady || !status?.running || !cables.length" @click="attachAll">
         附加全部（需管理员）
       </n-button>
-      <n-button size="small" :loading="busy" :disabled="!driverReady || !attachedCount" @click="detachAll">
+      <n-button size="small" :loading="busy" :disabled="!driverReady || (!attachedCount && !stalePorts.length)"
+        @click="detachAll">
         断开全部
       </n-button>
     </div>
+
+    <n-alert v-if="stalePorts.length" type="warning" class="block">
+      系统里还挂着 {{ stalePorts.length }} 个已删除线路的设备（占用端口
+      {{ stalePorts.map((p) => p.port).join("、") }}）——多半是上次拆卸时取消了管理员授权。
+      点上面「断开全部」清理即可。
+    </n-alert>
 
     <n-alert v-if="status?.ports_error" type="default" class="block">
       端口状态不可用：{{ status.ports_error }}

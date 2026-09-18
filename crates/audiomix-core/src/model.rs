@@ -314,11 +314,19 @@ impl GraphConfig {
 
 /// 本地控制 API（REST + SSE）开关与监听参数。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ControlApiSettings {
     pub enabled: bool,
     /// 监听地址（默认仅本机）
     pub bind: String,
     pub port: u16,
+    /// 访问令牌：非空时 `/api/*` 全部要带令牌
+    /// （`Authorization: Bearer <token>` / `X-Api-Token` / `?token=`）。
+    /// 空 = 不鉴权（仅适合只监听回环地址的场景）。
+    pub token: String,
+    /// 允许浏览器跨域调用（CORS）。**默认关闭**：开启后任意网页都能读取/控制
+    /// 本机混音器（CSRF 面），只在有前端页面作为客户端时才打开，且应同时设令牌。
+    pub cors: bool,
 }
 
 impl Default for ControlApiSettings {
@@ -327,7 +335,32 @@ impl Default for ControlApiSettings {
             enabled: false,
             bind: "127.0.0.1".into(),
             port: 17643,
+            token: String::new(),
+            cors: false,
         }
+    }
+}
+
+impl ControlApiSettings {
+    /// 生成一个新令牌（32 位十六进制）。界面上「生成」按钮用。
+    pub fn generate_token() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    /// 监听地址是否只在回环（外网/局域网访问不到）
+    pub fn loopback_only(&self) -> bool {
+        matches!(self.bind.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    }
+
+    /// 启动前自检：非回环监听且没设令牌 → 返回提示文本（仅告警，不阻断）
+    pub fn security_warning(&self) -> Option<String> {
+        if self.enabled && !self.loopback_only() && self.token.trim().is_empty() {
+            return Some(format!(
+                "控制 API 监听 {}（非回环）但未设置访问令牌：同网段的任何人都能控制本机混音器",
+                self.bind
+            ));
+        }
+        None
     }
 }
 
@@ -849,6 +882,24 @@ mod tests {
         assert!(s.control_api.enabled);
         assert_eq!(s.control_api.port, 1);
         assert!(s.close_to_tray, "未指定的字段应取默认值");
+    }
+
+    #[test]
+    fn control_api_auth_defaults_and_warning() {
+        // 老配置没有 token / cors 字段 → 空令牌 + 关 CORS
+        let mut api: ControlApiSettings =
+            serde_json::from_str(r#"{"enabled":true,"bind":"127.0.0.1","port":17643}"#).unwrap();
+        assert!(api.token.is_empty());
+        assert!(!api.cors);
+        assert!(api.loopback_only());
+        assert!(api.security_warning().is_none(), "只监听回环时不应告警");
+
+        // 监听全网且无令牌 → 告警；设了令牌就不再告警
+        api.bind = "0.0.0.0".into();
+        assert!(api.security_warning().is_some());
+        api.token = ControlApiSettings::generate_token();
+        assert_eq!(api.token.len(), 32);
+        assert!(api.security_warning().is_none());
     }
 
     #[test]

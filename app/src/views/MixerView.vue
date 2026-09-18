@@ -134,6 +134,8 @@ const layout = ref<Record<string, NodePos>>({});
 let layoutLoaded = false;
 const cables = ref<UsbIpCableStatus[]>([]);
 const usbipRunning = ref(false);
+/** 线路状态是否已拉到过（拉之前分不清「还没读到」和「线路已删除」） */
+const cablesLoaded = ref(false);
 
 // ---------- 虚拟线路（usbip://N/playback|capture 设备本体即线路节点） ----------
 /** 是否线路的播放端（系统播放 → 混音器采集） */
@@ -155,10 +157,11 @@ function lineName(deviceId: string): string {
   if (c?.display_name) return c.display_name;
   return app.deviceName(deviceId).replace(/\s*[(（](输入|输出)[)）]\s*$/, "");
 }
-/** 线路节点副标题里的接入状态 */
+/** 线路节点副标题里的接入状态。`c === null` 有两种情况：状态还没拉到，或线路已被删除 */
 function lineStateOf(c: UsbIpCableStatus | null): string {
+  if (!c) return cablesLoaded.value ? "线路已删除（此节点不再有音频）" : "线路状态读取中…";
   if (!usbipRunning.value) return "服务器未运行";
-  return c?.attached ? "已接入系统" : "未接入（需附加）";
+  return c.attached ? "已接入系统" : "未接入（需附加）";
 }
 /** 线路节点副标题里的内部拷贝方向 */
 function lineCopyOf(c: UsbIpCableStatus | null): string {
@@ -1477,6 +1480,7 @@ onMounted(async () => {
     const s = await api.usbipStatus();
     cables.value = s.cables;
     usbipRunning.value = s.running;
+    cablesLoaded.value = true;
   } catch {
     cables.value = [];
     usbipRunning.value = false;
@@ -1487,6 +1491,7 @@ onMounted(async () => {
   unlistenUsbip = await listen<UsbIpStatus>("usbip-status", (e) => {
     cables.value = e.payload.cables;
     usbipRunning.value = e.payload.running;
+    cablesLoaded.value = true;
   });
   await refreshDeviceVolumes();
   fitCanvas();

@@ -273,7 +273,9 @@ pub fn spawn_default_device_guard(app: AppHandle) {
                     .iter()
                     .map(|c| c.bus_id.clone())
                     .collect();
-                if !cable_bus_ids.is_empty() {
+                // 注意：线缆表为空（线路全被删/服务器停用）同样要进来——这时所有占用中的
+                // 端口都是「线缆已不存在」，正需要拆掉；早前在这里判空导致全删后没人清理。
+                {
                     if let Ok(ports) = usbip_attach::ports() {
                         let in_use: Vec<_> = ports.iter().filter(|p| p.in_use).collect();
                         // 同一 bus_id 占多个端口：保留最小端口号（最早附加、在流式的那个）
@@ -886,6 +888,19 @@ pub fn update_settings(
     state: State<AppState>,
     settings: Settings,
 ) -> Result<(), String> {
+    apply_settings(&app, &state, settings, false)
+}
+
+/// 应用一份完整设置（Tauri 命令与控制 API 宿主共用）。
+///
+/// `defer_api_restart` = true 时把控制 API 的重启延后几百毫秒——从 API 里改
+/// API 自身的开关/端口/令牌时，先让本次响应发出去再重启，否则连接会被掐断。
+pub fn apply_settings(
+    app: &AppHandle,
+    state: &AppState,
+    settings: Settings,
+    defer_api_restart: bool,
+) -> Result<(), String> {
     let old_settings = state.config.lock().settings.clone();
     {
         let mut cfg = state.config.lock();
@@ -911,13 +926,25 @@ pub fn update_settings(
             .engine
             .set_fft_params(settings.fft_size, settings.fft_bands.clone());
     }
-    // 控制 API 开关/端口变化 → 重启服务
-    restart_control_api(&state)?;
+    // 控制 API 开关/端口/令牌变化 → 重启服务
+    if defer_api_restart {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let state: State<AppState> = app.state();
+            if let Err(e) = restart_control_api_handle(&app, &state) {
+                tracing::warn!("控制 API 重启失败: {e}");
+            }
+        });
+    } else {
+        let state: State<AppState> = app.state();
+        restart_control_api_handle(app, &state)?;
+    }
     // 自启参数可能变化（headless 偏好）→ 若已开启自启则重新注册
     if crate::autostart::get() {
         crate::autostart::set(true, settings.autostart_headless)?;
     }
-    persist(&app, &state)
+    persist(app, state)
 }
 
 // ---------- 控制 API ----------
@@ -928,6 +955,10 @@ pub fn get_control_api_status(state: State<AppState>) -> serde_json::Value {
     json!({
         "running": api.is_some(),
         "addr": api.as_ref().map(|a| a.addr.to_string()),
+        "base_url": api.as_ref().map(|a| a.base_url()),
+        "auth_enabled": api.as_ref().map(|a| a.auth_enabled).unwrap_or(false),
+        "token_set": !state.config.lock().settings.control_api.token.trim().is_empty(),
+        "cors": state.config.lock().settings.control_api.cors,
     })
 }
 
@@ -941,17 +972,35 @@ pub fn set_control_api_enabled(
         let mut cfg = state.config.lock();
         cfg.settings.control_api.enabled = enabled;
     }
-    restart_control_api(&state)?;
+    restart_control_api_handle(&app, &state)?;
     persist(&app, &state)
 }
 
+/// 启动/停止控制 API，使其与 settings.control_api 一致（Tauri 命令入口）
+pub fn restart_control_api(app: &AppHandle) -> Result<(), String> {
+    let state: State<AppState> = app.state();
+    restart_control_api_handle(app, &state)
+}
+
 /// 启动/停止控制 API，使其与 settings.control_api 一致
-pub fn restart_control_api(state: &State<AppState>) -> Result<(), String> {
-    let (enabled, bind, port) = {
+pub fn restart_control_api_handle(
+    app: &AppHandle,
+    state: &State<AppState>,
+) -> Result<(), String> {
+    let (enabled, bind, port, token, cors) = {
         let cfg = state.config.lock();
         let api = &cfg.settings.control_api;
-        (api.enabled, api.bind.clone(), api.port)
+        (
+            api.enabled,
+            api.bind.clone(),
+            api.port,
+            api.token.clone(),
+            api.cors,
+        )
     };
+    if let Some(warn) = state.config.lock().settings.control_api.security_warning() {
+        tracing::warn!("{warn}");
+    }
     // 先停旧的
     if let Some(old) = state.api.lock().take() {
         old.stop();
@@ -960,9 +1009,13 @@ pub fn restart_control_api(state: &State<AppState>) -> Result<(), String> {
         return Ok(());
     }
     let engine = state.engine.clone();
+    let opts = audiomix_control_api::ApiOptions::new(bind, port)
+        .with_token(token)
+        .with_cors(cors)
+        .with_host(crate::api_host::host(app.clone()));
     let (tx, rx) = std::sync::mpsc::channel();
     tauri::async_runtime::spawn(async move {
-        let result = audiomix_control_api::spawn(engine, &bind, port).await;
+        let result = audiomix_control_api::spawn(engine, opts).await;
         let _ = tx.send(result);
     });
     let server = rx
@@ -1077,6 +1130,45 @@ pub fn emit_usbip_status(app: &AppHandle) {
     });
 }
 
+/// 状态查询的输入（配置 + 服务器运行态），在跑 `usbip port` 之前同步收集
+pub struct UsbIpStatusInputs {
+    pub enabled: bool,
+    pub bind: String,
+    pub running: bool,
+    pub local_addr: Option<String>,
+    pub cables: Vec<UsbIpCableSettings>,
+}
+
+/// 收集状态查询输入
+pub fn usbip_status_inputs(state: &AppState) -> UsbIpStatusInputs {
+    let (enabled, bind, cables) = {
+        let cfg = state.config.lock();
+        (
+            cfg.settings.usbip.enabled,
+            cfg.settings.usbip.bind.clone(),
+            cfg.settings.usbip.cables.clone(),
+        )
+    };
+    UsbIpStatusInputs {
+        enabled,
+        bind,
+        running: state.usbip.running(),
+        local_addr: state.usbip.local_addr().map(|a| a.to_string()),
+        cables,
+    }
+}
+
+/// 同步构建状态（内部要跑 `usbip port`，会阻塞）——命令与 API 宿主都在阻塞线程调用
+pub fn usbip_status_sync(inputs: UsbIpStatusInputs) -> UsbIpStatus {
+    build_usbip_status(
+        inputs.enabled,
+        inputs.bind,
+        inputs.running,
+        inputs.local_addr,
+        &inputs.cables,
+    )
+}
+
 fn build_usbip_status(
     enabled: bool,
     bind: String,
@@ -1146,21 +1238,10 @@ fn build_usbip_status(
 /// 查询 USB/IP 虚拟声卡状态（会执行 `usbip port`，放到阻塞线程）
 #[tauri::command]
 pub async fn usbip_status(state: State<'_, AppState>) -> Result<UsbIpStatus, String> {
-    let (enabled, bind, cables) = {
-        let cfg = state.config.lock();
-        (
-            cfg.settings.usbip.enabled,
-            cfg.settings.usbip.bind.clone(),
-            cfg.settings.usbip.cables.clone(),
-        )
-    };
-    let running = state.usbip.running();
-    let local_addr = state.usbip.local_addr().map(|a| a.to_string());
-    tauri::async_runtime::spawn_blocking(move || {
-        build_usbip_status(enabled, bind, running, local_addr, &cables)
-    })
-    .await
-    .map_err(|e| format!("状态查询失败: {e}"))
+    let inputs = usbip_status_inputs(&state);
+    tauri::async_runtime::spawn_blocking(move || usbip_status_sync(inputs))
+        .await
+        .map_err(|e| format!("状态查询失败: {e}"))
 }
 
 /// 检测本机端口是否空闲（可绑定）。false = 已被其它程序占用。
@@ -1235,14 +1316,37 @@ pub async fn usbip_set_port(
 #[tauri::command]
 pub async fn usbip_set_cables(
     app: AppHandle,
-    state: State<'_, AppState>,
     enabled: bool,
     cables: Vec<UsbIpCableSettings>,
 ) -> Result<UsbIpStatus, String> {
+    let a = app.clone();
+    // 放到阻塞线程：同步核心内部要等旧 accept 任务退出并重试绑定，最多约 1 秒
+    let inputs = tauri::async_runtime::spawn_blocking(move || {
+        let state: State<AppState> = a.state();
+        usbip_set_cables_sync(&a, &state, enabled, cables)?;
+        Ok::<_, String>(usbip_status_inputs(&state))
+    })
+    .await
+    .map_err(|e| format!("USB/IP 任务失败: {e}"))??;
+    tauri::async_runtime::spawn_blocking(move || usbip_status_sync(inputs))
+        .await
+        .map_err(|e| format!("状态查询失败: {e}"))
+}
+
+/// 保存线缆配置并（重）启服务器（同步核心，命令与 API 宿主共用）。
+///
+/// 服务器已在运行时**不重绑端口**，只替换线缆表（改格式/改名要重新 attach 才生效，
+/// UI 会自动重新附加）。启动失败会回滚到上一次的线缆表，避免把在跑的服务停在半路。
+pub fn usbip_set_cables_sync(
+    app: &AppHandle,
+    state: &AppState,
+    enabled: bool,
+    cables: Vec<UsbIpCableSettings>,
+) -> Result<(), String> {
     let bind = state.config.lock().settings.usbip.bind.clone();
     let settings = UsbIpSettings {
         enabled,
-        bind: bind.clone(),
+        bind,
         cables,
     };
     settings.validate().map_err(|e| e.to_string())?;
@@ -1254,64 +1358,123 @@ pub async fn usbip_set_cables(
             cfg.settings.usbip.enabled,
         )
     };
-    let manager = state.usbip.clone();
-    // RuntimeHandle 是临时值，.inner() 借它；闭包要求 'static，这里克隆出 tokio Handle（廉价 Arc 克隆）
-    let rt_owner = tauri::async_runtime::handle();
-    let rt = rt_owner.inner().clone();
+    // 改动前的 line 表（线缆号 + busid）：用来算「哪些线缆被删了/被停用了」，
+    // 好在保存后把它们占的 vhci 端口拆掉——Windows 里的扬声器/麦克风不会自己消失。
+    let old_bus_ids: Vec<String> = state
+        .usbip
+        .cables()
+        .iter()
+        .map(|c| c.bus_id.clone())
+        .collect();
+    let manager = &state.usbip;
+    // RuntimeHandle 是临时值，.inner() 借它；这里克隆出 tokio Handle（廉价 Arc 克隆）
+    let rt = tauri::async_runtime::handle().inner().clone();
     let new_configs = cable_configs(&settings);
-    let wants_enabled = settings.enabled;
 
-    // 放到阻塞线程：start/stop 内部要等旧 accept 任务退出并重试绑定，最多阻塞约 1 秒
-    let outcome = tauri::async_runtime::spawn_blocking(move || {
-        if !wants_enabled {
-            manager.stop();
-            return Ok(());
-        }
-        match manager.start(&rt, new_configs) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if previous_enabled && !previous.is_empty() {
-                    match manager.start(&rt, previous) {
-                        Ok(()) => {
-                            tracing::warn!("USB/IP 服务器启动失败（{e}），已回滚到上次的线缆配置")
-                        }
-                        Err(e2) => {
-                            tracing::error!("USB/IP 服务器启动失败（{e}），回滚亦失败: {e2}")
-                        }
-                    }
-                }
-                Err(e)
+    if !settings.enabled {
+        manager.stop();
+    } else if let Err(e) = manager.start(&rt, new_configs) {
+        // 启动失败回滚到上一次的线缆表，别把在跑的服务停在半路
+        if previous_enabled && !previous.is_empty() {
+            match manager.start(&rt, previous) {
+                Ok(()) => tracing::warn!("USB/IP 服务器启动失败（{e}），已回滚到上次的线缆配置"),
+                Err(e2) => tracing::error!("USB/IP 服务器启动失败（{e}），回滚亦失败: {e2}"),
             }
         }
-    })
-    .await
-    .map_err(|e| format!("USB/IP 任务失败: {e}"))?;
-    outcome.map_err(|e| format!("启动 USB/IP 服务器失败: {e}"))?;
+        return Err(format!("启动 USB/IP 服务器失败: {e}"));
+    }
 
     {
         let mut cfg = state.config.lock();
         cfg.settings.usbip = settings.clone();
     }
-    persist(&app, &state)?;
-    // 设备列表随线缆变化
+    persist(app, state)?;
+
+    // 删掉 / 停用的线缆：把它们的 vhci 端口拆掉，否则 Windows 声音设置里那个
+    // 「Virtual Cable NN」扬声器/麦克风会一直留着（服务已经不认识它，数据通路是死的），
+    // 看起来就是「删除线路没生效」。提权：broker 在线零 UAC，否则一次性提权；
+    // 拆卸失败不回滚配置（配置本身已经生效），只告警提示手动「断开全部」。
+    let removed: Vec<String> = if settings.enabled {
+        let alive: std::collections::HashSet<String> = state
+            .usbip
+            .cables()
+            .iter()
+            .map(|c| c.bus_id.clone())
+            .collect();
+        old_bus_ids
+            .into_iter()
+            .filter(|b| !alive.contains(b))
+            .collect()
+    } else {
+        old_bus_ids // 停用服务器 = 所有线缆都该从系统里收走
+    };
+    detach_cable_ports_for(&removed);
+
+    // 设备列表随线缆变化（拆除之后再刷新，拿到的才是最终形态）
     let _ = state.engine.refresh_devices();
     // 混音页等其它页面监听事件同步线缆状态
-    emit_usbip_status(&app);
+    emit_usbip_status(app);
+    Ok(())
+}
 
-    let running = state.usbip.running();
-    let local_addr = state.usbip.local_addr().map(|a| a.to_string());
-    tauri::async_runtime::spawn_blocking(move || {
-        build_usbip_status(enabled, bind, running, local_addr, &settings.cables)
-    })
-    .await
-    .map_err(|e| format!("状态查询失败: {e}"))
+/// 拆掉这些 busid 的线缆所占的 vhci 端口（提权；多个端口一次 UAC 内完成）。
+///
+/// 拆不动（没装 usbip.exe / 用户取消 UAC / 端口列表读不到）只告警：调用方的配置
+/// 已经生效，用户可在虚拟声卡页点「断开全部」重试。
+fn detach_cable_ports_for(bus_ids: &[String]) {
+    if bus_ids.is_empty() {
+        return;
+    }
+    let ports = match usbip_attach::ports() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("读取 vhci 端口列表失败，跳过已删线路的拆除: {e}");
+            return;
+        }
+    };
+    let targets: Vec<u32> = ports
+        .iter()
+        .filter(|p| {
+            p.in_use
+                && p.bus_id
+                    .as_deref()
+                    .is_some_and(|b| bus_ids.iter().any(|x| x == b))
+        })
+        .map(|p| p.port)
+        .collect();
+    if targets.is_empty() {
+        return; // 这些线缆本来就没接入系统
+    }
+    // broker 在线（已提权）→ 零 UAC；否则一次性提权
+    let result = if usbip_broker::broker_online() {
+        usbip_broker::broker_detach_ports(&targets)
+    } else {
+        usbip_attach::detach_ports(&targets)
+    };
+    match result {
+        Ok(_) => tracing::info!("已把删除的虚拟线路从系统断开（端口 {targets:?}）"),
+        Err(e) => tracing::warn!(
+            "拆除已删线路的端口 {targets:?} 失败: {e}（可在虚拟声卡页点「断开全部」重试）"
+        ),
+    }
 }
 
 /// 重新附加全部线缆（提权：先 detach --all，再逐条 attach）
 #[tauri::command]
-pub async fn usbip_attach_all(
-    app: AppHandle,
-    state: State<'_, AppState>,
+pub async fn usbip_attach_all(app: AppHandle) -> Result<usbip_attach::AttachReport, String> {
+    let a = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<AppState> = a.state();
+        usbip_attach_all_sync(&a, &state)
+    })
+    .await
+    .map_err(|e| format!("附加任务失败: {e}"))?
+}
+
+/// 附加全部线缆（同步核心，命令与 API 宿主共用；内部会提权，可能弹 UAC）
+pub fn usbip_attach_all_sync(
+    app: &AppHandle,
+    state: &AppState,
 ) -> Result<usbip_attach::AttachReport, String> {
     let Some(addr) = state.usbip.local_addr() else {
         return Err("USB/IP 服务器未运行——请先启用虚拟声卡并保存线缆".into());
@@ -1326,58 +1489,57 @@ pub async fn usbip_attach_all(
         return Err("尚未配置任何虚拟线缆".into());
     }
     let (host, port) = (addr.ip().to_string(), addr.port());
-    let report = tauri::async_runtime::spawn_blocking(move || {
-        // broker 在线（或本次 UAC 启动成功）→ 零 UAC；取消 UAC 则中止，不回退再弹
-        if usbip_broker::ensure_broker().is_ok() {
-            match usbip_broker::broker_attach_all(&host, port, &bus_ids) {
-                Ok(r) => Ok(r),
-                Err(e) => {
-                    tracing::warn!("broker 附加失败，回退一次性提权: {e}");
-                    usbip_attach::attach_all(&host, port, &bus_ids)
-                }
+    // broker 在线（或本次 UAC 启动成功）→ 零 UAC；取消 UAC 则中止，不回退再弹
+    let report = if usbip_broker::ensure_broker().is_ok() {
+        match usbip_broker::broker_attach_all(&host, port, &bus_ids) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                tracing::warn!("broker 附加失败，回退一次性提权: {e}");
+                usbip_attach::attach_all(&host, port, &bus_ids)
             }
-        } else {
-            usbip_attach::attach_all(&host, port, &bus_ids)
         }
-    })
-    .await
-    .map_err(|e| format!("附加任务失败: {e}"));
-    let report = match report {
-        Ok(r) => r,
-        Err(e) => {
-            // 失败也可能已经动了端口（先 detach 再 attach 中途失败），照样广播状态
-            let _ = state.engine.refresh_devices();
-            emit_usbip_status(&app);
-            return Err(e);
-        }
+    } else {
+        usbip_attach::attach_all(&host, port, &bus_ids)
     };
+    // 成败都广播状态：失败也可能已经动了端口（先 detach 再 attach 中途失败）
     let _ = state.engine.refresh_devices();
-    emit_usbip_status(&app);
-    Ok(report?)
+    emit_usbip_status(app);
+    report
 }
 
 /// 断开全部已接入的线缆（提权 broker 优先，回退一次性提权）
 #[tauri::command]
-pub async fn usbip_detach_all(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let out = tauri::async_runtime::spawn_blocking(detach_via_broker_or_elevated)
-        .await
-        .map_err(|e| format!("断开任务失败: {e}"))??;
+pub async fn usbip_detach_all(app: AppHandle) -> Result<String, String> {
+    let a = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<AppState> = a.state();
+        usbip_detach_all_sync(&a, &state)
+    })
+    .await
+    .map_err(|e| format!("断开任务失败: {e}"))?
+}
+
+/// 断开全部线缆（同步核心，命令与 API 宿主共用）
+pub fn usbip_detach_all_sync(app: &AppHandle, state: &AppState) -> Result<String, String> {
+    let out = detach_via_broker_or_elevated()?;
     let _ = state.engine.refresh_devices();
-    emit_usbip_status(&app);
+    emit_usbip_status(app);
     Ok(out)
 }
 
 /// 安装随包捆绑的 usbip-win2（提权静默安装，需要 UAC）
 #[tauri::command]
 pub async fn usbip_install_driver() -> Result<String, String> {
-    // exe 旁边没找到捆绑安装包时，用编译进 exe 的那份（单文件分发也能装驱动）。
-    const EMBEDDED: (&str, &[u8]) = (EMBEDDED_INSTALLER_NAME, EMBEDDED_INSTALLER);
-    tauri::async_runtime::spawn_blocking(move || usbip_attach::install_bundled(Some(EMBEDDED)))
+    tauri::async_runtime::spawn_blocking(usbip_install_driver_sync)
         .await
         .map_err(|e| format!("安装任务失败: {e}"))?
+}
+
+/// 安装随包驱动（同步核心，命令与 API 宿主共用）
+pub fn usbip_install_driver_sync() -> Result<String, String> {
+    // exe 旁边没找到捆绑安装包时，用编译进 exe 的那份（单文件分发也能装驱动）。
+    const EMBEDDED: (&str, &[u8]) = (EMBEDDED_INSTALLER_NAME, EMBEDDED_INSTALLER);
+    usbip_attach::install_bundled(Some(EMBEDDED))
 }
 
 // ---------- 运行日志（设置页右侧面板） ----------
@@ -1416,7 +1578,7 @@ pub fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
-fn persist(app: &AppHandle, state: &State<AppState>) -> Result<(), String> {
+pub fn persist(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let snapshot = state.config.lock().clone();
     config::save(app, &snapshot)
 }
