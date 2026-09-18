@@ -71,7 +71,29 @@ fn driver_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// 随包捆绑的 usbip-win2 安装包（`drivers/usbip/USBip-*-x64.exe`）
+/// 内嵌安装包释放到的目录：`%LOCALAPPDATA%\com.audiomix.app\drivers\usbip`
+pub fn installer_cache_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|d| {
+            PathBuf::from(d)
+                .join("com.audiomix.app")
+                .join("drivers")
+                .join("usbip")
+        })
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// 内嵌安装包**将要**释放成的路径（只算路径，不写盘）。
+///
+/// 单文件分发（CI 只发 exe，旁边没有 `drivers/usbip/`）时，[`bundled_installer`] 找不到
+/// 任何文件，但安装仍可从编译进 exe 的那份完成——状态页据此给出安装入口，
+/// 不能因为磁盘上没有就以为装不了。
+pub fn embedded_installer_path(name: &str) -> PathBuf {
+    installer_cache_dir().join(name)
+}
+
+/// 随包捆绑的 usbip-win2 安装包（`drivers/usbip/USBip-*-x64.exe`）。
+/// **只看 exe 旁边的目录**：单文件分发时返回 None，改用 [`embedded_installer_path`]。
 pub fn bundled_installer() -> Option<PathBuf> {
     for root in driver_roots() {
         let dir = root.join("usbip");
@@ -555,17 +577,10 @@ pub fn install_bundled(embedded: Option<(&str, &[u8])>) -> Result<String, String
     }
 }
 
-/// 把内嵌的安装包写到本地缓存目录（%LOCALAPPDATA%\com.audiomix.app\drivers\usbip）。
+/// 把内嵌的安装包写到本地缓存目录（[`installer_cache_dir`]，见 [`embedded_installer_path`]）。
 /// 已存在且大小一致就复用，不重复写 26MB。
 fn extract_installer(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    let dir = std::env::var_os("LOCALAPPDATA")
-        .map(|d| {
-            PathBuf::from(d)
-                .join("com.audiomix.app")
-                .join("drivers")
-                .join("usbip")
-        })
-        .unwrap_or_else(std::env::temp_dir);
+    let dir = installer_cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建驱动缓存目录失败: {e}"))?;
     let path = dir.join(name);
     let stale = std::fs::metadata(&path)

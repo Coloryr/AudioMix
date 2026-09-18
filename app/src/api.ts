@@ -156,6 +156,8 @@ export interface UsbIpDriverInfo {
   installed: boolean;
   usbip_path: string | null;
   installer_path: string | null;
+  /** installer_path 是内嵌副本（单文件分发，安装时才释放到磁盘） */
+  installer_embedded: boolean;
   test_signing: boolean | null;
   hvci_enabled: boolean | null;
 }

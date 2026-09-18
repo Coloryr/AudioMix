@@ -987,6 +987,12 @@ pub fn set_autostart(state: State<AppState>, enabled: bool) -> Result<(), String
 
 // ---------- USB/IP 虚拟声卡（usbip-win2 + UAC1）----------
 
+/// 随包捆绑的 usbip-win2 安装包。exe 旁边有 `drivers/usbip/` 就用那份；没有
+/// （CI 只发单个 exe）就用编译进 exe 的这份，安装时释放到本地缓存目录再执行。
+/// 换驱动版本时同步改这里的文件名与 `drivers/usbip/` 下的文件。
+const EMBEDDED_INSTALLER_NAME: &str = "USBip-0.9.8.0-x64.exe";
+const EMBEDDED_INSTALLER: &[u8] = include_bytes!("../drivers/usbip/USBip-0.9.8.0-x64.exe");
+
 /// 一条线缆的运行态（UI 用）
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UsbIpCableStatus {
@@ -1013,8 +1019,11 @@ pub struct UsbIpCableStatus {
 pub struct UsbIpDriverInfo {
     pub installed: bool,
     pub usbip_path: Option<String>,
-    /// 随包安装包路径（未找到为 null）
+    /// 可用的随包安装包路径：优先 exe 旁边的 `drivers/usbip/`，否则是内嵌副本
+    /// 释放后的落地路径（那时文件还没写出，但安装确实能完成）
     pub installer_path: Option<String>,
+    /// `installer_path` 指的是内嵌副本（单文件分发），而非磁盘上已存在的文件
+    pub installer_embedded: bool,
     pub test_signing: Option<bool>,
     pub hvci_enabled: Option<bool>,
 }
@@ -1079,6 +1088,15 @@ fn build_usbip_status(
         Ok(p) => (p, None),
         Err(e) => (Vec::new(), Some(e)),
     };
+    // 磁盘上有捆绑安装包就用它；没有（单文件分发）报内嵌副本的落地路径，
+    // 否则前端会因为 installer_path 为空而禁用安装按钮——明明装得了。
+    let (installer_path, installer_embedded) = match usbip_attach::bundled_installer() {
+        Some(p) => (Some(p), false),
+        None => (
+            Some(usbip_attach::embedded_installer_path(EMBEDDED_INSTALLER_NAME)),
+            true,
+        ),
+    };
     let cable_status = cables
         .iter()
         .map(|c| {
@@ -1115,8 +1133,8 @@ fn build_usbip_status(
         driver: UsbIpDriverInfo {
             installed: usbip_attach::installed(),
             usbip_path: usbip_attach::find_usbip().map(|p| p.to_string_lossy().to_string()),
-            installer_path: usbip_attach::bundled_installer()
-                .map(|p| p.to_string_lossy().to_string()),
+            installer_path: installer_path.map(|p| p.to_string_lossy().to_string()),
+            installer_embedded,
             test_signing: driver::test_signing_enabled(),
             hvci_enabled: driver::hvci_enabled(),
         },
@@ -1356,11 +1374,7 @@ pub async fn usbip_detach_all(
 #[tauri::command]
 pub async fn usbip_install_driver() -> Result<String, String> {
     // exe 旁边没找到捆绑安装包时，用编译进 exe 的那份（单文件分发也能装驱动）。
-    // 换驱动版本时同步更新 drivers/usbip/ 下的文件名。
-    const EMBEDDED: (&str, &[u8]) = (
-        "USBip-0.9.8.0-x64.exe",
-        include_bytes!("../drivers/usbip/USBip-0.9.8.0-x64.exe"),
-    );
+    const EMBEDDED: (&str, &[u8]) = (EMBEDDED_INSTALLER_NAME, EMBEDDED_INSTALLER);
     tauri::async_runtime::spawn_blocking(move || usbip_attach::install_bundled(Some(EMBEDDED)))
         .await
         .map_err(|e| format!("安装任务失败: {e}"))?

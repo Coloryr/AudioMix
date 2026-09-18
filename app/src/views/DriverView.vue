@@ -266,7 +266,7 @@ onMounted(() => {
       虚拟声卡由 <b>usbip-win2</b>（BSD-2，微软签名驱动，内存完整性 HVCI 兼容）把应用内置的
       USB/IP 服务器仿真的设备接入 Windows，再由系统自带的 usbaudio.sys（UAC1）暴露为标准播放/录音端点。
       <template v-if="status.driver.installer_path">
-        已随包提供安装包，点击下面按钮一键安装（需要管理员权限，安装过程会短暂重启 USB 集线器）。
+        已随包提供安装包{{ status.driver.installer_embedded ? "（内置在程序内，安装时自动释放）" : "" }}，点击下面按钮一键安装（需要管理员权限，安装过程会短暂重启 USB 集线器）。
       </template>
       <template v-else>未找到随包安装包（resources/drivers/usbip/），请确认安装包完整。</template>
       <div style="margin-top: 8px; display: flex; gap: 10px; align-items: center">
@@ -276,7 +276,9 @@ onMounted(() => {
         </n-button>
         <n-button size="small" @click="load">刷新</n-button>
       </div>
-      <div v-if="status.driver.installer_path" style="margin-top: 6px; font-size: 12px; opacity: 0.75">
+      <!-- 内嵌副本此时还没释放到磁盘，不展示路径免得看起来像文件已存在 -->
+      <div v-if="status.driver.installer_path && !status.driver.installer_embedded"
+        style="margin-top: 6px; font-size: 12px; opacity: 0.75">
         安装包：{{ status.driver.installer_path }}
       </div>
       <div style="margin-top: 6px; font-size: 12px; opacity: 0.75">
