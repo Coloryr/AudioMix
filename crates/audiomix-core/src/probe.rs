@@ -82,6 +82,9 @@ struct SrcCfg {
 struct DstCfg {
     edge_key: String,
     rate: u32,
+    /// **终点采样率**的检测模板：注入在源侧（src_rate），检测在渲染侧（dst_rate），
+    /// 两侧采样率不同时必须各按各的率生成（扫频的物理频率/时长经重采样保持不变）
+    template: Vec<f32>,
     /// mono 信号缓冲（drop-oldest），buf[0] 的全局帧号 = frame_base
     buf: Vec<f32>,
     frame_base: u64,
@@ -200,6 +203,7 @@ impl LatencyProbe {
             return Err("流格式尚未就绪，请稍后再测".into());
         }
         let template = sweep_template(src_rate);
+        let dst_template = sweep_template(dst_rate);
         let burst_starts: Vec<u64> = (0..BURSTS)
             .map(|i| {
                 ((FIRST_BURST_DELAY_SECS + BURST_INTERVAL_SECS * i as f64) * src_rate as f64) as u64
@@ -217,6 +221,7 @@ impl LatencyProbe {
         *self.dst.lock() = Some(DstCfg {
             edge_key: edge_key.to_string(),
             rate: dst_rate,
+            template: dst_template,
             buf: Vec::with_capacity(4096),
             frame_base: 0,
             anchor: None,
@@ -267,22 +272,26 @@ impl LatencyProbe {
             if self.result.lock().is_some() || started.elapsed() > MEASURE_TIMEOUT {
                 break;
             }
-            let (template, inject_at, finished) = {
+            let (inject_at, finished) = {
+                let src_cfg = self.src.lock();
                 let mut dst = self.dst.lock();
                 let Some(dst) = dst.as_mut() else { return };
-                let src_cfg = self.src.lock();
                 let Some(src_cfg) = src_cfg.as_ref() else { return };
-                // 扫描新增样本
-                self.scan(dst, &src_cfg.template);
-                // 收尾条件：5 个脉冲全检出（或数量已达），或超时（上面判断）
+                // 扫描新增样本（用 dst 侧模板，见 DstCfg::template 注释）
+                self.scan(dst);
                 (
-                    src_cfg.template.clone(),
                     src_cfg.inject_at.clone(),
                     dst.detections.len() >= BURSTS,
                 )
             };
             if finished {
-                let r = finalize(&inject_at, &self.dst.lock().as_ref().map(|d| d.detections.clone()).unwrap_or_default(), template.len());
+                let dets = self
+                    .dst
+                    .lock()
+                    .as_ref()
+                    .map(|d| d.detections.clone())
+                    .unwrap_or_default();
+                let r = finalize(&inject_at, &dets);
                 *self.result.lock() = Some(r);
                 return;
             }
@@ -291,15 +300,19 @@ impl LatencyProbe {
         let r = {
             let src_cfg = self.src.lock();
             let dst = self.dst.lock();
-            let inject_at = src_cfg.as_ref().map(|s| s.inject_at.clone()).unwrap_or_default();
+            let inject_at = src_cfg
+                .as_ref()
+                .map(|s| s.inject_at.clone())
+                .unwrap_or_default();
             let detections = dst.as_ref().map(|d| d.detections.clone()).unwrap_or_default();
-            finalize(&inject_at, &detections, src_cfg.as_ref().map(|s| s.template.len()).unwrap_or(1))
+            finalize(&inject_at, &detections)
         };
         *self.result.lock() = Some(r);
     }
 
     /// 扫描 tap 里 [consumed, end) 的新样本做归一化相关，命中记入 detections。
-    fn scan(&self, dst: &mut DstCfg, template: &[f32]) {
+    fn scan(&self, dst: &mut DstCfg) {
+        let template = dst.template.clone();
         let t = template.len();
         if t == 0 {
             return;
@@ -318,7 +331,7 @@ impl LatencyProbe {
             let win = &dst.buf[off..off + t];
             let w_energy: f32 = win.iter().map(|x| x * x).sum();
             if w_energy > 1e-9 {
-                let dot: f32 = win.iter().zip(template).map(|(a, b)| a * b).sum();
+                let dot: f32 = win.iter().zip(template.iter()).map(|(a, b)| a * b).sum();
                 let r = dot / (w_energy * t_energy).sqrt();
                 if r > DETECT_THRESHOLD {
                     // 换算绝对时刻：锚点 + 帧差（帧号为全局，锚点记录其起始帧）
@@ -368,7 +381,7 @@ fn hann(n: usize, i: usize) -> f32 {
 /// 检出与注入配对 → 过滤离群 → 中位数（ms）。
 /// 配对按顺序：第 k 个检出对应第 k 个脉冲；漏检会让后续错位（差出 400ms 的整倍数），
 /// 因此先取中位数，再剔除偏离中位数 > 5ms 的值，再取一次中位数。
-fn finalize(inject_at: &[Instant], detections: &[(Instant, f32)], _template_len: usize) -> Result<f64, String> {
+fn finalize(inject_at: &[Instant], detections: &[(Instant, f32)]) -> Result<f64, String> {
     if inject_at.is_empty() {
         return Err("未能注入测试信号（源流未运行？）".into());
     }
@@ -429,6 +442,7 @@ mod tests {
         *probe.dst.lock() = Some(DstCfg {
             edge_key: "e".into(),
             rate,
+            template: template.clone(),
             buf: signal,
             frame_base: 0,
             anchor: Some((Instant::now(), 0)),
@@ -437,11 +451,44 @@ mod tests {
         });
         let mut dst = probe.dst.lock();
         let cfg = dst.as_mut().unwrap();
-        probe.scan(cfg, &template);
+        probe.scan(cfg);
         let d = &cfg.detections;
         assert_eq!(d.len(), 1, "应恰好检出一次: {d:?}");
         // 检出后扫描应至少越过整个脉冲（consumed 推进到缓冲尾也可）
         assert!(cfg.consumed >= (delay + template.len()) as u64);
+    }
+
+    /// 源侧 96k 注入、终点侧 48k 检测：采样率不同必须各按各的率生成模板
+    /// （半取样降采对 <24kHz 的扫频是干净的，相关峰应保持）
+    #[test]
+    fn detect_survives_resample() {
+        let src_rate = 96_000u32;
+        let dst_rate = 48_000u32;
+        let src_t = sweep_template(src_rate);
+        let mut signal: Vec<f32> = (0..dst_rate as usize * 2)
+            .map(|i| ((i * 2654435761 % 97) as f32 / 97.0) * 0.1 - 0.05)
+            .collect();
+        let delay = 2400usize; // 50ms @48k
+        for (i, &s) in src_t.iter().enumerate() {
+            if i % 2 == 0 {
+                signal[delay + i / 2] += s * 0.9;
+            }
+        }
+        let probe = Arc::new(LatencyProbe::default());
+        *probe.dst.lock() = Some(DstCfg {
+            edge_key: "e".into(),
+            rate: dst_rate,
+            template: sweep_template(dst_rate),
+            buf: signal,
+            frame_base: 0,
+            anchor: Some((Instant::now(), 0)),
+            consumed: 0,
+            detections: Vec::new(),
+        });
+        let mut dst = probe.dst.lock();
+        let cfg = dst.as_mut().unwrap();
+        probe.scan(cfg);
+        assert_eq!(cfg.detections.len(), 1, "跨采样率应仍能检出");
     }
 
     #[test]
@@ -457,7 +504,7 @@ mod tests {
                 (*t + Duration::from_secs_f64(lat / 1000.0), 0.9)
             })
             .collect();
-        let ms = finalize(&inj, &dets, 288).unwrap();
+        let ms = finalize(&inj, &dets).unwrap();
         assert!((ms - 50.0).abs() < 2.0, "应收敛到 50ms，实际 {ms}");
     }
 

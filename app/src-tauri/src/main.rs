@@ -1,7 +1,7 @@
 //! AudioMix — Tauri 壳。
 //!
 //! 引擎运行在 Rust 后端进程，webview 仅是控制面：
-//! 关闭窗口 = 隐藏到托盘；`--headless` 启动时不创建窗口。
+//! 关闭窗口 = 销毁 WebView 释放资源（引擎继续跑），再打开时重建；`--headless` 启动时不创建窗口。
 
 // 桌面应用：启动时不要弹出命令行窗口（日志走「设置」页右侧面板 + 落盘文件）
 #![windows_subsystem = "windows"]
@@ -47,6 +47,11 @@ fn main() {
     }
 
     tauri::Builder::default()
+        // 单实例：重复启动时唤醒已有实例的窗口（headless 驻留中也会把界面带出来）。
+        // 必须是第一个注册的插件。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tray::show_main(app);
+        }))
         .setup(move |app| {
             let handle = app.handle().clone();
 
@@ -141,9 +146,10 @@ fn main() {
                 let app = window.app_handle();
                 let state: State<state::AppState> = app.state();
                 if state.config.lock().settings.close_to_tray {
-                    // 关闭 = 隐藏到托盘，引擎继续运行
+                    // 关闭 = 销毁窗口（WebView 进程随之退出、不再占内存/CPU），
+                    // 引擎继续运行；点托盘「打开」时重建窗口（show_main）
                     api.prevent_close();
-                    let _ = window.hide();
+                    let _ = window.destroy();
                 }
             }
         })

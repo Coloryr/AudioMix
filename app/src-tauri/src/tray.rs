@@ -1,4 +1,4 @@
-//! 托盘：常驻图标、关闭窗口 = 隐藏到托盘、菜单打开/退出。
+//! 托盘：常驻图标、关闭窗口 = 销毁 WebView（引擎继续跑，再打开时重建窗口）、菜单打开/退出。
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};

@@ -23,3 +23,6 @@ winreg.workspace = true
 [dependencies.tauri]
 version = "2"
 features = ["tray-icon", "devtools"]
+
+[dependencies.tauri-plugin-single-instance]
+version = "2"

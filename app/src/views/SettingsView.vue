@@ -341,9 +341,10 @@ onUnmounted(() => {
       <n-card title="后台运行" size="small">
         <div class="item-row">
           <div style="flex: 1">
-            <div class="item-title">关闭窗口 = 最小化到托盘</div>
+            <div class="item-title">关闭窗口 = 释放界面、驻留托盘</div>
             <n-text depth="3" style="font-size: 12px">
-              引擎继续在后台混音，托盘左键单击可重新打开窗口。
+              引擎继续在后台混音，界面（WebView）会被关闭以释放资源；
+              托盘左键单击或再次启动程序时重新打开窗口。
             </n-text>
           </div>
           <n-switch v-model:value="app.settings.close_to_tray" @update:value="save" />
